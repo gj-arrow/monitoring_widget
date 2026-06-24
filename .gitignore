@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs
+*.log
+app_debug.log
+metrics_history.log
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Build artifacts (PyInstaller)
+dist/
+build/
+*.spec
+*.exe
+*.bin
+
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store

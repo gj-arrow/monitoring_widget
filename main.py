@@ -33,6 +33,7 @@ GPU_PURPLE = "#d79eff"
 VRAM_BLUE = "#82aaff"
 RAM_ORANGE = "#f78c6c"
 ALERT_RED = "#ff3333"
+WIDGET_ALPHA_PERCENT = 0
 
 class MonitorApp:
     """Запуск и поддержка жизненного цикла приложения."""
@@ -46,28 +47,29 @@ class MonitorApp:
             on_click_callback=self._handle_single_click,
             on_double_click_callback=self._handle_double_click
         )
+        wid.bg_alpha = int(WIDGET_ALPHA_PERCENT * 2.55)
 
-        # Set font and style
+        # Set font and style - text stays bright always
         font = QFont("Consolas", 12, QFont.Weight.Bold)
         wid.setFont(font)
-        wid.setStyleSheet(
-            "background-color: rgba(0,0,0,0);"
-            "border-radius: 6px; padding: 8px 14px;"
-        )
+        self.widget_alpha = WIDGET_ALPHA_PERCENT
 
         # Setup timer for updates
         timer = QTimer(self.app)
         timer.timeout.connect(lambda: self._tick(wid))
         timer.start(2000)
 
-        # Initial update and positioning
         self._tick(wid)
         wid.adjustSize()
         
         screen = wid.screen().availableGeometry()
         margin = 10
         # Position in top-right corner with margin
-        wid.move(screen.width() - wid.width() - margin, margin)
+        x = screen.right() - wid.width() - margin
+        y = screen.top() + margin
+        wid.move(x, y)
+        
+        wid.show()
         
         wid.show()
 
@@ -80,6 +82,15 @@ class MonitorApp:
 
     def _get_color(self, value: float, threshold: float = 80.0) -> str:
         return ALERT_RED if value >= threshold else ""
+
+    def update_transparency(self, alpha_percent: float) -> None:
+        """Update the background transparency percentage (0-100)."""
+        self.widget_alpha = max(0.0, min(100.0, alpha_percent))
+        bg_value = int(self.widget_alpha * 2.55)
+        for widget in QApplication.allWidgets():
+            if isinstance(widget, DraggableLabel):
+                widget.bg_alpha = bg_value
+                break
 
     def _tick(self, wid: DraggableLabel) -> None:
         try:

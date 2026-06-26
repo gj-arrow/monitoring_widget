@@ -86,26 +86,34 @@ class DraggableLabel(QWidget):
         logger.info("Label font set: %s %dpt", font.family(), font.pointSize())
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
-        if event.button() == Qt.MouseButton.MiddleButton:
-            logger.info("Middle click detected - quitting")
-            QApplication.quit()
-        elif event.button() == Qt.MouseButton.RightButton:
-            if event.clickCount() >= 2:
-                logger.info("Double right click detected")
-                if self.on_double_click_callback:
-                    try:
-                        self.on_double_click_callback()
-                    except Exception as e:
-                        logger.error("on_double_click_callback error: %s", e)
+        logger.info("mousePressEvent: button=%s clickCount=%s pos=%s globalPos=%s",
+                     event.button(), event.clickCount(), event.pos(), event.globalPos())
+        try:
+            if event.button() == Qt.MouseButton.MiddleButton:
+                logger.info("Middle click detected - quitting")
+                QApplication.quit()
+            elif event.button() == Qt.MouseButton.RightButton:
+                if event.clickCount() >= 2:
+                    logger.info("Double right click detected, calling double_click_callback")
+                    if self.on_double_click_callback:
+                        try:
+                            self.on_double_click_callback()
+                        except Exception as e:
+                            logger.error("on_double_click_callback error: %s", e, exc_info=True)
+                else:
+                    logger.info("Right click detected - calling callback")
+                    if self.on_click_callback:
+                        try:
+                            self.on_click_callback()
+                        except Exception as e:
+                            logger.error("on_click_callback error: %s", e, exc_info=True)
+            elif event.button() == Qt.MouseButton.LeftButton and not self._drag_mode:
+                logger.info("Left click detected - entering drag mode")
+                self._enter_drag_mode(event)
             else:
-                logger.info("Right click detected - calling callback")
-                if self.on_click_callback:
-                    try:
-                        self.on_click_callback()
-                    except Exception as e:
-                        logger.error("on_click_callback error: %s", e)
-        elif event.button() == Qt.MouseButton.LeftButton and not self._drag_mode:
-            self._enter_drag_mode(event)
+                logger.info("Unhandled button=%s clickCount=%s", event.button(), event.clickCount())
+        except Exception as e:
+            logger.error("mousePressEvent error: %s", e, exc_info=True)
         super().mousePressEvent(event)
 
     def wheelEvent(self, event: QMouseEvent) -> None:

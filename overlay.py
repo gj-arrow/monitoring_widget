@@ -114,7 +114,6 @@ class DraggableLabel(QWidget):
                 logger.info("Unhandled button=%s clickCount=%s", event.button(), event.clickCount())
         except Exception as e:
             logger.error("mousePressEvent error: %s", e, exc_info=True)
-        super().mousePressEvent(event)
 
     def wheelEvent(self, event: QMouseEvent) -> None:
         delta = event.angleDelta().y()

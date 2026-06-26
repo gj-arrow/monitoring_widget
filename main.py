@@ -29,9 +29,9 @@ import metrics as m
 from overlay import DraggableLabel
 
 CPU_GREEN = "#33ff99"
-GPU_PURPLE = "#d79eff"
+GPU_PURPLE = "#FF00FF"
 VRAM_BLUE = "#82aaff"
-RAM_ORANGE = "#f78c6c"
+RAM_ORANGE = "#FF8C00"
 ALERT_RED = "#ff3333"
 WIDGET_ALPHA_PERCENT = 0
 
@@ -43,10 +43,11 @@ class MonitorApp:
         self.random_mode = False
         self.current_random_color = "#FFFFFF"
 
-        wid = DraggableLabel(
+        self._wid = DraggableLabel(
             on_click_callback=self._handle_single_click,
             on_double_click_callback=self._handle_double_click
         )
+        wid = self._wid
         wid.bg_alpha = int(WIDGET_ALPHA_PERCENT * 2.55)
 
         # Set font and style - text stays bright always
@@ -74,22 +75,14 @@ class MonitorApp:
         wid.show()
 
     def _handle_single_click(self) -> None:
-        logging.info("_handle_single_click START")
-        try:
-            self.random_mode = True
-            self.current_random_color = f"#{random.randint(0, 0xFFFFFF):06x}"
-            logging.info("_handle_single_click OK, color=%s", self.current_random_color)
-        except Exception as e:
-            logging.error("_handle_single_click ERROR: %s", e, exc_info=True)
+        self.random_mode = True
+        self.current_random_color = f"#{random.randint(0, 0xFFFFFF):06x}"
+        self._tick(self._wid)
 
     def _handle_double_click(self) -> None:
-        logging.info("_handle_double_click START")
-        try:
-            self.random_mode = False
-            self.current_random_color = "#FFFFFF"
-            logging.info("_handle_double_click OK")
-        except Exception as e:
-            logging.error("_handle_double_click ERROR: %s", e, exc_info=True)
+        self.random_mode = False
+        self.current_random_color = "#FFFFFF"
+        self._tick(self._wid)
 
     def _get_color(self, value: float, threshold: float = 80.0) -> str:
         return ALERT_RED if value >= threshold else ""
@@ -138,7 +131,6 @@ class MonitorApp:
                 f"<span style='color:{vram_color}'>/{gpu_tv}GB</span>"
             )
             wid.setText(html)
-            wid.adjustSize() 
         except Exception as e:
             logging.error(f"Error updating metrics: {e}", exc_info=True)
 

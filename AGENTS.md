@@ -1,24 +1,26 @@
-# Agent instructions for the System Monitor project
+# System Monitor — Agent Instructions
 
 ## Project Structure
-- Located in `widget/` directory.
-- `main.py`: Entry point (PyQt6).
-- `metrics.py`: Retrieval logic for CPU, RAM, and GPU metrics.
-- `overlay.py`: UI component (`DraggableLabel`).
+- **Root files**: `main.py` (entry point), `metrics.py` (metric retrieval), `overlay.py` (UI widget), `run_widget.py` (alternate launcher)
+- **PyInstaller**: `build_exe.bat` (quick build), `Monitor.spec` / `spec_build.py` (build specs)
+- All Python modules live at root, not in a subdirectory.
 
-## Running and Testing
-- **Execution**: Run from project root using `.venv\Scripts\python widget/main.py`.
-- **Environment**: Uses a local virtual environment in `widget/.venv/`.
-- **Dependencies**: Requires `psutil`, `PyQt6`, `pynvml` (NVIDIA), and `wmi` (fallback).
+## Running
+- **Setup**: `python -m venv .venv && .venv\Scripts\activate && pip install -r requirements.txt`
+- **Run**: `.venv\Scripts\python main.py` (or `run_widget.py`)
+- **Build exe**: `build_exe.bat` → outputs `dist\Monitor.exe`
+- **Dependencies**: `psutil`, `PyQt6`, `pynvml` (NVIDIA), `wmi` (fallback)
 
-## Key Developer Notes
-- **Logging**: 
-  - Application errors and startup info are logged to `app_debug.log`.
-  - Metric history is recorded in `metrics_history.log`.
-- **Pathing**: `main.py` modifies `sys.path` to allow imports from the `widget/` subdirectory.
-- **UI**: 
-  - Always call `wid.adjustSize()` after updating text to prevent clipping.
-  - Right-click (single click) toggles random color mode.
-  - Double-click reverts to default colors.
-  - Middle-click quits the application.
-- **Maintenance**: When adding new metrics, update both retrieval logic in `metrics.py` and the HTML template in `main.py`.
+## Key Gotchas
+- **GPU metrics**: Require NVIDIA GPU. Falls back to WMI heuristics which are approximate.
+- **sys.path**: `main.py` appends its own directory; `run_widget.py` does the same. If adding modules, ensure they're importable from root.
+- **UI sizing**: Always call `wid.adjustSize()` after updating text to prevent clipping.
+- **Mouse controls**: Right-click toggles random color, double-click reverts, middle-click quits, scroll wheel adjusts background transparency.
+- **Logging**: `app_debug.log` for errors/startup, `metrics_history.log` for metric history (both gitignored).
+- **Window**: Frameless, translucent background, stays on top, positioned top-right of screen.
+
+## Adding Metrics
+Update `metrics.py` (retrieval) and the HTML template in `main.py` `_tick()` method simultaneously.
+
+## Build Artifacts
+- `dist/`, `build/`, `*.log`, `.venv/`, `.idea/` are all gitignored.

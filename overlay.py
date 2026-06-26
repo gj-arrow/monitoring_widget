@@ -122,8 +122,7 @@ class DraggableLabel(QWidget):
         self._drag_offset = event.pos()
         self.grabMouse()
         self.setCursor(QCursor(Qt.CursorShape.ClosedHandCursor))
-        self._bg_alpha_percent = max(0.0, self._bg_alpha_percent - 20.0)
-        self._update_bg_style()
+        self._bg_frame.setStyleSheet("background-color: rgba(0, 0, 139, 128); border: 2px solid rgba(100, 150, 255, 200);")
         logger.info("Drag mode entered, offset=%s", self._drag_offset)
 
     def _exit_drag_mode(self) -> None:
@@ -132,7 +131,8 @@ class DraggableLabel(QWidget):
         self._drag_offset = None
         self.releaseMouse()
         self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
-        self._update_bg_style()
+        alpha_value = int(max(0, min(255, self._bg_alpha_percent * 2.55)))
+        self._bg_frame.setStyleSheet(f"background-color: rgba(0, 0, 139, {alpha_value});")
         logger.info("Drag mode exited")
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:

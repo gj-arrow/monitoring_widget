@@ -6,6 +6,10 @@ import os
 import sys
 import logging
 
+logging.getLogger().setLevel(logging.DEBUG)
+for h in logging.getLogger().handlers:
+    h.setLevel(logging.DEBUG)
+
 # Настройка логирования ошибок в app_debug.log
 logging.basicConfig(
     filename=os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_debug.log"),
@@ -74,12 +78,22 @@ class MonitorApp:
         wid.show()
 
     def _handle_single_click(self) -> None:
-        self.random_mode = True
-        self.current_random_color = f"#{random.randint(0, 0xFFFFFF):06x}"
+        logging.info("_handle_single_click START")
+        try:
+            self.random_mode = True
+            self.current_random_color = f"#{random.randint(0, 0xFFFFFF):06x}"
+            logging.info("_handle_single_click OK, color=%s", self.current_random_color)
+        except Exception as e:
+            logging.error("_handle_single_click ERROR: %s", e, exc_info=True)
 
     def _handle_double_click(self) -> None:
-        self.random_mode = False
-        self.current_random_color = "#FFFFFF"
+        logging.info("_handle_double_click START")
+        try:
+            self.random_mode = False
+            self.current_random_color = "#FFFFFF"
+            logging.info("_handle_double_click OK")
+        except Exception as e:
+            logging.error("_handle_double_click ERROR: %s", e, exc_info=True)
 
     def _get_color(self, value: float, threshold: float = 80.0) -> str:
         return ALERT_RED if value >= threshold else ""

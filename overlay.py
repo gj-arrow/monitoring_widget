@@ -92,6 +92,7 @@ class DraggableLabel(QWidget):
             btn = event.button()
             if btn == Qt.MouseButton.MiddleButton:
                 QApplication.quit()
+                return
             elif btn == Qt.MouseButton.RightButton:
                 if event.clickCount() >= 2:
                     if self.on_double_click_callback:
@@ -106,11 +107,13 @@ class DraggableLabel(QWidget):
         except Exception as e:
             logger.error("mousePressEvent error: %s", e, exc_info=True)
         super().mousePressEvent(event)
+        event.accept()
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         if self._drag_mode and self._drag_offset is not None:
             self.move(event.globalPosition().toPoint() - self._drag_offset)
         super().mouseMoveEvent(event)
+        event.accept()
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton and self._drag_mode:
@@ -118,6 +121,7 @@ class DraggableLabel(QWidget):
             self._drag_offset = None
             self.setCursor(Qt.CursorShape.ArrowCursor)
         super().mouseReleaseEvent(event)
+        event.accept()
 
     def wheelEvent(self, event: QMouseEvent) -> None:
         delta = event.angleDelta().y()

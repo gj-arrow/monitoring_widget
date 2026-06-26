@@ -85,7 +85,7 @@ class DraggableLabel(QWidget):
         self._label.setFont(font)
         logger.info("Label font set: %s %dpt", font.family(), font.pointSize())
 
-   def mousePressEvent(self, event: QMouseEvent) -> None:
+    def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.MiddleButton:
             logger.info("Middle click detected - quitting")
             QApplication.quit()

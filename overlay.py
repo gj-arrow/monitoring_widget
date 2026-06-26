@@ -119,8 +119,10 @@ class DraggableLabel(QWidget):
     def _enter_drag_mode(self, event: QMouseEvent) -> None:
         """Enter drag mode, save offset, apply visual feedback."""
         self._drag_mode = True
-        self._drag_offset = event.position().toPoint()
+        self._drag_offset = event.pos()
         self.setMouseTracking(True)
+        self._bg_frame.setMouseTracking(True)
+        self._label.setMouseTracking(True)
         self.setCursor(QCursor(Qt.CursorShape.ClosedHandCursor))
         self._bg_alpha_percent = max(0.0, self._bg_alpha_percent - 20.0)
         self._update_bg_style()
@@ -131,6 +133,8 @@ class DraggableLabel(QWidget):
         self._drag_mode = False
         self._drag_offset = None
         self.setMouseTracking(False)
+        self._bg_frame.setMouseTracking(False)
+        self._label.setMouseTracking(False)
         self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
         self._update_bg_style()
         logger.info("Drag mode exited")

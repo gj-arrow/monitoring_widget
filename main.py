@@ -79,6 +79,7 @@ class MonitorApp:
 
     def _handle_double_click(self) -> None:
         self.random_mode = False
+        self.current_random_color = "#FFFFFF"
 
     def _get_color(self, value: float, threshold: float = 80.0) -> str:
         return ALERT_RED if value >= threshold else ""

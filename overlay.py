@@ -90,12 +90,20 @@ class DraggableLabel(QWidget):
             logger.info("Middle click detected - quitting")
             QApplication.quit()
         elif event.button() == Qt.MouseButton.RightButton:
-            logger.info("Right click detected - calling callback")
-            if self.on_click_callback:
-                try:
-                    self.on_click_callback()
-                except Exception as e:
-                    logger.error("on_click_callback error: %s", e)
+            if event.clickCount() >= 2:
+                logger.info("Double right click detected")
+                if self.on_double_click_callback:
+                    try:
+                        self.on_double_click_callback()
+                    except Exception as e:
+                        logger.error("on_double_click_callback error: %s", e)
+            else:
+                logger.info("Right click detected - calling callback")
+                if self.on_click_callback:
+                    try:
+                        self.on_click_callback()
+                    except Exception as e:
+                        logger.error("on_click_callback error: %s", e)
         elif event.button() == Qt.MouseButton.LeftButton and not self._drag_mode:
             self._enter_drag_mode(event)
         super().mousePressEvent(event)

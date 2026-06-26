@@ -1,7 +1,7 @@
 import logging
 from PyQt6.QtWidgets import QWidget, QFrame, QLabel, QApplication
 from PyQt6.QtCore import Qt, QSize, QPoint
-from PyQt6.QtGui import QMouseEvent, QFont, QCursor
+from PyQt6.QtGui import QMouseEvent, QFont
 
 logger = logging.getLogger('widget.overlay')
 
@@ -36,6 +36,8 @@ class DraggableLabel(QWidget):
         # Drag-and-drop state
         self._drag_mode = False
         self._drag_offset: QPoint | None = None
+
+        self.setMouseTracking(True)
 
     def sizeHint(self) -> QSize:
         return QSize(160, 90)
@@ -86,34 +88,36 @@ class DraggableLabel(QWidget):
         logger.info("Label font set: %s %dpt", font.family(), font.pointSize())
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
-        logger.info("mousePressEvent: button=%s clickCount=%s pos=%s globalPos=%s",
-                     event.button(), event.clickCount(), event.pos(), event.globalPos())
         try:
-            if event.button() == Qt.MouseButton.MiddleButton:
-                logger.info("Middle click detected - quitting")
+            btn = event.button()
+            if btn == Qt.MouseButton.MiddleButton:
                 QApplication.quit()
-            elif event.button() == Qt.MouseButton.RightButton:
+            elif btn == Qt.MouseButton.RightButton:
                 if event.clickCount() >= 2:
-                    logger.info("Double right click detected, calling double_click_callback")
                     if self.on_double_click_callback:
-                        try:
-                            self.on_double_click_callback()
-                        except Exception as e:
-                            logger.error("on_double_click_callback error: %s", e, exc_info=True)
+                        self.on_double_click_callback()
                 else:
-                    logger.info("Right click detected - calling callback")
                     if self.on_click_callback:
-                        try:
-                            self.on_click_callback()
-                        except Exception as e:
-                            logger.error("on_click_callback error: %s", e, exc_info=True)
-            elif event.button() == Qt.MouseButton.LeftButton and not self._drag_mode:
-                logger.info("Left click detected - entering drag mode")
-                self._enter_drag_mode(event)
-            else:
-                logger.info("Unhandled button=%s clickCount=%s", event.button(), event.clickCount())
+                        self.on_click_callback()
+            elif btn == Qt.MouseButton.LeftButton:
+                self._drag_mode = True
+                self._drag_offset = event.pos()
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
         except Exception as e:
             logger.error("mousePressEvent error: %s", e, exc_info=True)
+        event.accept()
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if self._drag_mode and self._drag_offset is not None:
+            self.move(event.globalPosition().toPoint() - self._drag_offset)
+        event.accept()
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and self._drag_mode:
+            self._drag_mode = False
+            self._drag_offset = None
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+        event.accept()
 
     def wheelEvent(self, event: QMouseEvent) -> None:
         delta = event.angleDelta().y()
@@ -121,32 +125,4 @@ class DraggableLabel(QWidget):
         self._bg_alpha_percent = max(0.0, min(100.0, self._bg_alpha_percent + change))
         alpha_value = int(self._bg_alpha_percent * 2.55)
         self.bg_alpha = alpha_value
-
-    def _enter_drag_mode(self, event: QMouseEvent) -> None:
-        """Enter drag mode, save offset, apply visual feedback."""
-        self._drag_mode = True
-        self._drag_offset = event.pos()
-        self.grabMouse()
-        self.setCursor(QCursor(Qt.CursorShape.ClosedHandCursor))
-        self._bg_frame.setStyleSheet("background-color: rgba(0, 0, 139, 128); border: 2px solid rgba(100, 150, 255, 200);")
-        logger.info("Drag mode entered, offset=%s", self._drag_offset)
-
-    def _exit_drag_mode(self) -> None:
-        """Exit drag mode, restore visual state."""
-        self._drag_mode = False
-        self._drag_offset = None
-        self.releaseMouse()
-        self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
-        alpha_value = int(max(0, min(255, self._bg_alpha_percent * 2.55)))
-        self._bg_frame.setStyleSheet(f"background-color: rgba(0, 0, 139, {alpha_value});")
-        logger.info("Drag mode exited")
-
-    def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        if self._drag_mode and self._drag_offset is not None:
-            new_pos = event.globalPosition().toPoint() - self._drag_offset
-            self.move(new_pos)
-
-    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
-        if self._drag_mode and event.button() == Qt.MouseButton.LeftButton:
-            self._exit_drag_mode()
-        super().mouseReleaseEvent(event)
+        event.accept()

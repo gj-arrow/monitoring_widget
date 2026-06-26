@@ -6,10 +6,6 @@ import os
 import sys
 import logging
 
-logging.getLogger().setLevel(logging.DEBUG)
-for h in logging.getLogger().handlers:
-    h.setLevel(logging.DEBUG)
-
 # Настройка логирования ошибок в app_debug.log
 logging.basicConfig(
     filename=os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_debug.log"),

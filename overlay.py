@@ -85,7 +85,7 @@ class DraggableLabel(QWidget):
         self._label.setFont(font)
         logger.info("Label font set: %s %dpt", font.family(), font.pointSize())
 
-    def mousePressEvent(self, event: QMouseEvent) -> None:
+   def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.MiddleButton:
             logger.info("Middle click detected - quitting")
             QApplication.quit()
@@ -107,15 +107,6 @@ class DraggableLabel(QWidget):
         elif event.button() == Qt.MouseButton.LeftButton and not self._drag_mode:
             self._enter_drag_mode(event)
         super().mousePressEvent(event)
-
-    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
-        logger.info("Double right click detected")
-        if self.on_double_click_callback:
-            try:
-                self.on_double_click_callback()
-            except Exception as e:
-                logger.error("on_double_click_callback error: %s", e)
-        super().mouseDoubleClickEvent(event)
 
     def wheelEvent(self, event: QMouseEvent) -> None:
         delta = event.angleDelta().y()

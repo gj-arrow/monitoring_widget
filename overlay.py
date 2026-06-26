@@ -105,19 +105,19 @@ class DraggableLabel(QWidget):
                 self.setCursor(Qt.CursorShape.ClosedHandCursor)
         except Exception as e:
             logger.error("mousePressEvent error: %s", e, exc_info=True)
-        event.accept()
+        super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         if self._drag_mode and self._drag_offset is not None:
             self.move(event.globalPosition().toPoint() - self._drag_offset)
-        event.accept()
+        super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton and self._drag_mode:
             self._drag_mode = False
             self._drag_offset = None
             self.setCursor(Qt.CursorShape.ArrowCursor)
-        event.accept()
+        super().mouseReleaseEvent(event)
 
     def wheelEvent(self, event: QMouseEvent) -> None:
         delta = event.angleDelta().y()

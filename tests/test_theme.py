@@ -1,6 +1,13 @@
+from types import SimpleNamespace
+
 import pytest
 
 import theme
+
+
+def snapshot(**fields):
+    """Stand-in for metrics.Snapshot, which a later task will define."""
+    return SimpleNamespace(**fields)
 
 
 @pytest.mark.parametrize(
@@ -70,3 +77,90 @@ def test_worst_state_picks_the_most_severe():
 
 def test_state_colors_are_distinct():
     assert len({theme.state_color(s).name() for s in (theme.NORMAL, theme.WARN, theme.CRITICAL)}) == 3
+
+
+def test_state_color_hands_out_a_copy_not_the_shared_token():
+    assert theme.state_color(theme.NORMAL) is not theme.CALM
+    assert theme.state_color(theme.WARN) is not theme.WARN_COLOR
+    assert theme.state_color(theme.CRITICAL) is not theme.CRITICAL_COLOR
+
+
+def test_mutating_a_returned_colour_leaves_the_tokens_alone():
+    before = [theme.CALM.alpha(), theme.WARN_COLOR.alpha(), theme.CRITICAL_COLOR.alpha()]
+    for state in (theme.NORMAL, theme.WARN, theme.CRITICAL):
+        theme.state_color(state).setAlpha(1)
+    assert [theme.CALM.alpha(), theme.WARN_COLOR.alpha(), theme.CRITICAL_COLOR.alpha()] == before
+
+
+def test_gpu_temperature_limits_are_70_and_80():
+    assert (theme.GPU_TEMP_WARN, theme.GPU_TEMP_CRITICAL) == (70.0, 80.0)
+
+
+@pytest.mark.parametrize(
+    ("temp", "expected"),
+    [
+        (None, theme.NORMAL),
+        (0.0, theme.NORMAL),
+        (69.9, theme.NORMAL),
+        (70.0, theme.WARN),
+        (79.9, theme.WARN),
+        (80.0, theme.CRITICAL),
+        (120.0, theme.CRITICAL),
+    ],
+)
+def test_gpu_temperature_boundaries(temp, expected):
+    assert theme.state_for(temp, theme.GPU_TEMP_WARN, theme.GPU_TEMP_CRITICAL) == expected
+
+
+def test_panel_width_is_pinned_to_280():
+    assert theme.WIDTH == 280
+    assert theme.panel_rect().width() == 280.0
+
+
+def test_row_value_reads_a_pct_row():
+    spec = theme.METRICS_BY_KEY["cpu_pct"]
+    assert theme.row_value(spec, snapshot(cpu_pct=42.0)) == 42.0
+    assert theme.row_value(spec, snapshot(gpu_pct=42.0)) is None
+
+
+def test_row_value_computes_a_gb_row():
+    spec = theme.METRICS_BY_KEY["ram"]
+    assert theme.row_value(spec, snapshot(ram_used_gb=6.0, ram_total_gb=16.0)) == 37.5
+
+
+def test_row_value_is_none_when_the_gb_row_cannot_be_computed():
+    spec = theme.METRICS_BY_KEY["ram"]
+    assert theme.row_value(spec, snapshot()) is None
+    assert theme.row_value(spec, snapshot(ram_used_gb=6.0)) is None
+    assert theme.row_value(spec, snapshot(ram_total_gb=16.0)) is None
+    assert theme.row_value(spec, snapshot(ram_used_gb=6.0, ram_total_gb=0.0)) is None
+
+
+def test_row_fraction_clamps_at_zero_and_one():
+    spec = theme.METRICS_BY_KEY["cpu_pct"]
+    assert theme.row_fraction(spec, snapshot(cpu_pct=-20.0)) == 0.0
+    assert theme.row_fraction(spec, snapshot(cpu_pct=0.0)) == 0.0
+    assert theme.row_fraction(spec, snapshot(cpu_pct=100.0)) == 1.0
+    assert theme.row_fraction(spec, snapshot(cpu_pct=140.0)) == 1.0
+    assert theme.row_fraction(spec, snapshot()) is None
+
+
+def test_metric_state_takes_the_worse_of_load_and_temperature():
+    spec = theme.METRICS_BY_KEY["gpu_pct"]
+    assert theme.metric_state(spec, snapshot(gpu_pct=50.0, gpu_temp_c=75.0)) == theme.WARN
+    assert theme.metric_state(spec, snapshot(gpu_pct=50.0, gpu_temp_c=20.0)) == theme.NORMAL
+    assert theme.metric_state(spec, snapshot(gpu_pct=96.0, gpu_temp_c=20.0)) == theme.CRITICAL
+    assert theme.metric_state(spec, snapshot(gpu_pct=50.0, gpu_temp_c=85.0)) == theme.CRITICAL
+
+
+def test_metric_state_survives_a_snapshot_without_a_temperature():
+    spec = theme.METRICS_BY_KEY["gpu_pct"]
+    assert theme.metric_state(spec, snapshot(gpu_pct=50.0)) == theme.NORMAL
+
+
+def test_has_any_data_is_false_for_an_entirely_empty_snapshot():
+    assert theme.has_any_data(snapshot()) is False
+
+
+def test_has_any_data_is_true_for_a_temperature_alone():
+    assert theme.has_any_data(snapshot(gpu_temp_c=45.0)) is True

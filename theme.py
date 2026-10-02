@@ -125,11 +125,21 @@ def row_fraction(spec: MetricSpec, snapshot) -> float | None:
     return min(1.0, max(0.0, value / 100.0))
 
 
+def gpu_temp(snapshot) -> float | None:
+    """Auxiliary GPU temperature, or None when the reading is absent.
+
+    Read with getattr so a snapshot that has no temperature field at all
+    degrades to "no data" instead of raising AttributeError.
+    """
+    return getattr(snapshot, "gpu_temp_c", None)
+
+
 def metric_state(spec: MetricSpec, snapshot) -> int:
     """Worst state for a row, counting its auxiliary reading too."""
     state = state_for(row_value(spec, snapshot), spec.warn, spec.critical)
-    if spec.key == "gpu_pct" and snapshot.gpu_temp_c is not None:
-        state = max(state, state_for(snapshot.gpu_temp_c, GPU_TEMP_WARN, GPU_TEMP_CRITICAL))
+    temp = gpu_temp(snapshot)
+    if spec.key == "gpu_pct" and temp is not None:
+        state = max(state, state_for(temp, GPU_TEMP_WARN, GPU_TEMP_CRITICAL))
     return state
 
 
@@ -137,7 +147,7 @@ def has_any_data(snapshot) -> bool:
     """True when at least one number will be on screen."""
     if any(row_value(spec, snapshot) is not None for spec in METRICS):
         return True
-    return snapshot.gpu_temp_c is not None
+    return gpu_temp(snapshot) is not None
 
 
 def worst_state(states) -> int:
@@ -145,7 +155,12 @@ def worst_state(states) -> int:
 
 
 def state_color(state: int) -> QColor:
-    return _STATE_COLORS[state]
+    """A fresh copy: QColor is mutable, so callers may adjust alpha on it.
+
+    Handing back _STATE_COLORS[state] would let one caller mutate theme.CALM
+    for everyone else in the process.
+    """
+    return QColor(_STATE_COLORS[state])
 
 
 def panel_rect() -> QRectF:

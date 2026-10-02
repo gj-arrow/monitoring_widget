@@ -15,6 +15,7 @@ edge reading as a hard wall against the desktop.
 from __future__ import annotations
 
 import logging
+import time
 import traceback
 
 from PyQt6.QtCore import QPoint, Qt, pyqtSignal
@@ -31,6 +32,15 @@ logger = logging.getLogger("widget.overlay")
 WINDOW_TITLE = "System Monitor"
 CORNER_MARGIN = 10
 
+# Seconds between two render-failure records, whatever the faults are. update()
+# fires every theme.TICK_MS, so 300 s is 150 frames of silence between records:
+# a fault that never clears is announced at most 288 times a day instead of
+# 43 200, and still often enough that "still broken" shows up several times in
+# any working session. A fault that clears and comes back later does not wait
+# for this at all -- the first frame that paints cleanly drops the memo, and the
+# next failure is written out at once.
+PAINT_ERROR_LOG_INTERVAL = 300.0
+
 
 class MonitorPanel(QWidget):
     menu_requested = pyqtSignal(QPoint)
@@ -45,6 +55,7 @@ class MonitorPanel(QWidget):
         }
         self._drag_origin: QPoint | None = None
         self._last_paint_error: str | None = None
+        self._last_paint_log = float("-inf")
 
         self.setWindowTitle(WINDOW_TITLE)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
@@ -115,19 +126,27 @@ class MonitorPanel(QWidget):
             painter.end()
 
     def _log_paint_failure(self) -> None:
-        """Log one fault once, whatever it keeps failing at.
+        """At most one record per PAINT_ERROR_LOG_INTERVAL, naming the newest fault.
 
-        update() runs every theme.TICK_MS for as long as the widget is up, so an
-        unguarded logger.exception() would append the same traceback to
-        app_debug.log tens of thousands of times a day -- the log growth this
-        rewrite set out to stop. Keyed on the traceback text rather than on a
-        time window: an identical repeat says nothing new, while a *different*
-        fault is written out immediately, because that one is new information.
+        The identity alone cannot bound this. It says whether the traceback
+        changed, and a changed traceback is exactly what two faults alternating
+        every frame -- or one message carrying a varying value, `expected 37.4`
+        -- produce on every single frame: 43 200 tracebacks a day, about 17 MB,
+        into a plain basicConfig with no rotation. That is the log-growth
+        problem this rewrite set out to fix, so the interval gates every record
+        rather than only the repeats.
+
+        What the identity still buys: the first failure after a healthy frame is
+        reported at once, since a clean frame drops the memo, and the record
+        written when the interval is up always carries the fault as it stands
+        then -- so a new fault is delayed, never lost.
         """
-        failure = traceback.format_exc()
-        if failure == self._last_paint_error:
+        already_reported = self._last_paint_error is not None
+        self._last_paint_error = traceback.format_exc()
+        now = time.monotonic()
+        if already_reported and now - self._last_paint_log < PAINT_ERROR_LOG_INTERVAL:
             return
-        self._last_paint_error = failure
+        self._last_paint_log = now
         logger.exception("panel paint failed")
 
     # --- placement --------------------------------------------------------
@@ -214,6 +233,11 @@ class MonitorPanel(QWidget):
         super().hideEvent(event)
 
     def mouseDoubleClickEvent(self, event) -> None:
+        # Before the move, not after it: a double-click whose release was
+        # swallowed leaves the grab armed, and the corner the panel is about to
+        # jump to would carry a closed-hand cursor claiming it is being carried
+        # there.
+        self._cancel_drag()
         self.restore_default_position()
         event.accept()
 

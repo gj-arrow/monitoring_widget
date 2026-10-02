@@ -109,6 +109,49 @@ def render_panel(panel):
     return image
 
 
+def fresh_paint(panel):
+    """One paint() call on a painter of its own: what the widget should draw."""
+    image = blank_canvas()
+    canvas_painter = QPainter(image)
+    try:
+        paint(canvas_painter, panel._snapshot, panel._histories, panel.current_alpha())
+    finally:
+        canvas_painter.end()
+    return image
+
+
+class Clock:
+    """A monotonic clock the test owns.
+
+    The paint-log floor is minutes long by design, so no test may wait for it.
+    Replacing overlay's `time` puts the frame cadence and the floor on the same
+    pretend timeline.
+    """
+
+    def __init__(self, start: float = 1000.0) -> None:
+        self.now = start
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def tick(self, frames: int = 1) -> None:
+        self.now += theme.TICK_MS / 1000.0 * frames
+
+
+def failing_paint(message):
+    def raiser(*args, **kwargs):
+        raise RuntimeError(message)
+
+    return raiser
+
+
+# The chosen log floor, restated here on purpose. The bounds below are computed
+# from this value rather than from overlay.PAINT_ERROR_LOG_INTERVAL, so moving
+# the interval -- raising it far enough to mute a fault, or lowering it enough
+# to let the log grow -- fails instead of quietly redefining "correct".
+EXPECTED_LOG_FLOOR = 300.0
+
+
 def max_channel_delta(a, b):
     worst = 0
     for y in range(a.height()):
@@ -417,12 +460,30 @@ def test_drag_is_clamped_to_the_screen():
     ), f"left at {panel.pos()}, dragging is what keeps it on screen"
 
 
-def test_double_click_restores_the_corner():
+def test_a_double_click_cancels_an_armed_drag():
+    """The double click gives the drag back before it moves the panel.
+
+    press, then a double-click with the release swallowed -- the same loss the
+    hide case has -- leaves _drag_origin armed and the cursor on a closed hand.
+    The buttons() guard stops the panel from actually being dragged, but the
+    cursor claims "grabbing" until the next move or press, on a panel that has
+    already jumped back to the corner.
+    """
     panel = make_panel()
-    panel.move(10, 10)
-    panel.restore_default_position()
-    available = panel.screen().availableGeometry()
-    assert panel.x() > available.left()
+    panel.move(400, 300)
+    panel.mousePressEvent(mouse_event(
+        QMouseEvent.Type.MouseButtonPress, panel, QPoint(410, 310),
+        Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+    ))
+    assert panel.cursor().shape() == Qt.CursorShape.ClosedHandCursor
+
+    panel.mouseDoubleClickEvent(mouse_event(
+        QMouseEvent.Type.MouseButtonDblClick, panel, QPoint(420, 320),
+        Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+    ))
+
+    assert panel._drag_origin is None, "the double click left the grab armed"
+    assert panel.cursor().shape() == Qt.CursorShape.OpenHandCursor
 
 
 def test_a_double_click_drives_the_panel_back_to_the_corner():
@@ -583,62 +644,118 @@ def test_paint_event_ends_every_painter_it_opens(monkeypatch):
 
 
 def test_a_failed_frame_does_not_take_the_process_with_it(caplog, monkeypatch):
-    """One bad frame must cost a frame, not the desktop.
+    """One bad frame must cost a frame, not the process.
 
     PyQt calls qFatal() when a Python exception escapes a reimplemented virtual
     method, so a raise out of paintEvent ends the process -- and this widget is
     meant to sit on someone's screen all day. painter.py reads snapshot.ts,
     cpu_mhz and cpu_max_mhz straight off the dataclass rather than through an
-    accessor, so any snapshot thinner than metrics.Snapshot aborts the whole
-    application without this guard.
+    accessor, so any snapshot thinner than metrics.Snapshot would take the whole
+    application down from inside a paint event.
 
-    Rendered inside pytest.raises: outside it, a raise from paintEvent does not
-    come back as a Python exception at all, it takes the interpreter down. That
-    is the whole point of the guard, and the only way a test can hold the
-    un-guarded implementation still enough to observe it.
+    Driven through render() because that is the path a real frame takes; the
+    raise never comes back as a Python exception there, it ends the
+    interpreter. test_a_failed_frame_does_not_raise_out_of_the_handler is the
+    same fault seen from somewhere a failure can be read.
     """
     panel = make_panel()
     panel.apply_snapshot(Snapshot(cpu_pct=34.0))
 
-    def raising_paint(*args, **kwargs):
-        raise RuntimeError("simulated render failure")
-
     with monkeypatch.context() as patch:
-        patch.setattr(overlay, "paint", raising_paint)
+        patch.setattr(overlay, "paint", failing_paint("simulated render failure"))
         for _ in range(5):
-            image = render_panel(panel)
-            assert not image.isNull(), "the panel stopped painting anything at all"
+            render_panel(panel)
 
     assert "simulated render failure" in caplog.text, (
         "a frame that failed to render said nothing: the failure would only be "
         "visible as a panel that quietly stopped updating"
     )
 
+    # And the guard cost the widget nothing: it paints the whole panel again
+    # the moment the renderer is well.
+    assert max_channel_delta(render_panel(panel), fresh_paint(panel)) == 0, (
+        "the panel did not go back to painting itself once the renderer "
+        "recovered: the failed frames left it damaged"
+    )
 
-def test_a_failed_frame_still_ends_its_painter(caplog, monkeypatch):
+
+def test_a_failed_frame_does_not_raise_out_of_the_handler(monkeypatch):
+    """The same fault, caught where a test can see it.
+
+    render() hands the exception to Qt, which aborts: a regression there kills
+    the whole run, and a dead run tells you nothing about which test died.
+    paintEvent called directly raises into this frame instead, so narrowing or
+    dropping the guard fails this one test with a traceback that says what.
+    """
+    panel = make_panel()
+    panel.apply_snapshot(Snapshot(cpu_pct=34.0))
+
+    with monkeypatch.context() as patch:
+        patch.setattr(overlay, "paint", failing_paint("simulated render failure"))
+        panel.paintEvent(None)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ValueError("not a number"),
+        KeyError("cpu_pct"),
+        TypeError("not subscriptable"),
+        ZeroDivisionError("division by zero"),
+        AttributeError("no attribute 'ts'"),
+    ],
+    ids=["ValueError", "KeyError", "TypeError", "ZeroDivisionError", "AttributeError"],
+)
+def test_the_render_guard_is_wide_enough_for_any_fault(caplog, monkeypatch, error):
+    """`except Exception`, not `except RuntimeError`.
+
+    Every other failure test injects a RuntimeError because that is the easy
+    one to raise, which is exactly why a guard narrowed to RuntimeError passes
+    all of them. The faults painter.py can plausibly hit -- an attribute a thin
+    snapshot does not carry, a value that will not divide, a key that is not
+    there -- are ValueError, TypeError, KeyError and AttributeError, and the
+    panel would die on the first of them.
+
+    Driven through paintEvent directly so a narrowed guard fails this test
+    rather than aborting the run on the way to it.
+    """
+    panel = make_panel()
+    panel.apply_snapshot(Snapshot(cpu_pct=34.0))
+
+    def raiser(*args, **kwargs):
+        raise error
+
+    with monkeypatch.context() as patch:
+        patch.setattr(overlay, "paint", raiser)
+        panel.paintEvent(None)
+
+    assert type(error).__name__ in caplog.text, (
+        f"a {type(error).__name__} out of the renderer was swallowed without a "
+        "word in the log"
+    )
+
+
+def test_a_failed_frame_still_ends_its_painter(monkeypatch):
     """The guard must not swallow the painter along with the exception.
 
     finally: painter.end() is what keeps the widget's paint device free for the
-    next tick. An except that returns before the end() would leave the painter
+    next tick. An except that returned before the end() would leave the painter
     active on the device, and the failure would trade one broken frame for a
     broken panel.
-    """
-    def raising_paint(*args, **kwargs):
-        raise RuntimeError("simulated render failure")
 
+    Through render(), not a direct paintEvent call, and the difference is the
+    whole test: QPainter on a widget that was never shown never activates, so
+    isActive() would read False for a painter that never began. render()
+    redirects the painter onto a real device, which is what makes "ended" mean
+    something here.
+    """
     panel = make_panel()
     panel.apply_snapshot(Snapshot(cpu_pct=34.0))
 
     with recording_painters(monkeypatch) as opened:
         with monkeypatch.context() as patch:
-            patch.setattr(overlay, "paint", raising_paint)
-            try:
-                render_panel(panel)
-            except RuntimeError:
-                # Without the guard this raise escapes paintEvent, which ends
-                # the interpreter. Swallowed here so the assertion below can
-                # still report on the painter instead of taking the run with it.
-                pass
+            patch.setattr(overlay, "paint", failing_paint("simulated render failure"))
+            render_panel(panel)
 
         assert opened, "paintEvent opened no painter, so this test proves nothing"
         still_active = active_painters(opened)
@@ -654,34 +771,21 @@ def test_one_failing_fault_is_logged_once_not_once_per_tick(caplog, monkeypatch)
     An unguarded logger.exception() would append the same traceback to
     app_debug.log tens of thousands of times a day, which is the log growth the
     rewrite set out to stop. Five failed frames are one fault, so they are one
-    log record; a different fault is logged at once, because that one is new
-    information.
+    log record.
     """
-    def raising_paint(*args, **kwargs):
-        raise RuntimeError("simulated render failure")
-
-    def other_paint(*args, **kwargs):
-        raise ValueError("a different fault entirely")
-
     panel = make_panel()
     panel.apply_snapshot(Snapshot(cpu_pct=34.0))
 
     with caplog.at_level(logging.ERROR, logger="widget.overlay"):
         with monkeypatch.context() as patch:
-            patch.setattr(overlay, "paint", raising_paint)
+            patch.setattr(overlay, "paint", failing_paint("simulated render failure"))
             for _ in range(5):
                 render_panel(panel)
-            assert len(caplog.records) == 1, (
-                f"five identical failures logged {len(caplog.records)} times: "
-                "one fault is one log record"
-            )
 
-            patch.setattr(overlay, "paint", other_paint)
-            render_panel(panel)
-            assert len(caplog.records) == 2, (
-                f"a different fault logged nothing new: {len(caplog.records)} "
-                "records after two distinct faults"
-            )
+    assert len(caplog.records) == 1, (
+        f"five identical failures logged {len(caplog.records)} times: one fault "
+        "is one log record"
+    )
 
 
 def test_a_recovered_panel_reports_the_same_fault_again(caplog, monkeypatch):
@@ -692,15 +796,12 @@ def test_a_recovered_panel_reports_the_same_fault_again(caplog, monkeypatch):
     swallowed for the rest of the session, which is the log-growth fix taken too
     far.
     """
-    def raising_paint(*args, **kwargs):
-        raise RuntimeError("simulated render failure")
-
     panel = make_panel()
     panel.apply_snapshot(Snapshot(cpu_pct=34.0))
 
     with caplog.at_level(logging.ERROR, logger="widget.overlay"):
         with monkeypatch.context() as patch:
-            patch.setattr(overlay, "paint", raising_paint)
+            patch.setattr(overlay, "paint", failing_paint("simulated render failure"))
             render_panel(panel)
             render_panel(panel)
             assert len(caplog.records) == 1
@@ -708,12 +809,91 @@ def test_a_recovered_panel_reports_the_same_fault_again(caplog, monkeypatch):
             patch.undo()
             render_panel(panel)
 
-            patch.setattr(overlay, "paint", raising_paint)
+            patch.setattr(overlay, "paint", failing_paint("simulated render failure"))
             render_panel(panel)
 
     assert len(caplog.records) == 2, (
         f"the same fault after a healthy frame logged {len(caplog.records) - 1} "
         "times: the panel never noticed it had recovered"
+    )
+
+
+def test_repeated_faults_are_bounded_by_the_log_floor(caplog, monkeypatch):
+    """One fault, all day: one record per floor, not one per frame.
+
+    The memo alone cannot do this. Its key is the formatted traceback, so a
+    message carrying a changing value -- `ValueError: expected 37.4` -- never
+    matches itself and every frame logs. A day of that is 43 200 records, and
+    the handler on the other end is a plain basicConfig with no rotation.
+    """
+    panel = make_panel()
+    panel.apply_snapshot(Snapshot(cpu_pct=34.0))
+    clock = Clock()
+    monkeypatch.setattr(overlay, "time", clock)
+    frames = 1800  # one frame per theme.TICK_MS, for an hour
+
+    with caplog.at_level(logging.ERROR, logger="widget.overlay"):
+        with monkeypatch.context() as patch:
+            patch.setattr(overlay, "paint", failing_paint("simulated render failure"))
+            for _ in range(frames):
+                render_panel(panel)
+                clock.tick()
+
+    span = frames * theme.TICK_MS / 1000.0
+    ceiling = 1 + int(span // EXPECTED_LOG_FLOOR)
+    assert overlay.PAINT_ERROR_LOG_INTERVAL == EXPECTED_LOG_FLOOR
+    assert len(caplog.records) <= ceiling, (
+        f"{frames} failed frames logged {len(caplog.records)} records, more than "
+        f"the {ceiling} a {EXPECTED_LOG_FLOOR:.0f}s floor allows: the log is "
+        "growing with the frame count again"
+    )
+    assert len(caplog.records) >= ceiling - 1, (
+        f"{frames} failed frames logged only {len(caplog.records)} records: the "
+        "floor is muting a fault that never clears rather than spacing it out"
+    )
+    assert len(caplog.records) < frames / 100, "the floor is not bounding anything"
+
+
+def test_alternating_faults_are_bounded_by_the_log_floor(caplog, monkeypatch):
+    """Two faults, every frame: the worst case for an identity memo.
+
+    Every traceback differs from the last, so a memo that logs on any change
+    writes a record per frame -- the case the floor exists for. It must report
+    the change at the next tick of the channel, and the record it writes then
+    has to name the fault that is actually failing, so the change is delayed
+    rather than lost.
+    """
+    panel = make_panel()
+    panel.apply_snapshot(Snapshot(cpu_pct=34.0))
+    clock = Clock()
+    monkeypatch.setattr(overlay, "time", clock)
+    faults = [failing_paint("probe A"), failing_paint("probe B")]
+
+    with caplog.at_level(logging.ERROR, logger="widget.overlay"):
+        with monkeypatch.context() as patch:
+            for index in range(10):
+                patch.setattr(overlay, "paint", faults[index % 2])
+                render_panel(panel)
+                clock.tick()
+
+            assert len(caplog.records) == 1, (
+                f"ten alternating failures logged {len(caplog.records)} records: "
+                "the memo never matches, so only a time floor can bound this"
+            )
+
+            # The floor is a floor, not a mute: five minutes later it speaks
+            # again, and what it says is the fault as it stands now.
+            clock.now += overlay.PAINT_ERROR_LOG_INTERVAL
+            patch.setattr(overlay, "paint", faults[-1])
+            render_panel(panel)
+
+    assert len(caplog.records) == 2, (
+        f"the floor suppressed the repeat for good: {len(caplog.records)} records "
+        "after a whole interval had passed"
+    )
+    assert "probe B" in caplog.text, (
+        "the record written after the interval names an older fault: a fault "
+        "that replaced another one is reported as the wrong thing"
     )
 
 

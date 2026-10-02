@@ -4,15 +4,29 @@ Nothing here calls show(). A test run must leave no window on screen. Every
 thing the panel needs works while it is hidden: render() drives paintEvent
 without a native window, and QWidget.screen() falls back to the primary screen
 when the widget has no window handle yet.
+
+Where the panel needs its own painting inspected, the tests go through
+panel.render() rather than repaint(): render() redirects the painter that
+paintEvent creates into a QImage the test owns, so the pixels under test are
+the widget's own.
 """
 
 import pytest
 from PyQt6.QtCore import QPoint, QPointF, Qt
-from PyQt6.QtGui import QContextMenuEvent, QMouseEvent, QWheelEvent
+from PyQt6.QtGui import (
+    QColor,
+    QContextMenuEvent,
+    QImage,
+    QMouseEvent,
+    QPainter,
+    QWheelEvent,
+)
 
+import overlay
 import theme
 from metrics import Snapshot
 from overlay import MonitorPanel
+from painter import paint
 from settings import Settings
 
 
@@ -51,6 +65,34 @@ def wheel(dy):
         Qt.ScrollPhase.ScrollUpdate,
         False,
     )
+
+
+def blank_canvas():
+    image = QImage(theme.CANVAS_W, theme.CANVAS_H, QImage.Format.Format_ARGB32_Premultiplied)
+    image.fill(QColor(0, 0, 0, 0))
+    return image
+
+
+def render_panel(panel):
+    """Paint the widget into an image, hidden, without repainting the screen."""
+    image = blank_canvas()
+    panel.render(image)
+    return image
+
+
+def max_channel_delta(a, b):
+    worst = 0
+    for y in range(a.height()):
+        for x in range(a.width()):
+            left, right = a.pixelColor(x, y), b.pixelColor(x, y)
+            worst = max(
+                worst,
+                abs(left.red() - right.red()),
+                abs(left.green() - right.green()),
+                abs(left.blue() - right.blue()),
+                abs(left.alpha() - right.alpha()),
+            )
+    return worst
 
 
 def test_the_panel_is_the_canvas_size_and_not_the_panel_size(qapp):
@@ -202,3 +244,96 @@ def test_clamp_keeps_the_panel_on_screen(qapp):
     clamped = panel.clamp_to_screen(QPoint(99999, 99999))
     assert clamped.x() <= available.right() - panel.width()
     assert clamped.y() <= available.bottom() - panel.height()
+
+
+def test_a_position_from_a_build_with_a_smaller_panel_is_honoured(qapp):
+    """No migration for the top-left left behind in settings.json.
+
+    The stored pair is a top-left corner, and a corner that put a 280 px wide
+    panel on screen still puts a 296 px one on screen: the widget grew into the
+    margin it was already drawn over. Rewriting or discarding it would move the
+    panel out from under the user on the first start of this build, so the
+    answer is to leave the number alone and let clamping judge it against the
+    size the panel is now.
+    """
+    panel = make_panel(qapp)
+    available = panel.screen().availableGeometry()
+    stored = QPoint(available.right() - theme.WIDTH - 20, available.top() + 40)
+
+    assert panel.clamp_to_screen(stored) == stored
+
+
+def test_two_ticks_through_paint_event_match_one_fresh_paint(qapp):
+    """The reused painter must land on the same pixels twice, and match paint().
+
+    paint() translates the canvas by theme.BLEED, so a painter that kept that
+    translate would start every tick 8 px further right than the last and walk
+    the panel off the canvas -- while the golden images, each painted by a
+    fresh painter, stayed green. Task 5 proves paint() hands the painter back
+    unchanged; this proves the widget uses one the way the app does, which is
+    the only place that accumulation could happen.
+
+    ts defaults to 0.0, so the header carries no age text and the wall clock
+    paint() reads for it cannot move a pixel between the three renders.
+    """
+    panel = make_panel(qapp)
+    panel.set_alpha(theme.DEFAULT_ALPHA)
+    for cpu in (28.0, 34.0, 41.0):
+        panel.apply_snapshot(Snapshot(cpu_pct=cpu, ram_used_gb=11.4, ram_total_gb=32.0))
+
+    first = render_panel(panel)
+    second = render_panel(panel)
+
+    reference = blank_canvas()
+    reference_painter = QPainter(reference)
+    try:
+        paint(
+            reference_painter,
+            panel._snapshot,
+            panel._histories,
+            panel.current_alpha(),
+        )
+    finally:
+        reference_painter.end()
+
+    assert max_channel_delta(second, first) == 0, (
+        "the second tick painted different pixels than the first: the painter "
+        "kept state between ticks"
+    )
+    assert max_channel_delta(second, reference) == 0, (
+        f"two ticks through paintEvent differ from one paint() call by "
+        f"{max_channel_delta(second, reference)} counts: the widget's own "
+        "painting is drifting, clipped, or drawing nothing at all"
+    )
+
+
+def test_paint_event_ends_every_painter_it_opens(qapp, monkeypatch):
+    """A painter left open stays active on the widget, and the next tick's
+    QPainter(self) then finds the device already in use.
+
+    The pixels cannot show this: PyQt's garbage collector ends an abandoned
+    painter as the frame unwinds, so a missing end() still renders correctly
+    once and only misbehaves later, inside Qt. Holding a reference to each
+    painter is what makes it visible. overlay imports QPainter by name, so
+    patching the module attribute is enough to see the ones it opens.
+    """
+    opened = []
+
+    class RecordingPainter(QPainter):
+        def __init__(self, device):
+            super().__init__(device)
+            opened.append(self)
+
+    monkeypatch.setattr(overlay, "QPainter", RecordingPainter)
+
+    panel = make_panel(qapp)
+    panel.apply_snapshot(Snapshot(cpu_pct=34.0))
+    render_panel(panel)
+
+    assert opened, "paintEvent opened no painter, so this test proves nothing"
+    still_active = [index for index, p in enumerate(opened) if p.isActive()]
+    assert not still_active, (
+        f"paintEvent returned with painter(s) {still_active} still active: "
+        "they were never ended, so the next tick paints onto a device that is "
+        "already in use"
+    )

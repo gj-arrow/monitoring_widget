@@ -1,142 +1,399 @@
-"""Точка входа для системного монитора."""
-import warnings
-warnings.filterwarnings("ignore", category=FutureWarning)
+"""Application entry point: DPI policy, sampling thread, tray menu.
 
-import os
-import sys
+Sampling runs on its own thread. psutil.cpu_percent(interval=0.1) blocks for
+a tenth of a second, and doing that on the GUI thread froze the panel every
+two seconds; here the GUI thread only ever paints.
+
+The tray icon and the right-click menu are the only way out of a panel with
+no title bar: without them the process lives until the task manager notices.
+"""
+
+from __future__ import annotations
+
+import ctypes
 import logging
+import logging.handlers
+import sys
+from ctypes import wintypes
+from pathlib import Path
 
-# Настройка логирования ошибок в app_debug.log
-logging.basicConfig(
-    filename=os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_debug.log"),
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+from PyQt6.QtCore import (
+    QDeadlineTimer,
+    QMutex,
+    QMutexLocker,
+    QPoint,
+    QThread,
+    QTimer,
+    QWaitCondition,
+    Qt,
+    pyqtSignal,
 )
+from PyQt6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap
+from PyQt6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
-# Добавляем лог о запуске приложения
-logging.info("Приложение MonitorApp запускается...")
+import theme
+from history import HistoryLog
+from metrics import SystemProbe
+from overlay import MonitorPanel
+from settings import Settings, config_path, load_settings, save_settings
 
-# Add the current script's directory to sys.path to ensure imports work from any location
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+logger = logging.getLogger("widget.main")
 
-from PyQt6.QtWidgets import QApplication
-from PyQt6.QtCore import QTimer
-from PyQt6.QtGui import QFont
+LOG_NAME = "app_debug.log"
+LOG_MAX_BYTES = 512 * 1024
+LOG_BACKUPS = 2
+LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 
-import random
-import metrics as m
-from overlay import DraggableLabel
+DWMWA_SYSTEMBACKDROP_TYPE = 38
+DWMSBT_TRANSIENTWINDOW = 3
 
-CPU_GREEN = "#33ff99"
-GPU_PURPLE = "#FF00FF"
-VRAM_BLUE = "#82aaff"
-RAM_ORANGE = "#FF8C00"
-ALERT_RED = "#ff3333"
-WIDGET_ALPHA_PERCENT = 0
+# How long shutdown waits for the sampler. Bounded because a sample already
+# blocked inside psutil cannot be cancelled, and a widget on someone's desktop
+# must never hang on it: past this the thread is abandoned, not waited for.
+SHUTDOWN_WAIT_MS = 3000
 
-class MonitorApp:
-    """Запуск и поддержка жизненного цикла приложения."""
+TRAY_TITLE = "System Monitor"
+ACRYLIC_REFUSED = "This Windows build refused the acrylic backdrop."
+HISTORY_REFUSED = "Could not open metrics_history.log."
 
-    def __init__(self) -> None:
-        self.app = QApplication(sys.argv)
-        self.random_mode = False
-        self.current_random_color = "#FFFFFF"
+ALPHA_STEPS = (("35%", 0.35), ("50%", 0.50), ("65%", 0.65), ("80%", 0.80), ("100%", 1.00))
 
-        self._wid = DraggableLabel(
-            on_click_callback=self._handle_single_click,
-            on_double_click_callback=self._handle_double_click
-        )
-        wid = self._wid
-        wid.bg_alpha = int(WIDGET_ALPHA_PERCENT * 2.55)
 
-        # Set font and style - text stays bright always
-        font = QFont("Consolas", 12, QFont.Weight.Bold)
-        wid.setFont(font)
-        self.widget_alpha = WIDGET_ALPHA_PERCENT
+def log_path() -> Path:
+    """Beside settings.json, which is beside the executable when frozen.
 
-        # Setup timer for updates
-        timer = QTimer(self.app)
-        timer.timeout.connect(lambda: self._tick(wid))
-        timer.start(2000)
+    Not the working directory: a frozen build started from a shortcut has a
+    working directory nobody chose, and the log would be scattered across the
+    desktop while the settings it explains stayed put.
+    """
+    return config_path().with_name(LOG_NAME)
 
-        self._tick(wid)
-        wid.adjustSize()
-        
-        screen = wid.screen().availableGeometry()
-        margin = 10
-        # Position in top-right corner with margin
-        x = screen.right() - wid.width() - margin
-        y = screen.top() + margin
-        wid.move(x, y)
-        
-        wid.show()
-        
-        wid.show()
 
-    def _handle_single_click(self) -> None:
-        self.random_mode = True
-        self.current_random_color = f"#{random.randint(0, 0xFFFFFF):06x}"
-        self._tick(self._wid)
+def build_log_handler(name: str | Path | None = None) -> logging.handlers.RotatingFileHandler:
+    """A log that cannot outgrow its welcome: at most 3 x LOG_MAX_BYTES."""
+    handler = logging.handlers.RotatingFileHandler(
+        str(name or log_path()),
+        maxBytes=LOG_MAX_BYTES,
+        backupCount=LOG_BACKUPS,
+        encoding="utf-8",
+    )
+    handler.setFormatter(logging.Formatter(LOG_FORMAT))
+    return handler
 
-    def _handle_double_click(self) -> None:
-        self.random_mode = False
-        self.current_random_color = "#FFFFFF"
-        self._tick(self._wid)
 
-    def _get_color(self, value: float, threshold: float = 80.0) -> str:
-        return ALERT_RED if value >= threshold else ""
+def setup_logging() -> None:
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    if not any(isinstance(h, logging.handlers.RotatingFileHandler) for h in root.handlers):
+        root.addHandler(build_log_handler())
+    # The per-metric warning lines are useful; the INFO chatter from failed
+    # probes is not, and it was most of what filled the old log.
+    logging.getLogger("widget.metrics").setLevel(logging.WARNING)
 
-    def update_transparency(self, alpha_percent: float) -> None:
-        """Update the background transparency percentage (0-100)."""
-        self.widget_alpha = max(0.0, min(100.0, alpha_percent))
-        bg_value = int(self.widget_alpha * 2.55)
-        for widget in QApplication.allWidgets():
-            if isinstance(widget, DraggableLabel):
-                widget.bg_alpha = bg_value
-                break
 
-    def _tick(self, wid: DraggableLabel) -> None:
-        try:
-            cpu = float(m.cpu_pct())
-            gpu_u = float(m.gpu_utilization())
-            gpu_uv = float(m.gpu_vram_used_gb())
-            gpu_tv = float(m.gpu_vram_total_gb())
-            ram_u = float(m.ram_used_gb())
-            ram_t = float(m.ram_total_gb())
-            gpu_temp = float(m.gpu_temp())
+class Collector(QThread):
+    """Samples on a worker thread and emits each Snapshot to the GUI thread.
 
-            def get_element_color(base_color: str, value_percent: float) -> str:
-                if self._get_color(value_percent):
-                    return ALERT_RED
-                if self.random_mode:
-                    return self.current_random_color
-                return base_color
+    A poke is a request for one sample, not a queue entry. The timer pokes
+    every theme.TICK_MS and the menu pokes again on the way in, so a poke that
+    queued would let the sampler fall behind and catch up as fast as the CPU
+    allows; 25 pokes during one in-flight sample buy exactly one extra
+    reading, which is what the boolean flag below is for.
+    """
 
-            cpu_color = get_element_color(CPU_GREEN, cpu)
-            gpu_color = get_element_color(GPU_PURPLE, gpu_u)
-            vram_color = get_element_color(GPU_PURPLE, (gpu_uv / gpu_tv) * 100 if gpu_tv > 0 else 0)
-            ram_color = get_element_color(RAM_ORANGE, (ram_u / ram_t) * 100 if ram_t > 0 else 0)
+    sampled = pyqtSignal(object)
 
-            html = (
-                f"<span style='color:{cpu_color}'>CPU </span>"
-                f"<span style='font-weight:bold;color:{cpu_color}'>{cpu}%</span><br/>"
-                f"<span style='color:{ram_color}'>RAM </span>"
-                f"<span style='font-weight:bold;color:{ram_color}'>{ram_u}</span>"
-                f"<span style='color:{ram_color}'>/{ram_t}GB</span><br/>"
-                f"<span style='color:{gpu_color}'>GPU </span>"
-                f"<span style='font-weight:bold;color:{gpu_color}'>{gpu_u}% {gpu_temp}°C</span><br/>"
-                f"<span style='color:{vram_color}'>VRAM </span>"
-                f"<span style='font-weight:bold;color:{vram_color}'>{gpu_uv}</span>"
-                f"<span style='color:{vram_color}'>/{gpu_tv}GB</span>"
-            )
-            wid.setText(html)
-        except Exception as e:
-            logging.error(f"Error updating metrics: {e}", exc_info=True)
+    def __init__(self, probe, parent=None) -> None:
+        super().__init__(parent)
+        self._probe = probe
+        self._mutex = QMutex()
+        self._wake = QWaitCondition()
+        self._pending = False
+
+    def poke(self) -> None:
+        """Ask for an out-of-band sample, e.g. right after the user opens the menu."""
+        with QMutexLocker(self._mutex):
+            self._pending = True
+            self._wake.wakeAll()
 
     def run(self) -> None:
-        sys.exit(self.app.exec())
+        while not self.isInterruptionRequested():
+            # Cleared before the sample rather than after it: a sample takes
+            # about 100 ms, and a poke arriving in that window would be erased
+            # by a clear that runs afterwards. The flag is also what makes the
+            # poke land at all -- wakeAll() on a QWaitCondition nobody is
+            # waiting on is dropped, and it is dropped here, mid-sample.
+            with QMutexLocker(self._mutex):
+                self._pending = False
+            self.sampled.emit(self._probe.sample())
+            with QMutexLocker(self._mutex):
+                # The three ways out of a wait: poked, the tick expiring, and
+                # an interruption. The last one is checked here as well as at
+                # the top of the loop, so shutdown does not have to sit out the
+                # rest of the tick waiting for the deadline to expire.
+                while not self._pending and not self.isInterruptionRequested():
+                    if not self._wake.wait(self._mutex, QDeadlineTimer(theme.TICK_MS)):
+                        break
+                self._pending = False
+
+
+def stop_collector(collector: Collector, timeout_ms: int = SHUTDOWN_WAIT_MS) -> bool:
+    """Interrupt the sampler and wait for it, bounded. True when it stopped.
+
+    The poke is what makes it prompt, and the timeout is what makes it finite:
+    a sample already blocked inside psutil cannot be interrupted, so waiting on
+    it forever is the one way this could hang.
+    """
+    collector.requestInterruption()
+    collector.poke()
+    return collector.wait(timeout_ms)
+
+
+def enable_acrylic(hwnd: int) -> bool:
+    """Ask DWM for real backdrop blur. False when the OS refuses.
+
+    Only reached when the user ticks the setting; the default translucent fill
+    needs no ctypes and works from Windows 8 onwards.
+    """
+    if not sys.platform.startswith("win") or not hwnd:
+        return False
+    try:
+        value = ctypes.c_int(DWMSBT_TRANSIENTWINDOW)
+        result = ctypes.windll.dwmapi.DwmSetWindowAttribute(
+            wintypes.HWND(hwnd),
+            ctypes.c_uint(DWMWA_SYSTEMBACKDROP_TYPE),
+            ctypes.byref(value),
+            ctypes.sizeof(value),
+        )
+        return result == 0
+    except Exception:
+        logger.info("acrylic unavailable", exc_info=True)
+        return False
+
+
+def build_tray_icon() -> QIcon:
+    pixmap = QPixmap(32, 32)
+    pixmap.fill(QColor(0, 0, 0, 0))
+    painter = QPainter(pixmap)
+    try:
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(theme.CALM)
+        painter.drawRoundedRect(4, 4, 24, 24, 7, 7)
+        painter.setBrush(theme.VALUE)
+        for index, height in enumerate((8, 13, 18)):
+            painter.drawRoundedRect(9 + index * 6, 26 - height, 4, height, 2, 2)
+    finally:
+        painter.end()
+    return QIcon(pixmap)
+
+
+class MonitorApp:
+    """The panel, the sampler feeding it, and the tray menu that owns both."""
+
+    def __init__(self) -> None:
+        self.settings: Settings = load_settings()
+        self.history_log = HistoryLog()
+        if self.settings.log_history:
+            self.settings.log_history = self.history_log.enable()
+
+        self.panel = MonitorPanel(self.settings)
+        self.panel.set_alpha(self.settings.alpha)
+
+        # No parent: a QThread whose parent is destroyed while it is still
+        # running aborts the process, and a widget must not be able to do that
+        # by being collected. Nothing here can collect it -- this object holds
+        # it and shutdown() joins it first.
+        self.collector = Collector(SystemProbe())
+        self.collector.sampled.connect(self.panel.apply_snapshot)
+        self.collector.sampled.connect(self._record_history)
+
+        self.panel.menu_requested.connect(self._show_menu_at)
+        self.panel.quit_requested.connect(self.shutdown)
+
+        self._stopped = False
+        self._alpha_actions: dict[float, QAction] = {}
+        self._toggle_actions: dict[str, QAction] = {}
+
+        # Before the menu exists, so the checkmark shows what was actually
+        # granted rather than what the file asked for.
+        self._apply_acrylic(self.settings.acrylic)
+
+        self.tray = QSystemTrayIcon(build_tray_icon(), self.panel)
+        self.tray.setToolTip(TRAY_TITLE)
+        self.tray.activated.connect(self._on_tray_activated)
+        self.tray.setContextMenu(self._build_menu())
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            logger.warning("no system tray: the right-click menu is the only way out")
+        self.tray.show()
+
+        self.timer = QTimer(self.panel)
+        self.timer.timeout.connect(self.collector.poke)
+        self.timer.start(theme.TICK_MS)
+
+        self._restore_position()
+        self.panel.show()
+
+        self.collector.start()
+
+    # --- wiring -----------------------------------------------------------
+
+    def _record_history(self, snapshot) -> None:
+        self.history_log.write(snapshot)
+
+    def _restore_position(self) -> None:
+        if self.settings.x is not None and self.settings.y is not None:
+            self.panel.move(self.panel.clamp_to_screen(QPoint(self.settings.x, self.settings.y)))
+        else:
+            self.panel.restore_default_position()
+        self.panel.remember_position()
+
+    def _on_tray_activated(self, reason) -> None:
+        if reason in (
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        ):
+            self.panel.restore_default_position()
+
+    def _show_menu_at(self, global_pos) -> None:
+        self._sync_menu()
+        # The values the user is about to read are two seconds old at worst;
+        # this makes the menu open on fresh ones.
+        self.collector.poke()
+        self.tray.contextMenu().exec(global_pos)
+
+    def _sync_menu(self) -> None:
+        """Re-check the menu against the settings before it opens.
+
+        A menu built once at startup keeps claiming the state it had then: the
+        wheel changes the alpha without coming through here, and the acrylic
+        and history toggles can be refused by the OS or by the filesystem
+        after the checkmark has already gone on.
+        """
+        for value, action in self._alpha_actions.items():
+            action.setChecked(abs(self.settings.alpha - value) < 0.001)
+        for name, action in self._toggle_actions.items():
+            action.setChecked(bool(getattr(self.settings, name)))
+
+    # --- menu -------------------------------------------------------------
+
+    def _build_menu(self) -> QMenu:
+        menu = QMenu()
+
+        reset = QAction("Reset position", menu)
+        reset.triggered.connect(self.panel.restore_default_position)
+        menu.addAction(reset)
+
+        opacity = menu.addMenu("Opacity")
+        for label, value in ALPHA_STEPS:
+            action = QAction(label, opacity)
+            action.setCheckable(True)
+            action.setChecked(abs(self.settings.alpha - value) < 0.001)
+            action.triggered.connect(lambda _checked=False, v=value: self._set_alpha(v))
+            opacity.addAction(action)
+            self._alpha_actions[value] = action
+
+        on_top = QAction("Always on top", menu)
+        on_top.setCheckable(True)
+        on_top.setChecked(self.settings.always_on_top)
+        on_top.toggled.connect(self._set_always_on_top)
+        menu.addAction(on_top)
+        self._toggle_actions["always_on_top"] = on_top
+
+        acrylic = QAction("Acrylic backdrop", menu)
+        acrylic.setCheckable(True)
+        acrylic.setChecked(self.settings.acrylic)
+        acrylic.toggled.connect(self._set_acrylic)
+        menu.addAction(acrylic)
+        self._toggle_actions["acrylic"] = acrylic
+
+        history = QAction("Write history to file", menu)
+        history.setCheckable(True)
+        history.setChecked(self.settings.log_history)
+        history.toggled.connect(self._set_log_history)
+        menu.addAction(history)
+        self._toggle_actions["log_history"] = history
+
+        menu.addSeparator()
+        quit_action = QAction("Quit", menu)
+        quit_action.triggered.connect(self.shutdown)
+        menu.addAction(quit_action)
+        return menu
+
+    def _set_alpha(self, value: float) -> None:
+        self.panel.set_alpha(value)
+        self.collector.poke()
+
+    def _set_always_on_top(self, enabled: bool) -> None:
+        self.settings.always_on_top = enabled
+        self.panel.apply_window_flags()
+
+    def _apply_acrylic(self, enabled: bool) -> bool:
+        """Try to turn the backdrop on, and record what was actually granted."""
+        granted = bool(enabled) and enable_acrylic(int(self.panel.winId()))
+        self.settings.acrylic = granted
+        if enabled and not granted:
+            logger.info("acrylic refused, using the translucent fill")
+        return granted
+
+    def _set_acrylic(self, enabled: bool) -> None:
+        granted = self._apply_acrylic(enabled)
+        if enabled and not granted:
+            self.tray.showMessage(TRAY_TITLE, ACRYLIC_REFUSED)
+        self.panel.update()
+
+    def _set_log_history(self, enabled: bool) -> None:
+        if not enabled:
+            # HistoryLog keeps its own flag, and write() only checks that one:
+            # clearing the setting alone would leave the trace growing.
+            self.history_log.disable()
+            self.settings.log_history = False
+            return
+        self.settings.log_history = self.history_log.enable()
+        if not self.settings.log_history:
+            self.tray.showMessage(TRAY_TITLE, HISTORY_REFUSED)
+
+    # --- shutdown ---------------------------------------------------------
+
+    def shutdown(self) -> None:
+        """Stop everything, once, however many things asked.
+
+        Middle-click, the tray's Quit and an external quit all land here and
+        any two of them can arrive together; a second call returns at once
+        rather than waiting out another timeout or saving settings over a
+        collector that is already gone.
+        """
+        if self._stopped:
+            return
+        self._stopped = True
+        self.timer.stop()
+        if not stop_collector(self.collector):
+            logger.error("sampler thread did not stop within %d ms", SHUTDOWN_WAIT_MS)
+        save_settings(self.settings)
+        self.tray.hide()
+        QApplication.quit()
+
+
+def main() -> int:
+    QApplication.setHighDpiScaleFactorRoundingPolicy(
+        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+    )
+    app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
+    setup_logging()
+    logger.info("MonitorApp starting")
+    try:
+        monitor = MonitorApp()
+    except Exception:
+        # A frozen build has no console for the traceback to reach, so this is
+        # the only record that startup ever happened and failed.
+        logger.exception("MonitorApp failed to start")
+        return 1
+    # A quit nobody asked for -- a logoff, a session end -- does not come
+    # through the tray menu, and the settings are only written on the way out.
+    app.aboutToQuit.connect(monitor.shutdown)
+    return app.exec()
 
 
 if __name__ == "__main__":
-    MonitorApp().run()
+    sys.exit(main())

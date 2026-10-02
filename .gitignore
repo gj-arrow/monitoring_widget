@@ -18,6 +18,8 @@ metrics_history.log
 *.swp
 *.swo
 
+settings.json
+
 # Build artifacts (PyInstaller)
 dist/
 build/

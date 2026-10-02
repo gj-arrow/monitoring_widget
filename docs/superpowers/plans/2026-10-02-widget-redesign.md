@@ -451,9 +451,28 @@ def test_history_clamps_out_of_range_input():
 
 
 def test_resample_keeps_a_one_sample_spike():
-    points = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+    # The peak must share a column window with a value near the previous
+    # point, or uniform sampling gives the same answer and the test proves
+    # nothing. Windows at width 4 are [0,0] [0,0.4,1.0] [0,0] [0,0,0].
+    points = [0.0, 0.0, 0.0, 0.4, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     got = resample(points, 4)
     assert max(p.y() for p in got) == 1.0
+    naive = [points[column * len(points) // 4] for column in range(4)]
+    assert naive == [0.0, 0.0, 0.0, 0.0]
+
+
+def test_resample_tie_break_is_measured_from_the_previous_column():
+    # Column 1's window is [0.8, 0.95] and the previous point is 1.0, so the
+    # furthest value is 0.8. A plain per-column max would pick 0.95.
+    got = resample([1.0, 0.0, 0.8, 0.95], 2)
+    assert [p.y() for p in got] == [1.0, 0.8]
+
+
+def test_resample_only_draws_values_that_were_measured():
+    points = [0.2, 0.25, 0.18, 0.22, 0.9, 0.2, 0.24, 0.19, 0.21, 0.2]
+    ys = [p.y() for p in resample(points, 5)]
+    assert set(ys) <= set(points)
+    assert max(ys) == 0.9
 
 
 def test_resample_keeps_every_point_when_it_fits():
@@ -506,6 +525,7 @@ thrown away, and uniform sampling throws away spikes.
 from __future__ import annotations
 
 import logging
+import math
 from collections import deque
 from pathlib import Path
 
@@ -528,7 +548,9 @@ class History:
         return len(self._values)
 
     def append(self, value: float | None) -> None:
-        if value is None:
+        # NaN is skipped, not clamped: min/max silently turn NaN into 0.0,
+        # which would record an invented sample as a real reading.
+        if value is None or math.isnan(value):
             return
         self._values.append(min(1.0, max(0.0, value)))
 
@@ -545,8 +567,15 @@ def resample(points: list[float], width: int) -> list[QPointF]:
     Uniform sampling would drop spikes: with more samples than pixels a
     one-sample spike is easily averaged away, and the graph would lie about
     exactly the moment it exists to reveal. Instead each column picks the
-    value furthest from the previously drawn point, which keeps the spike
-    and stays visually continuous.
+    value furthest from the previously drawn point, so a peak survives.
+
+    That deliberately breaks visual continuity at a spike, which is the
+    trade being made. Column 0 has no predecessor, so it takes a plain
+    per-column max: with nothing to be continuous with, the maximum is the
+    only spike-preserving choice.
+
+    Values are not clamped here; `History.append` clamps before anything
+    reaches this function, and a NaN is dropped there rather than recorded.
     """
     if width <= 0 or not points:
         return []
@@ -563,7 +592,7 @@ def resample(points: list[float], width: int) -> list[QPointF]:
         lo = column * n // width
         hi = max(lo + 1, (column + 1) * n // width)
         window = points[lo:hi]
-        chosen = max(window) if previous is None else min(window, key=lambda v: abs(v - previous))
+        chosen = max(window) if previous is None else max(window, key=lambda v: abs(v - previous))
         out.append(QPointF(float(column), chosen))
         previous = chosen
     return out
@@ -620,7 +649,7 @@ def _csv(value: float | None) -> str:
 
 Run: `python -m pytest tests/test_history.py -q`
 
-Expected: `9 passed`.
+Expected: `11 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -2006,7 +2035,7 @@ class MonitorPanel(QWidget):
 
 Run: `python -m pytest tests/test_overlay.py -q`
 
-Expected: `9 passed`.
+Expected: `11 passed`.
 
 - [ ] **Step 5: Run the whole suite**
 

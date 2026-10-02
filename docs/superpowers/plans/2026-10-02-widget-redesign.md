@@ -51,7 +51,6 @@ the design that can silently be wrong, so it goes first with its tests.
 - Create: `tests/conftest.py`
 - Create: `tests/test_theme.py`
 - Create: `theme.py`
-- Modify: `requirements.txt`
 
 **Interfaces:**
 - Consumes: nothing.
@@ -390,23 +389,15 @@ Run: `python -m pytest tests/test_theme.py -q`
 
 Expected: `16 passed`.
 
-- [ ] **Step 7: Update `requirements.txt`**
+- [ ] **Step 7: Leave `requirements.txt` alone**
 
-```text
-PyQt6>=6.5.0
-psutil>=5.9.0
-pynvml>=11.5.0; sys_platform == 'win32'
-wmi>=1.4.9; sys_platform == 'win32'
-pytest>=8.0.0; extra == "dev"
-```
-
-Note: pip ignores the `extra` marker on a plain requirements file. Add it anyway as
-documentation of the dev dependency, and rely on Task 12 to mention it in the docs.
+Do not touch it. Its four runtime entries are correct and pytest is not a runtime dependency;
+Task 11 adds `requirements-dev.txt` for it.
 
 - [ ] **Step 8: Commit**
 
 ```bash
-git add theme.py tests/conftest.py tests/test_theme.py requirements.txt
+git add theme.py tests/conftest.py tests/test_theme.py
 git commit -m "feat: add theme module with thresholds and panel geometry
 
 Single source of truth for palette, 80/95 percentage thresholds, GPU
@@ -2765,20 +2756,19 @@ commit the fix before claiming completion.
 **Files:**
 - None.
 
-- [ ] **Step 1: Panel matches the design at 100 % DPI**
+Two steps below are marked **HUMAN-ONLY**: no subagent can perform them. They are recorded, not
+skipped, and the final report must surface them to the user.
 
-Run: `python main.py`
+- [ ] **Step 1: Panel matches the design at 100 % DPI** — **HUMAN-ONLY**
 
-Expected: four rows, 280 × 280 logical pixels, no clipping, values right-aligned, graphs
-building. Compare against `tests/golden/calm.png`.
+An agent can launch the app and screenshot it, but judging whether it "matches the design" needs
+a human looking at a real desktop. The agent does run the automated half: `python main.py`, take
+a screenshot, confirm the panel is 280 × 280 logical pixels with four rows and no clipping.
 
-- [ ] **Step 2: Panel holds up at 150 % DPI**
+- [ ] **Step 2: Panel holds up at 150 % DPI** — **HUMAN-ONLY**
 
-Set Windows display scaling to 150 %, log off and on, then run `python main.py`.
-
-Expected: the panel is physically larger (420 × 420 device pixels) but identical in proportion,
-text is crisp, nothing is clipped or doubled. This is the criterion that a manual DPI multiplier
-would have broken.
+Requires changing Windows display scaling and logging off and on. Record as pending for the user;
+do not attempt it.
 
 - [ ] **Step 3: No stutter, low CPU use**
 

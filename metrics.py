@@ -540,16 +540,35 @@ class NetProbe:
             # appears brings cumulative counters with it, and summing those in
             # publishes its whole lifetime -- measured with a VPN adapter
             # carrying 9 GB, 1,575,001,000 B/s on one tick, and then six more
-            # ticks of the EMA decaying from that peak. An adapter that vanishes
-            # leaves the sum missing a term. Neither is the machine's traffic.
+            # ticks of the EMA decaying from that peak.
             #
             # Unmeasured is the honest answer, and it is the same answer a
-            # counter that went backwards gets below: these are one defect --
-            # a discontinuity in a cumulative counter -- read in two directions.
+            # counter that went backwards gets below: these are one defect -- a
+            # discontinuity in a cumulative counter -- read in two directions.
             # Summing only the adapters present in both samples was the
-            # alternative; it avoids the dash but publishes a subset of the
-            # traffic as though it were all of it, which is wrong by an unknown
-            # amount exactly when a freshly connected adapter is moving data.
+            # alternative, and it fails on the vanishing side as badly as on the
+            # appearing one: the departed adapter's final interval is a term
+            # missing from the sum, so the intersection would silently drop real
+            # traffic that had already happened. That is the same unbounded
+            # error as a lifetime total, not the cosmetic cost of a lost dash --
+            # which is what settles set *equality* here rather than a one-way
+            # "anything appeared" check. Any number printed is a claim about the
+            # machine's total, and the total is unknowable on a tick like this.
+            #
+            # The average goes with it. Carried across the churn, a 300 KB/s peak
+            # blends with the next real reading as 0.35*20000 + 0.65*300000 =
+            # 202000 and then decays for five more ticks -- the artefact the
+            # counter-reset branch below was fixed for, reached through the branch
+            # that claims the two agree. Dropping it costs nothing: the tick after
+            # this one seeds fresh from a real measurement.
+            #
+            # The comparison is over the *real* adapters, because _summed_adapters
+            # drops the pseudo interfaces before handing the names back. Windows
+            # brings and goes a loopback pseudo-interface on its own, and if it
+            # counted here every such churn would cost a tick that was perfectly
+            # measurable throughout.
+            for key in NET_KEYS:
+                self._averaged[key] = None
             return out
 
         for index, key in enumerate(NET_KEYS, start=2):

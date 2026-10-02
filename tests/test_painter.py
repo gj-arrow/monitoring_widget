@@ -20,7 +20,7 @@ from types import SimpleNamespace
 
 import pytest
 from PyQt6.QtCore import QPointF, QRectF, Qt
-from PyQt6.QtGui import QColor, QFont, QImage, QPainter, QPen, QTransform
+from PyQt6.QtGui import QColor, QFont, QFontMetricsF, QImage, QPainter, QPen, QTransform
 
 import painter
 import theme
@@ -594,6 +594,23 @@ def test_an_unmeasured_rate_renders_a_dash_in_both_directions(monkeypatch):
         (1048576.0, "1.0 MB/s"),
         (1_250_000_000.0, "1250.0 MB/s"),
         (999_900_000.0, "999.9 MB/s"),
+        # The top of the ladder. The unit list stops at MB/s, so a value whose
+        # megabyte figure would read 1000.0 or more has no unit left to be
+        # stated in -- 1e12 rendered a 302-character string and overran the
+        # header by more than its whole width. "At least" is the honest
+        # monotone statement about a number known to be enormous but with no
+        # bound to quote against.
+        (999_949_999.0, "999.9 MB/s"),
+        # The top of the ladder, and the same documented artefact as the
+        # half-unit boundaries below: the unit switches on the unrounded
+        # magnitude, so 999.96 MB/s prints as "1000.0 MB/s". The saturating arm
+        # starts at exactly one terabyte, where the figure would otherwise be a
+        # megabyte count large enough to overrun the header.
+        (999_960_000.0, "1000.0 MB/s"),
+        (999_999_999_999.0, "1000000.0 MB/s"),
+        (1e12, ">= 1000.0 TB/s"),
+        (1e300, ">= 1000.0 TB/s"),
+        (-1e300, ">= 1000.0 TB/s"),
     ],
 )
 def test_the_rate_formatter_picks_the_unit_from_the_magnitude(value, expected):
@@ -606,9 +623,34 @@ def test_the_rate_formatter_picks_the_unit_from_the_magnitude(value, expected):
     assert painter._format_rate(value) == expected
 
 
+def test_the_widest_rate_string_the_header_must_fit_is_bounded():
+    """Measured, because it decides the header's font.
+
+    Not the saturated arm: the ladder's *own* ceiling is wider. A value just
+    under the terabyte renders as `1000000.0 MB/s`, so that pair -- not
+    `>= 1000.0 TB/s` -- is the longest string _format_net can produce. Both are
+    measured, and both are pinned in the parametrised test above, because if the
+    bound ever moved the two could swap and the header would have to change
+    rather than the bound.
+    """
+    def width(value):
+        widest = painter._format_net(SimpleNamespace(net_down_bytes_per_sec=value,
+                                                    net_up_bytes_per_sec=value))
+        return QFontMetricsF(theme.aux_font()).horizontalAdvance(widest), widest
+
+    available = theme.header_rect().right() - theme.header_text_x()
+    for value, expected in ((999_999_999_999.0, "DN 1000000.0 MB/s  UP 1000000.0 MB/s"),
+                            (1e300, "DN >= 1000.0 TB/s  UP >= 1000.0 TB/s")):
+        metrics_width, widest = width(value)
+        assert widest == expected
+        assert metrics_width <= available, (
+            f"{widest!r} is {metrics_width:.0f} px against {available:.0f} px of header"
+        )
+
+
 @pytest.mark.parametrize(
-    "rate", [999_900_000.0, 1_250_000_000.0],
-    ids=["999.9 MB/s", "1250.0 MB/s"],
+    "rate", [999_900_000.0, 1_250_000_000.0, 999_999_999_999.0, 1e300],
+    ids=["999.9 MB/s", "1250.0 MB/s", "1000000.0 MB/s", "saturated"],
 )
 def test_the_longest_header_string_stays_clear_of_the_dot_and_inside_the_header(monkeypatch, rate):
     """Measured, not asserted from a metrics calculation.

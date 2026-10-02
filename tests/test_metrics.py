@@ -950,6 +950,67 @@ def test_a_new_adapter_publishes_its_lifetime_as_this_interval():
     assert values == {"net_down_bytes_per_sec": None, "net_up_bytes_per_sec": None}, values
 
 
+def test_adapter_churn_drops_the_average_built_before_it():
+    # A 300 KB/s average is established, then a VPN adapter appears. The churn
+    # tick is unmeasured, but the *next* tick's true traffic is 20 KB/s and the
+    # average has to go with it. Carried across the churn, the EMA blends the
+    # real 20000 into the dead 300000 at 0.35/0.65 and reads 202000 on the first
+    # recovery tick -- then 138300, 96895, 69982, 52488 as it decays: the same
+    # six-tick artefact the counter-reset path was fixed for, reached through the
+    # branch whose comment claims the two paths agree.
+    giga = 1024 ** 3
+    probe = net_probe([
+        [("Ethernet", 0, 0)],
+        [("Ethernet", 600_000, 600_000)],
+        [("Ethernet", 620_000, 620_000), ("VPN Adapter", 9 * giga, 3 * giga)],
+        [("Ethernet", 640_000, 640_000), ("VPN Adapter", 9 * giga + 20_000, 3 * giga + 20_000)],
+        [("Ethernet", 660_000, 660_000), ("VPN Adapter", 9 * giga + 40_000, 3 * giga + 40_000)],
+    ])
+    probe.read()
+    probe._now.advance(2.0)
+    assert probe.read() == {"net_down_bytes_per_sec": 300_000.0,
+                            "net_up_bytes_per_sec": 300_000.0}, (
+        "the fixture never established the average this test is about"
+    )
+    probe._now.advance(2.0)
+    assert probe.read() == {"net_down_bytes_per_sec": None, "net_up_bytes_per_sec": None}
+    probe._now.advance(2.0)
+    # 40000 bytes over 2 s -- the real figure, not a blend with the old peak.
+    # Both directions, because the average is held per key and clearing only one
+    # of them would leave the other decaying.
+    assert probe.read() == {"net_down_bytes_per_sec": 20_000.0,
+                            "net_up_bytes_per_sec": 20_000.0}
+    probe._now.advance(2.0)
+    # And it stays there: a fresh seed, so no decay tail behind it either.
+    assert probe.read() == {"net_down_bytes_per_sec": 20_000.0,
+                            "net_up_bytes_per_sec": 20_000.0}
+
+
+def test_a_vanishing_adapter_drops_the_average_too():
+    # Same argument on the other side of the set comparison, and the reason the
+    # check is set *equality* rather than one-directional: the departed adapter's
+    # final interval is a term missing from the sum, so the total is as
+    # unknowable as on the appearing side.
+    probe = net_probe([
+        [("Ethernet", 0, 0), ("VPN Adapter", 0, 0)],
+        [("Ethernet", 600_000, 600_000), ("VPN Adapter", 600_000, 600_000)],
+        [("Ethernet", 620_000, 620_000)],
+        [("Ethernet", 640_000, 640_000)],
+    ])
+    probe.read()
+    probe._now.advance(2.0)
+    # Both adapters at 600_000 and summed: 1_200_000 over 2 s.
+    assert probe.read() == {"net_down_bytes_per_sec": 600_000.0,
+                            "net_up_bytes_per_sec": 600_000.0}, (
+        "the fixture never established the average this test is about"
+    )
+    probe._now.advance(2.0)
+    assert probe.read() == {"net_down_bytes_per_sec": None, "net_up_bytes_per_sec": None}
+    probe._now.advance(2.0)
+    assert probe.read() == {"net_down_bytes_per_sec": 10_000.0,
+                            "net_up_bytes_per_sec": 10_000.0}
+
+
 def test_an_adapter_that_appears_and_stays_measures_normally_from_the_next_tick():
     # The recovery is the half that matters: a policy that simply gave up on the
     # network would pass the test above and break the panel permanently. Both

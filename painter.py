@@ -41,6 +41,7 @@ UP_LABEL = "UP"
 # being printed. Memory stays binary because that is what the OS reports.
 _KB = 1000
 _MB = 1000 ** 2
+_TB = 1000 ** 4
 
 
 def paint(
@@ -137,12 +138,27 @@ def _format_rate(value: float | None) -> str:
     not have; above a kilobyte the figure moves by whole units often enough that
     one decimal is the finest change which still reads as a change rather than
     as the smoothing factor's own noise.
+
+    The unit list stops at MB/s, so there is a saturating arm from one terabyte
+    up. Every other counter-derived number in metrics.py is bounded at the source,
+    but this one cannot be: a rate is a difference of two monotonically rising
+    counters divided by an interval that is checked for positivity, so nothing
+    upstream can produce an absurd value and nothing upstream can rule one out
+    either. The arm is here rather than in that code because an enormous rate is
+    not *invalid* -- it is unrenderable, and "at least" is the honest monotone
+    statement about a number known to be huge with no bound to quote it against.
+    1e12 rendered a 302-character string, overrunning the header by more than its
+    own width. The arm is on the magnitude, so a negative input saturates too:
+    the probe cannot produce one, and `>=` is what the string already claims.
     """
     if value is None:
         return "--"
-    if abs(value) >= _MB:
+    magnitude = abs(value)
+    if magnitude >= _TB:
+        return ">= 1000.0 TB/s"
+    if magnitude >= _MB:
         return f"{value / _MB:.1f} MB/s"
-    if abs(value) >= _KB:
+    if magnitude >= _KB:
         return f"{value / _KB:.1f} KB/s"
     return f"{value:.0f} B/s"
 

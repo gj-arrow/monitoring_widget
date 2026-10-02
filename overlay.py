@@ -29,6 +29,13 @@ from settings import Settings
 logger = logging.getLogger("widget.overlay")
 
 WINDOW_TITLE = "System Monitor"
+
+# Widget placement policy rather than a design token: how far from the screen
+# corner the panel comes to rest. No renderer code reads it, and the tokens in
+# theme.py are the ones the panel's pixels are drawn from. WHEEL_ALPHA_STEP went
+# the other way in wave 1 and lives in theme.py, which is the more consistent
+# home for a constant a test wants to quote; moving this one there is a one-line
+# change in any commit allowed to touch theme.py.
 CORNER_MARGIN = 10
 
 # Seconds between two render-failure records, whatever the faults are, and
@@ -175,6 +182,10 @@ class MonitorPanel(QWidget):
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.MiddleButton:
+            # Every button path gives the grab back, this one included: the app
+            # is about to quit, and a widget that has already started shutting
+            # down has no business still claiming it is being dragged.
+            self._cancel_drag()
             self.quit_requested.emit()
             event.accept()
             return
@@ -227,16 +238,21 @@ class MonitorPanel(QWidget):
         super().hideEvent(event)
 
     def mouseDoubleClickEvent(self, event) -> None:
+        # The grab goes back whatever button the double click carried: a
+        # double-click whose release was swallowed leaves _drag_origin armed, and
+        # the closed-hand cursor outlives the hand that closed it. Restricting
+        # this handler to the left button put that cancel behind an early
+        # return, and the right button then leaked the grab it had no business
+        # touching.
+        self._cancel_drag()
         if event.button() != Qt.MouseButton.LeftButton:
-            # The right button asks for the tray menu. It has no business
-            # moving the panel, and none at all snapping it home.
+            # The right button asks for the tray menu. It has no business moving
+            # the panel, and none at all snapping it home.
             super().mouseDoubleClickEvent(event)
             return
-        # Before the move, not after it: a double-click whose release was
-        # swallowed leaves the grab armed, and the corner the panel is about to
-        # jump to would carry a closed-hand cursor claiming it is being carried
-        # there.
-        self._cancel_drag()
+        # Before the move, not after it: the corner the panel is about to jump
+        # to would otherwise carry a closed-hand cursor claiming it is being
+        # carried there.
         self.restore_default_position()
         event.accept()
 

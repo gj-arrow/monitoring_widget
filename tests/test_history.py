@@ -159,3 +159,70 @@ def test_default_history_length_comes_from_theme():
     for step in range(theme.HISTORY_LEN + 1):
         h.append(step / theme.HISTORY_LEN)
     assert len(h) == theme.HISTORY_LEN
+
+
+def _write_trace(path, header, rows):
+    path.write_text(header + "\n" + "".join(row + "\n" for row in rows), encoding="utf-8")
+
+
+def test_history_log_rotates_a_stale_header_instead_of_mixing_columns(tmp_path, caplog):
+    # A trace left by a build with other columns is not a header this build
+    # can honour. Appending to it writes rows of one width under a header of
+    # another, and every column after the first is silently wrong -- so the
+    # old trace is rotated aside and the new one starts clean.
+    import logging
+
+    from history import HistoryLog
+    from metrics import Snapshot
+
+    path = tmp_path / "history.log"
+    _write_trace(path, "t,cpu,gpu,temp", ["0,1,2,3", "1,4,5,6"])
+
+    log = HistoryLog(path)
+    assert log.enable() is True
+    with caplog.at_level(logging.WARNING, logger="widget.history"):
+        log.write(Snapshot(cpu_pct=7.0, ts=2.0))
+
+    kept = tmp_path / "history.log.1"
+    assert kept.read_text(encoding="utf-8") == "t,cpu,gpu,temp\n0,1,2,3\n1,4,5,6\n"
+    header, row = path.read_text(encoding="utf-8").strip().splitlines()
+    assert header == ",".join(Snapshot(cpu_pct=7.0, ts=2.0).as_dict().keys())
+    assert row == "2,7,,,,,,,,"
+    assert any("history.log.1" in record.message for record in caplog.records)
+
+
+def test_history_log_keeps_a_matching_header_and_only_appends_a_row(tmp_path):
+    # The rotation must not fire on a trace this build could have written
+    # itself, or a normal restart would strand a fresh file every time.
+    from history import HistoryLog
+    from metrics import Snapshot
+
+    path = tmp_path / "history.log"
+    header = ",".join(Snapshot().as_dict().keys())
+    _write_trace(path, header, ["1,2,,,,,,,,"])
+
+    log = HistoryLog(path)
+    log.enable()
+    log.write(Snapshot(cpu_pct=9.0, ts=3.0))
+
+    lines = path.read_text(encoding="utf-8").strip().splitlines()
+    assert lines == [header, "1,2,,,,,,,,", "3,9,,,,,,,,"]
+    assert not (tmp_path / "history.log.1").exists()
+
+
+def test_history_log_rotation_takes_the_next_free_suffix(tmp_path):
+    # Rotating must never overwrite a trace that is already there: the whole
+    # point of keeping the stale file is that it is somebody's data.
+    from history import HistoryLog
+    from metrics import Snapshot
+
+    path = tmp_path / "history.log"
+    _write_trace(path, "a,b", ["1,2"])
+    _write_trace(tmp_path / "history.log.1", "earlier,still", ["9,9"])
+
+    log = HistoryLog(path)
+    log.enable()
+    log.write(Snapshot(cpu_pct=1.0, ts=1.0))
+
+    assert (tmp_path / "history.log.1").read_text(encoding="utf-8") == "earlier,still\n9,9\n"
+    assert (tmp_path / "history.log.2").read_text(encoding="utf-8") == "a,b\n1,2\n"

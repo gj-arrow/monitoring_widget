@@ -99,6 +99,7 @@ class HistoryLog:
         self._path = Path(path)
         self._enabled = False
         self._has_header = False
+        self._header_checked = False
 
     @property
     def enabled(self) -> bool:
@@ -106,7 +107,6 @@ class HistoryLog:
 
     def enable(self) -> bool:
         try:
-            self._has_header = self._path.exists() and self._path.stat().st_size > 0
             self._path.parent.mkdir(parents=True, exist_ok=True)
             self._path.touch(exist_ok=True)
         except OSError as exc:
@@ -123,13 +123,14 @@ class HistoryLog:
             return
         values = snapshot.as_dict()
         try:
+            if not self._header_checked:
+                self._header_checked = True
+                self._adopt_existing_header(values)
             with self._path.open("a", encoding="utf-8") as handle:
                 # Both strings come from one dict, so they agree within a
-                # single write. Across runs they can still disagree: a file
-                # left by a build with other columns is trusted as-is,
-                # because `enable()` cannot know this build's column list
-                # until the first write, and rewriting a user's existing
-                # log to hide that would trade data for cosmetics.
+                # single write. Across runs the header is checked once, on the
+                # first write, because only then is this build's column list
+                # knowable.
                 if not self._has_header:
                     handle.write(",".join(values.keys()) + "\n")
                     self._has_header = True
@@ -137,6 +138,48 @@ class HistoryLog:
         except OSError as exc:
             logger.warning("history log write failed, switching off: %s", exc)
             self._enabled = False
+
+    def _adopt_existing_header(self, values: dict[str, float | None]) -> None:
+        """Decide once whether a trace written by an earlier run can be extended.
+
+        The columns come from the snapshot, so they are only knowable here. A
+        trace whose header does not match them was written by a build with
+        other columns, and appending to it would put rows of one width under a
+        header of another: the arity of every row would look fine while each
+        column after the first was reading the wrong value. Such a file is
+        rotated aside -- kept, never overwritten -- and the new trace starts
+        with a correct header. A header that cannot be read is not confirmed
+        either, and is rotated for the same reason.
+        """
+        expected = ",".join(values.keys())
+        try:
+            with self._path.open("r", encoding="utf-8") as handle:
+                first = handle.readline().strip()
+        except OSError as exc:
+            logger.warning("history log header unreadable, rotating: %s", exc)
+            first = None
+        if first is not None and first == expected:
+            self._has_header = True
+            return
+        if first == "":
+            return  # nothing there yet; the header below writes it
+        rotated = self._free_rotation_path()
+        try:
+            self._path.replace(rotated)
+        except OSError as exc:
+            logger.warning("history log rotation failed: %s", exc)
+            return
+        logger.warning(
+            "history log columns do not match this build, moved to %s", rotated
+        )
+
+    def _free_rotation_path(self) -> Path:
+        number = 0
+        while True:
+            number += 1
+            candidate = self._path.with_name(f"{self._path.name}.{number}")
+            if not candidate.exists():
+                return candidate
 
 
 def _csv(value: float | None) -> str:

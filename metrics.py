@@ -98,10 +98,25 @@ class GpuProbe:
             try:
                 nvml.nvmlInit()
                 self._handle = nvml.nvmlDeviceGetHandleByIndex(0)
-                logger.info("NVML ready: %s", nvml.nvmlDeviceGetName(self._handle))
             except Exception:
                 logger.info("NVML present but no usable device, falling back to WMI")
                 self._handle = None
+            else:
+                logger.info("NVML ready: %s", self._device_name())
+
+    def _device_name(self) -> str:
+        """The device name for the log line, or a marker when it cannot be read.
+
+        The name is decoration, not a health check, so it is looked up outside
+        the try that guards the handle. A device that will not report its name
+        is still a device whose load, temperature and memory can be read, and
+        calling that a failure costs the panel three real readings per tick.
+        """
+        try:
+            return str(self._nvml.nvmlDeviceGetName(self._handle))
+        except Exception:
+            logger.info("NVML device name unavailable, logging it as unnamed", exc_info=True)
+            return "unnamed device"
 
     @property
     def available(self) -> bool:

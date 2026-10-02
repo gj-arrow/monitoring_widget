@@ -1,3 +1,4 @@
+import logging
 from dataclasses import fields
 from types import SimpleNamespace
 
@@ -23,9 +24,10 @@ class FakeNvml:
 
     NVML_TEMPERATURE_GPU = 0
 
-    def __init__(self, fail_init=False):
+    def __init__(self, fail_init=False, fail_name=False):
         self.calls = {}
         self._fail_init = fail_init
+        self._fail_name = fail_name
 
     def _count(self, name):
         self.calls[name] = self.calls.get(name, 0) + 1
@@ -40,6 +42,9 @@ class FakeNvml:
         return f"handle-{index}"
 
     def nvmlDeviceGetName(self, handle):
+        self._count("name")
+        if self._fail_name:
+            raise RuntimeError("name lookup is broken")
         return "Fake GPU"
 
     def nvmlDeviceGetUtilizationRates(self, handle):
@@ -83,9 +88,10 @@ def test_probe_reads_every_gpu_number_in_one_pass():
     }
 
 
-def test_probe_reports_unavailable_when_nvml_cannot_start(monkeypatch):
+def test_probe_reports_unavailable_when_nvml_cannot_start(monkeypatch, caplog):
     monkeypatch.setattr(metrics, "_wmi_video_controllers", lambda: [])
-    probe = GpuProbe(nvml=FakeNvml(fail_init=True))
+    with caplog.at_level(logging.INFO, logger="widget.metrics"):
+        probe = GpuProbe(nvml=FakeNvml(fail_init=True))
     assert probe.available is False
     assert probe.read() == {
         "gpu_pct": None,
@@ -93,6 +99,29 @@ def test_probe_reports_unavailable_when_nvml_cannot_start(monkeypatch):
         "vram_used_gb": None,
         "vram_total_gb": None,
     }
+    # Genuinely no device: the log has to say so, not merely stay quiet.
+    assert any("falling back to WMI" in r.getMessage() for r in caplog.records)
+
+
+def test_probe_stays_available_when_only_the_device_name_lookup_fails(caplog):
+    # The name is a log line, not a health check. Guarding it together with the
+    # handle acquisition means a device that merely refuses to name itself is
+    # declared dead: every tick then falls back to WMI and the panel loses a
+    # real load percentage and a real temperature it was perfectly able to read.
+    with caplog.at_level(logging.INFO, logger="widget.metrics"):
+        probe = GpuProbe(nvml=FakeNvml(fail_name=True))
+
+    assert probe.available is True
+    assert probe.read() == {
+        "gpu_pct": 42.0,
+        "gpu_temp_c": 61.0,
+        "vram_used_gb": 2.0,
+        "vram_total_gb": 8.0,
+    }
+    messages = [r.getMessage() for r in caplog.records]
+    assert not any("falling back to WMI" in m for m in messages)
+    # An unnamed device, stated as such: the name is missing, not the device.
+    assert any("unnamed" in m for m in messages)
 
 
 def test_wmi_fallback_does_not_invent_a_load_percentage(monkeypatch):

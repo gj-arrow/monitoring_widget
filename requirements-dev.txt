@@ -1,0 +1,5 @@
+-r requirements.txt
+
+# pytest drives tests/. Pinned because the suite compares golden images that
+# the renderer produces, and a different Qt or pytest is a different image.
+pytest==9.1.1

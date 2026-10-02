@@ -24,6 +24,11 @@ settings.json
 dist/
 build/
 *.spec
+# ...except the build recipe. An untracked spec is an unreproducible build:
+# the exe can only be rebuilt from whoever's checkout happens to hold it, not
+# from the repository. This one is the entire description of the build, so it
+# is tracked on purpose.
+!Monitor.spec
 *.exe
 *.bin
 

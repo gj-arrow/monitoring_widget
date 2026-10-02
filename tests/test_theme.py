@@ -135,6 +135,12 @@ def test_the_bleed_does_not_move_the_panel():
     assert (panel.width(), panel.height()) == (theme.WIDTH, theme.HEIGHT)
 
 
+def test_row_text_inset_is_a_theme_constant_and_sits_inside_the_padding():
+    """Row text geometry belongs in theme, not beside it in the painter."""
+    assert 0 < theme.ROW_TEXT_INSET < theme.PAD_X
+    assert theme.ROW_TEXT_INSET + theme.ROW_TEXT_INSET < theme.WIDTH - 2 * theme.PAD_X
+
+
 def test_row_value_reads_a_pct_row():
     spec = theme.METRICS_BY_KEY["cpu_pct"]
     assert theme.row_value(spec, snapshot(cpu_pct=42.0)) == 42.0

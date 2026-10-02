@@ -23,10 +23,11 @@ from PyQt6.QtGui import QColor, QFontMetricsF, QPainter, QPainterPath, QPen
 import theme
 from history import History, resample
 
-HEADER_MARGIN = 9
+VALUE_GAP = 7.0
+TEXT_TOP = 6.0
+TEXT_CLEARANCE = 2.0
 GRAPH_LINE_WIDTH = 1.4
 GRAPH_FILL_ALPHA = 0.22
-VALUE_GAP = 7.0
 
 
 def paint(
@@ -64,9 +65,14 @@ def _draw_panel(painter: QPainter, rect: QRectF, alpha: float) -> None:
     painter.setPen(Qt.PenStyle.NoPen)
 
     # Fake a soft drop shadow: three expanding slabs, biggest and faintest first.
+    # Grown by `grow` on every side. QRectF.right() and .bottom() are edge
+    # coordinates, so adjust() takes a plain `grow` for them: the old table
+    # passed grow * 2 there and pushed the right and bottom lips 12.0 and 7.2 px
+    # out, which is 4 px past the canvas on the right and 0.8 px from clipping
+    # at the bottom, while the left side had all 8 px of the bleed to itself.
     for grow, strength in ((6.0, 0.10), (3.0, 0.16), (0.0, 0.28)):
         shadow = QRectF(rect)
-        shadow.adjust(-grow, -grow * 0.6, grow * 2.0, grow * 1.2)
+        shadow.adjust(-grow, -grow, grow, grow)
         tint = QColor(0, 0, 0)
         tint.setAlphaF(strength)
         painter.setBrush(tint)
@@ -120,13 +126,23 @@ def _draw_row(painter: QPainter, spec, rect: QRectF, snapshot, history) -> None:
     if history is not None and len(history) > 1:
         graph = QRectF(rect)
         graph.setTop(rect.bottom() - theme.GRAPH_H)
+        # Clipped to the slab's rounded outline. The fill is a polygon and the
+        # line has round caps, so unclipped both paint straight across the
+        # corner arcs and out over the panel padding. save()/restore() keeps the
+        # clip, pen and brush from leaking into the text drawn afterwards.
+        painter.save()
+        _clip_to_rounded(painter, rect, theme.ROW_RADIUS)
         _draw_graph(painter, graph, history.values(), color)
+        painter.restore()
 
+    # The band stops short of the graph strip: the value font's descent reaches
+    # 0.64 px past its baseline, so a band flush with the strip would put
+    # descenders on the fill.
     text_rect = QRectF(
-        rect.left() + HEADER_MARGIN,
-        rect.top() + 6.0,
-        rect.width() - 2 * HEADER_MARGIN,
-        20.0,
+        rect.left() + theme.ROW_TEXT_INSET,
+        rect.top() + TEXT_TOP,
+        rect.width() - 2 * theme.ROW_TEXT_INSET,
+        rect.height() - TEXT_TOP - theme.GRAPH_H - TEXT_CLEARANCE,
     )
     _draw_text(painter, spec.label, text_rect, theme.label_font(), theme.NEUTRAL)
 
@@ -147,17 +163,31 @@ def _draw_row(painter: QPainter, spec, rect: QRectF, snapshot, history) -> None:
         _draw_text(painter, aux_text, text_rect, aux_font, theme.SUBTLE, right=True)
 
 
-def _draw_graph(painter: QPainter, rect: QRectF, values: list[float], color: QColor) -> None:
-    points = resample(values, max(2, int(rect.width())))
-    if len(points) < 2:
-        return
-    bottom = rect.bottom()
+def _clip_to_rounded(painter: QPainter, rect: QRectF, radius: float) -> None:
+    """Confine drawing to a rounded rect, corners included."""
+    path = QPainterPath()
+    path.addRoundedRect(rect, radius, radius)
+    painter.setClipPath(path, Qt.ClipOperation.IntersectClip)
 
+
+def _draw_graph(painter: QPainter, rect: QRectF, values: list[float], color: QColor) -> None:
+    """Fill and stroke the row's history inside `rect`.
+
+    `values` holds at least two samples -- the caller checks -- so resample
+    cannot come back short and there is nothing to guard against here.
+    """
+    points = resample(values, max(2, int(rect.width())))
+    bottom = rect.bottom()
+    left = rect.left()
+
+    # resample() returns column indices counting from zero. They are not panel
+    # coordinates: used raw they put the graph 14 px left of its slab and leave
+    # the same width bare on the right.
     area = QPainterPath()
-    area.moveTo(points[0].x(), bottom)
+    area.moveTo(points[0].x() + left, bottom)
     for point in points:
-        area.lineTo(point.x(), bottom - point.y() * rect.height())
-    area.lineTo(points[-1].x(), bottom)
+        area.lineTo(point.x() + left, bottom - point.y() * rect.height())
+    area.lineTo(points[-1].x() + left, bottom)
     area.closeSubpath()
 
     fill = QColor(color)
@@ -167,9 +197,9 @@ def _draw_graph(painter: QPainter, rect: QRectF, values: list[float], color: QCo
     painter.drawPath(area)
 
     line = QPainterPath()
-    line.moveTo(points[0].x(), bottom - points[0].y() * rect.height())
+    line.moveTo(points[0].x() + left, bottom - points[0].y() * rect.height())
     for point in points[1:]:
-        line.lineTo(point.x(), bottom - point.y() * rect.height())
+        line.lineTo(point.x() + left, bottom - point.y() * rect.height())
 
     pen = QPen(color, GRAPH_LINE_WIDTH)
     pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
@@ -215,7 +245,10 @@ def _format_aux(spec, snapshot) -> str:
         if spec.key == "cpu_pct":
             return _format_frequency(snapshot)
         if spec.key == "gpu_pct":
-            temp = snapshot.gpu_temp_c
+            # theme.gpu_temp(), not snapshot.gpu_temp_c: the accessor exists so
+            # a snapshot without the field degrades to "--" instead of raising
+            # AttributeError out of paint().
+            temp = theme.gpu_temp(snapshot)
             return "--" if temp is None else f"{temp:.0f}°C"
         return ""
     total = getattr(snapshot, f"{spec.key}_total_gb", None)

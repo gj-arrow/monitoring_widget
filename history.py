@@ -8,6 +8,7 @@ thrown away, and uniform sampling throws away spikes.
 from __future__ import annotations
 
 import logging
+import math
 from collections import deque
 from pathlib import Path
 
@@ -30,7 +31,17 @@ class History:
         return len(self._values)
 
     def append(self, value: float | None) -> None:
-        if value is None:
+        """Record one normalised sample; drop the ones that are not readings.
+
+        `None` means "not measured" and is not recorded. NaN is treated the
+        same way, and deliberately not clamped: `min(1.0, max(0.0, nan))`
+        evaluates to `0.0`, because `max` discards the NaN comparison, so
+        clamping alone would file a NaN reading as a real 0% data point and
+        draw it as one. A metric that failed to report is not a metric that
+        reported zero. `inf` needs no special case -- clamping it to 1.0 is
+        the honest reading of an over-range value.
+        """
+        if value is None or math.isnan(value):
             return
         self._values.append(min(1.0, max(0.0, value)))
 

@@ -14,6 +14,9 @@ edge reading as a hard wall against the desktop.
 
 from __future__ import annotations
 
+import logging
+import traceback
+
 from PyQt6.QtCore import QPoint, Qt, pyqtSignal
 from PyQt6.QtGui import QPainter
 from PyQt6.QtWidgets import QWidget
@@ -22,6 +25,8 @@ import theme
 from history import History
 from painter import paint
 from settings import Settings
+
+logger = logging.getLogger("widget.overlay")
 
 WINDOW_TITLE = "System Monitor"
 CORNER_MARGIN = 10
@@ -39,6 +44,7 @@ class MonitorPanel(QWidget):
             key: History() for key in theme.METRICS_BY_KEY
         }
         self._drag_origin: QPoint | None = None
+        self._last_paint_error: str | None = None
 
         self.setWindowTitle(WINDOW_TITLE)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
@@ -83,16 +89,46 @@ class MonitorPanel(QWidget):
 
         Nothing is drawn before the first sample: an empty window beats a black
         rectangle for the fraction of a second between show() and the first tick.
+
+        A renderer that raises costs one frame, not the process. PyQt calls
+        qFatal() when an exception escapes a reimplemented virtual method, and
+        this widget is meant to sit on someone's desktop all day; painter.py
+        still reads snapshot.ts, cpu_mhz and cpu_max_mhz straight off the
+        dataclass, so any snapshot thinner than metrics.Snapshot would take the
+        whole application down from inside a paint event. The guard belongs at
+        this boundary rather than inside paint(): the renderer stays pure and
+        testable, and it keeps raising where a test can see it.
         """
         if self._snapshot is None:
             return
         painter = QPainter(self)
         try:
-            paint(painter, self._snapshot, self._histories, self._settings.alpha)
+            paint(painter, self._snapshot, self._histories, self.current_alpha())
+        except Exception:
+            self._log_paint_failure()
+        else:
+            # A frame that painted cleanly makes the next fault news again.
+            self._last_paint_error = None
         finally:
-            # end() in a finally, so a raise out of paint() cannot leave the
-            # painter holding the widget's paint device for the next tick.
+            # end() in a finally, so neither a raise nor the guard above can
+            # leave the painter holding the widget's paint device.
             painter.end()
+
+    def _log_paint_failure(self) -> None:
+        """Log one fault once, whatever it keeps failing at.
+
+        update() runs every theme.TICK_MS for as long as the widget is up, so an
+        unguarded logger.exception() would append the same traceback to
+        app_debug.log tens of thousands of times a day -- the log growth this
+        rewrite set out to stop. Keyed on the traceback text rather than on a
+        time window: an identical repeat says nothing new, while a *different*
+        fault is written out immediately, because that one is new information.
+        """
+        failure = traceback.format_exc()
+        if failure == self._last_paint_error:
+            return
+        self._last_paint_error = failure
+        logger.exception("panel paint failed")
 
     # --- placement --------------------------------------------------------
 
@@ -141,28 +177,56 @@ class MonitorPanel(QWidget):
 
     def mouseMoveEvent(self, event) -> None:
         if self._drag_origin is not None:
-            target = event.globalPosition().toPoint() - self._drag_origin
-            self.move(self.clamp_to_screen(target))
-            event.accept()
-            return
+            if not event.buttons() & Qt.MouseButton.LeftButton:
+                # No button down, so nothing is being carried: a release went
+                # missing (hidden and re-shown, a lost grab) and this move is
+                # the first sign of it. Give the state back rather than drag on.
+                self._cancel_drag()
+            else:
+                target = event.globalPosition().toPoint() - self._drag_origin
+                self.move(self.clamp_to_screen(target))
+                event.accept()
+                return
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton and self._drag_origin is not None:
-            self._drag_origin = None
-            self.setCursor(Qt.CursorShape.OpenHandCursor)
+            self._cancel_drag()
             self.remember_position()
             event.accept()
             return
         super().mouseReleaseEvent(event)
+
+    def _cancel_drag(self) -> None:
+        """Forget the grab and give back the cursor. No position is saved.
+
+        A release that was swallowed leaves a grab armed against a panel
+        nobody is holding, and the next move -- with no button down -- walks it
+        across the screen. apply_window_flags() re-shows a visible widget, and
+        Qt does not deliver the release that was in flight across the hide, so
+        hideEvent cancels the drag for the same reason.
+        """
+        self._drag_origin = None
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+
+    def hideEvent(self, event) -> None:
+        self._cancel_drag()
+        super().hideEvent(event)
 
     def mouseDoubleClickEvent(self, event) -> None:
         self.restore_default_position()
         event.accept()
 
     def wheelEvent(self, event) -> None:
-        step = 0.05 if event.angleDelta().y() > 0 else -0.05
-        self.set_alpha(self._settings.alpha + step)
+        vertical = event.angleDelta().y()
+        if vertical == 0:
+            # A horizontal wheel notch, or a trackpad swipe that never left the
+            # x axis. Spending a whole step of opacity on it would be the
+            # gesture's only effect.
+            event.accept()
+            return
+        step = theme.WHEEL_ALPHA_STEP if vertical > 0 else -theme.WHEEL_ALPHA_STEP
+        self.set_alpha(self.current_alpha() + step)
         event.accept()
 
     def contextMenuEvent(self, event) -> None:

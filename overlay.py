@@ -101,11 +101,16 @@ class MonitorPanel(QWidget):
         A renderer that raises costs one frame, not the process. PyQt calls
         qFatal() when an exception escapes a reimplemented virtual method, and
         this widget is meant to sit on someone's desktop all day; painter.py
-        still reads snapshot.ts, cpu_mhz and cpu_max_mhz straight off the
-        dataclass, so any snapshot thinner than metrics.Snapshot would take the
-        whole application down from inside a paint event. The guard belongs at
-        this boundary rather than inside paint(): the renderer stays pure and
-        testable, and it keeps raising where a test can see it.
+        reads cpu_live_mhz, cpu_nominal_mhz and the two net columns straight off
+        the dataclass rather than through an accessor, so any snapshot thinner
+        than metrics.Snapshot would take the whole application down from inside
+        a paint event. The guard belongs at this boundary rather than inside
+        paint(): the renderer stays pure and testable, and it keeps raising
+        where a test can see it.
+
+        The fields named above are the reason this comment matters: they are read
+        directly, so the cost of dropping one is not a missing number but a dead
+        process, and the fields most likely to be renamed are the ones listed.
         """
         if self._snapshot is None:
             return

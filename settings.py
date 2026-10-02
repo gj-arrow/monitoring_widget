@@ -3,6 +3,13 @@
 Under PyInstaller `__file__` points inside the bundle, which is unpacked to a
 temp directory that is wiped on exit, so a frozen build must anchor on
 sys.executable instead.
+
+This module imports nothing from the rest of the project, so the alpha range is
+restated here rather than borrowed from theme.
+
+Loading sanitises: a file that cannot be read, parsed or trusted degrades to
+usable settings instead of raising, because the caller is a GUI startup path
+with no way to recover. A single bad field costs you that field, not the file.
 """
 
 from __future__ import annotations
@@ -10,12 +17,17 @@ from __future__ import annotations
 import json
 import logging
 import sys
-from dataclasses import asdict, dataclass, fields
+from collections.abc import Callable
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 logger = logging.getLogger("widget.settings")
 
 CONFIG_NAME = "settings.json"
+
+# Restated from theme; see the module docstring.
+MIN_ALPHA = 0.35
+MAX_ALPHA = 1.0
 
 
 @dataclass
@@ -36,13 +48,76 @@ def config_path() -> Path:
     return base / CONFIG_NAME
 
 
+def _kind(value: object) -> str:
+    return "null" if value is None else type(value).__name__
+
+
+def _optional_int(value: object) -> int | None:
+    if value is None:
+        return None
+    # bool is a subclass of int, so `"x": true` would otherwise load as 1.
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"expected an integer or null, got {_kind(value)}")
+    return value
+
+
+def _alpha(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"expected a number, got {_kind(value)}")
+    # Rejects out-of-range values and NaN, which compares false against
+    # everything. Rejected rather than clamped: a clamped value would leave
+    # the file and the loaded state disagreeing.
+    if not MIN_ALPHA <= value <= MAX_ALPHA:
+        raise ValueError(f"expected {MIN_ALPHA} to {MAX_ALPHA}, got {value!r}")
+    return float(value)
+
+
+def _bool(value: object) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"expected true or false, got {_kind(value)}")
+    return value
+
+
+VALIDATORS: dict[str, Callable[[object], object]] = {
+    "x": _optional_int,
+    "y": _optional_int,
+    "alpha": _alpha,
+    "always_on_top": _bool,
+    "acrylic": _bool,
+    "log_history": _bool,
+}
+
+
+def _usable_fields(raw: dict) -> dict:
+    """Keep the fields that survive validation, dropping any that do not.
+
+    Unknown keys are skipped and bad fields fall back to their dataclass
+    default, so one bad value never costs the user the rest of the file.
+    """
+    accepted = {}
+    for name, value in raw.items():
+        check = VALIDATORS.get(name)
+        if check is None:
+            continue
+        try:
+            accepted[name] = check(value)
+        except ValueError as exc:
+            logger.warning(
+                "ignoring unusable setting %s=%r (%s); using the default", name, value, exc
+            )
+    return accepted
+
+
 def load_settings(path: Path | None = None) -> Settings:
     target = path or config_path()
     try:
         raw = json.loads(target.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return Settings()
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, ValueError) as exc:
+        # ValueError covers json.JSONDecodeError and the UnicodeDecodeError
+        # raised by a file that is not UTF-8, e.g. one written in cp1251 or
+        # UTF-16 by an older build.
         logger.warning("settings unreadable at %s (%s); using defaults", target, exc)
         return Settings()
 
@@ -50,12 +125,8 @@ def load_settings(path: Path | None = None) -> Settings:
         logger.warning("settings at %s are not an object; using defaults", target)
         return Settings()
 
-    known = {f.name for f in fields(Settings)}
-    try:
-        return Settings(**{k: v for k, v in raw.items() if k in known})
-    except TypeError as exc:
-        logger.warning("settings had unusable types (%s); using defaults", exc)
-        return Settings()
+    # Every key below is a real field name, so construction cannot raise.
+    return Settings(**_usable_fields(raw))
 
 
 def save_settings(settings: Settings, path: Path | None = None) -> bool:

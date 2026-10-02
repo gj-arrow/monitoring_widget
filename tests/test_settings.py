@@ -1,6 +1,8 @@
 import json
 import sys
 
+import pytest
+
 from settings import Settings, load_settings, save_settings
 
 
@@ -50,3 +52,125 @@ def test_config_path_anchors_on_the_executable_when_frozen(tmp_path, monkeypatch
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     monkeypatch.setattr(sys, "executable", str(exe))
     assert config_path() == exe.resolve().parent / CONFIG_NAME
+
+
+def test_a_non_utf8_file_falls_back_to_defaults(tmp_path):
+    """A file written by an older build in cp1251 must not reach startup."""
+    path = tmp_path / "settings.json"
+    # ensure_ascii=False, or json would escape the Cyrillic and leave pure
+    # ASCII that decodes as UTF-8 without complaint.
+    path.write_bytes(json.dumps({"alpha": 0.5, "note": "спасибо"}, ensure_ascii=False).encode("cp1251"))
+    assert load_settings(path) == Settings()
+
+
+def test_a_utf16_file_falls_back_to_defaults(tmp_path):
+    path = tmp_path / "settings.json"
+    path.write_bytes(json.dumps({"alpha": 0.5}).encode("utf-16"))
+    assert load_settings(path) == Settings()
+
+
+def test_a_wrong_typed_field_keeps_its_valid_siblings(tmp_path):
+    path = tmp_path / "settings.json"
+    path.write_text(
+        json.dumps({"x": "abc", "y": 200, "alpha": 0.5, "acrylic": True}),
+        encoding="utf-8",
+    )
+    assert load_settings(path) == Settings(x=None, y=200, alpha=0.5, acrylic=True)
+
+
+@pytest.mark.parametrize("alpha", [1.5, 0.34, 0.0, -1.0, "0.5", None])
+def test_alpha_outside_the_usable_range_falls_back_to_the_default(tmp_path, alpha):
+    path = tmp_path / "settings.json"
+    path.write_text(json.dumps({"alpha": alpha, "x": 10}), encoding="utf-8")
+    loaded = load_settings(path)
+    assert loaded == Settings(x=10)
+    assert loaded.alpha == Settings().alpha
+
+
+@pytest.mark.parametrize("alpha", [0.35, 1.0])
+def test_alpha_at_the_range_boundary_is_accepted(tmp_path, alpha):
+    path = tmp_path / "settings.json"
+    path.write_text(json.dumps({"alpha": alpha}), encoding="utf-8")
+    assert load_settings(path).alpha == alpha
+
+
+def test_alpha_as_an_integer_inside_the_range_is_normalised_to_float(tmp_path):
+    path = tmp_path / "settings.json"
+    path.write_text(json.dumps({"alpha": 1}), encoding="utf-8")
+    assert load_settings(path).alpha == 1.0
+    assert isinstance(load_settings(path).alpha, float)
+
+
+def test_alpha_that_is_not_a_number_is_rejected(tmp_path):
+    for raw in ("NaN", "Infinity", "-Infinity"):
+        path = tmp_path / "settings.json"
+        path.write_text('{"alpha": %s}' % raw, encoding="utf-8")
+        assert load_settings(path).alpha == Settings().alpha
+
+
+@pytest.mark.parametrize("value", ['"abc"', "12.5", "true", "[1]"])
+def test_a_non_int_position_is_dropped(tmp_path, value):
+    path = tmp_path / "settings.json"
+    path.write_text('{"x": %s, "y": 7}' % value, encoding="utf-8")
+    assert load_settings(path) == Settings(y=7)
+
+
+@pytest.mark.parametrize("value", ['"yes"', "1", "0", "null"])
+def test_a_non_bool_toggle_is_dropped(tmp_path, value):
+    path = tmp_path / "settings.json"
+    path.write_text('{"always_on_top": %s, "acrylic": true}' % value, encoding="utf-8")
+    loaded = load_settings(path)
+    assert loaded == Settings(always_on_top=True, acrylic=True)
+    # `1 == True` in Python, so equality alone would let an int through.
+    assert loaded.always_on_top is True
+    assert loaded.acrylic is True
+
+
+def test_an_explicit_null_position_is_a_legitimate_value(tmp_path):
+    path = tmp_path / "settings.json"
+    path.write_text(json.dumps({"x": None, "y": 3}), encoding="utf-8")
+    assert load_settings(path) == Settings(y=3)
+
+
+def test_every_field_wrong_still_yields_usable_settings(tmp_path):
+    path = tmp_path / "settings.json"
+    path.write_text(
+        json.dumps(
+            {
+                "x": "abc",
+                "y": [],
+                "alpha": "loud",
+                "always_on_top": "yes",
+                "acrylic": 1,
+                "log_history": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    loaded = load_settings(path)
+    assert loaded == Settings()
+    assert isinstance(loaded.alpha, float)
+    assert save_settings(loaded, path) is True
+    assert load_settings(path) == Settings()
+
+
+def test_every_field_has_a_validator():
+    """A field with no validator would be dropped on load, losing it silently."""
+    from dataclasses import fields
+
+    from settings import VALIDATORS
+
+    assert set(VALIDATORS) == {f.name for f in fields(Settings)}
+
+
+def test_a_dropped_field_is_logged_with_its_name(tmp_path, caplog):
+    """Silently dropping a field would leave the user with no way to diagnose it."""
+    import logging
+
+    path = tmp_path / "settings.json"
+    path.write_text(json.dumps({"alpha": "loud", "x": 5}), encoding="utf-8")
+    with caplog.at_level(logging.WARNING, logger="widget.settings"):
+        loaded = load_settings(path)
+    assert loaded == Settings(x=5)
+    messages = [r.getMessage() for r in caplog.records if r.name == "widget.settings"]
+    assert any("alpha" in m and "loud" in m for m in messages), messages

@@ -1,186 +1,175 @@
-import logging
-from PyQt6.QtWidgets import QWidget, QFrame, QLabel, QApplication
-from PyQt6.QtCore import Qt, QSize, QPoint, QTimer
-from PyQt6.QtGui import QMouseEvent, QFont
+"""The panel window: placement, mouse handling, and painting delegation.
 
-logger = logging.getLogger('widget.overlay')
+Dragging works from the first press. The previous version required a double
+click to arm a drag mode, which needed its own double-click detector, two
+QTimers and a per-click timer allocation -- thirteen commits of fixes grew out
+of that one extra step.
+
+The widget is theme.CANVAS_W x theme.CANVAS_H, not theme.WIDTH x theme.HEIGHT.
+The panel is 280 x 280 and the canvas is that plus a bleed on every side,
+because paint() draws the drop shadow *outside* panel_rect(): a widget the size
+of the panel has nowhere for the halo to go, clips it, and leaves the panel's
+edge reading as a hard wall against the desktop.
+"""
+
+from __future__ import annotations
+
+from PyQt6.QtCore import QPoint, Qt, pyqtSignal
+from PyQt6.QtGui import QPainter
+from PyQt6.QtWidgets import QWidget
+
+import theme
+from history import History
+from painter import paint
+from settings import Settings
+
+WINDOW_TITLE = "System Monitor"
+CORNER_MARGIN = 10
 
 
-class DraggableLabel(QWidget):
-    def __init__(self, on_click_callback=None, on_double_click_callback=None) -> None:
+class MonitorPanel(QWidget):
+    menu_requested = pyqtSignal(QPoint)
+    quit_requested = pyqtSignal()
+
+    def __init__(self, settings: Settings) -> None:
         super().__init__()
-        self.on_click_callback = on_click_callback
-        self.on_double_click_callback = on_double_click_callback
-        self._margin = 7
+        self._settings = settings
+        self._snapshot = None
+        self._histories: dict[str, History] = {
+            key: History() for key in theme.METRICS_BY_KEY
+        }
+        self._drag_origin: QPoint | None = None
 
-        self.setWindowFlags(
-            Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.Tool
-            | Qt.WindowType.WindowStaysOnTopHint
-        )
+        self.setWindowTitle(WINDOW_TITLE)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.setFixedSize(theme.CANVAS_W, theme.CANVAS_H)
+        self.apply_window_flags()
 
-        # Background frame — fills entire widget
-        self._bg_frame = QFrame(self)
-        self._bg_frame.setObjectName("BgFrame")
+    # --- configuration ----------------------------------------------------
 
-        # Label on top of background, no layout needed
-        self._label = QLabel(self)
-        self._label.setStyleSheet("background-color: transparent; color: white;")
-        self._label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
-        self._label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+    def apply_window_flags(self) -> None:
+        """Re-apply the window flags, e.g. after always-on-top was toggled.
 
-        self._bg_alpha_percent = 40.0
-        self._update_bg_style()
-        logger.info("DraggableLabel created, bg_alpha_initial=%.1f", self._bg_alpha_percent)
+        Qt hides a visible widget when its window flags change and recreates it
+        as a native window, so a panel that was on screen is put back.
+        """
+        flags = Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
+        if self._settings.always_on_top:
+            flags |= Qt.WindowType.WindowStaysOnTopHint
+        visible = self.isVisible()
+        self.setWindowFlags(flags)
+        if visible:
+            self.show()
 
-        # Drag-and-drop state
-        self._drag_mode = False
-        self._drag_enabled = False
-        self._drag_offset: QPoint | None = None
-        self._right_timer = QTimer(self)
-        self._right_timer.setSingleShot(True)
-        self._right_timer.timeout.connect(self._on_right_click_timeout)
-        self._click_counter = 0
+    def current_alpha(self) -> float:
+        return self._settings.alpha
 
-        self.setMouseTracking(True)
+    def set_alpha(self, value: float) -> None:
+        self._settings.alpha = max(theme.MIN_ALPHA, min(theme.MAX_ALPHA, value))
+        self.update()
 
-    def mousePressEvent(self, event: QMouseEvent) -> None:
+    def apply_snapshot(self, snapshot) -> None:
+        self._snapshot = snapshot
+        for spec in theme.METRICS:
+            self._histories[spec.key].append(theme.row_fraction(spec, snapshot))
+        self.update()
+
+    # --- painting ---------------------------------------------------------
+
+    def paintEvent(self, event) -> None:
+        """Delegate to the pure renderer, on a painter that is ended here.
+
+        Nothing is drawn before the first sample: an empty window beats a black
+        rectangle for the fraction of a second between show() and the first tick.
+        """
+        if self._snapshot is None:
+            return
+        painter = QPainter(self)
         try:
-            btn = event.button()
-            if btn == Qt.MouseButton.MiddleButton:
-                QApplication.quit()
-                return
-            elif btn == Qt.MouseButton.RightButton:
-                if self._right_timer.isActive():
-                    self._right_timer.stop()
-                    if self.on_double_click_callback:
-                        self.on_double_click_callback()
-                else:
-                    self._right_timer.start(300)
-                return
-            elif btn == Qt.MouseButton.LeftButton:
-                self._click_counter += 1
+            paint(painter, self._snapshot, self._histories, self._settings.alpha)
+        finally:
+            # end() in a finally, so a raise out of paint() cannot leave the
+            # painter holding the widget's paint device for the next tick.
+            painter.end()
 
-                if self._click_counter == 1:
-                    self._double_click_timer = QTimer(self)
-                    self._double_click_timer.setSingleShot(True)
-                    self._double_click_timer.timeout.connect(self._clear_click_counter)
-                    self._double_click_timer.start(300)
-                elif self._click_counter >= 2:
-                    self._double_click_timer.stop()
-                    self._double_click_timer.deleteLater()
-                    self._click_counter = 0
-                    self._drag_enabled = not self._drag_enabled
-                    self._update_drag_hint_style()
-                    if self._drag_enabled:
-                        self._drag_mode = True
-                        self._drag_offset = event.pos()
-                        self.setCursor(Qt.CursorShape.ClosedHandCursor)
-                        a = int(max(0, min(255, self._bg_alpha_percent * 2.55)))
-                        self._bg_frame.setStyleSheet(f"background-color: rgba(0,0,139,{a}); border: 2px solid #6496ff; border-radius: 8px;")
-                        logger.info("Drag mode: enabled (double-click)")
-                    else:
-                        logger.info("Drag mode: disabled (double-click)")
-                    return
+    # --- placement --------------------------------------------------------
 
-                if self._drag_enabled:
-                    self._drag_mode = True
-                    self._drag_offset = event.pos()
-                    self.setCursor(Qt.CursorShape.ClosedHandCursor)
-                    a = int(max(0, min(255, self._bg_alpha_percent * 2.55)))
-                    self._bg_frame.setStyleSheet(f"background-color: rgba(0,0,139,{a}); border: 2px solid #6496ff; border-radius: 8px;")
-        except Exception as e:
-            logger.error("mousePressEvent error: %s", e, exc_info=True)
+    def clamp_to_screen(self, top_left: QPoint) -> QPoint:
+        """The nearest on-screen top-left, measured against the widget's size.
+
+        Width and height are the canvas, which is what gets clamped: a
+        position stored by a build whose widget was only as big as the panel is
+        still a top-left corner and still means a place on screen, so it is
+        judged, not rewritten.
+        """
+        available = self.screen().availableGeometry()
+        return QPoint(
+            max(available.left(), min(int(top_left.x()), available.right() - self.width())),
+            max(available.top(), min(int(top_left.y()), available.bottom() - self.height())),
+        )
+
+    def restore_default_position(self) -> None:
+        available = self.screen().availableGeometry()
+        target = QPoint(
+            available.right() - self.width() - CORNER_MARGIN,
+            available.top() + CORNER_MARGIN,
+        )
+        self.move(self.clamp_to_screen(target))
+        self.remember_position()
+
+    def remember_position(self) -> None:
+        self._settings.x, self._settings.y = self.x(), self.y()
+
+    # --- input ------------------------------------------------------------
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.MiddleButton:
+            self.quit_requested.emit()
+            event.accept()
+            return
+        if event.button() == Qt.MouseButton.LeftButton:
+            # The grab is the cursor's offset from the window's corner, kept in
+            # global coordinates: the panel then follows the cursor by exactly
+            # the distance it was moved, wherever on the panel it was held.
+            self._drag_origin = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
         super().mousePressEvent(event)
-        event.accept()
 
-    def _on_right_click_timeout(self) -> None:
-        if self.on_click_callback:
-            self.on_click_callback()
-
-    def _clear_click_counter(self) -> None:
-        self._click_counter = 0
-
-    def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        if self._drag_mode and self._drag_offset is not None:
-            screen = self.screen().availableGeometry()
-            new_x = max(screen.left(), min(int(event.globalPosition().x()), screen.right() - self.width()))
-            new_y = max(screen.top(), min(int(event.globalPosition().y()), screen.bottom() - self.height()))
-            self.move(new_x, new_y)
+    def mouseMoveEvent(self, event) -> None:
+        if self._drag_origin is not None:
+            target = event.globalPosition().toPoint() - self._drag_origin
+            self.move(self.clamp_to_screen(target))
+            event.accept()
+            return
         super().mouseMoveEvent(event)
-        event.accept()
 
-    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
-        if event.button() == Qt.MouseButton.LeftButton and self._drag_mode:
-            self._drag_mode = False
-            self._drag_offset = None
-            self.setCursor(Qt.CursorShape.ArrowCursor)
-            self._update_drag_hint_style()
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and self._drag_origin is not None:
+            self._drag_origin = None
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+            self.remember_position()
+            event.accept()
+            return
         super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        self.restore_default_position()
         event.accept()
 
-    def wheelEvent(self, event: QMouseEvent) -> None:
-        delta = event.angleDelta().y()
-        change = 5.0 if delta > 0 else -5.0
-        self._bg_alpha_percent = max(0.0, min(100.0, self._bg_alpha_percent + change))
-        alpha_value = int(self._bg_alpha_percent * 2.55)
-        self.bg_alpha = alpha_value
+    def wheelEvent(self, event) -> None:
+        step = 0.05 if event.angleDelta().y() > 0 else -0.05
+        self.set_alpha(self._settings.alpha + step)
         event.accept()
 
-    def sizeHint(self) -> QSize:
-        return QSize(160, 90)
+    def contextMenuEvent(self, event) -> None:
+        """Report where the menu belongs; the app owns the menu itself."""
+        self.menu_requested.emit(event.globalPos())
+        event.accept()
 
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        w = self.width()
-        h = self.height()
-        m = self._margin
-        # bg fills entire widget
-        self._bg_frame.setGeometry(0, 0, w, h)
-        # label sits inset by margin
-        lw = max(10, w - 2 * m)
-        lh = max(10, h - 2 * m)
-        self._label.setGeometry(m, m, lw, lh)
-
-    def adjustSize(self):
-        old_w, old_h = self.width(), self.height()
-        # force text to measure at sensible size
-        self._label.setMinimumWidth(80)
-        super().adjustSize()
-        nw, nh = self.width(), self.height()
-        self.setFixedSize(nw, nh)
-        logger.debug("adjustSize: %dx%d -> %dx%d (fixed)", old_w, old_h, nw, nh)
-
-    @property
-    def bg_alpha(self) -> int:
-        return int(self._bg_alpha_percent * 2.55)
-
-    @bg_alpha.setter
-    def bg_alpha(self, value: int) -> None:
-        self._bg_alpha_percent = max(0.0, min(100.0, (value / 2.55)))
-        self._update_bg_style()
-        logger.info("bg_alpha changed to %d (%% %.1f)", value, self._bg_alpha_percent)
-
-    def _update_bg_style(self) -> None:
-        alpha_value = int(max(0, min(255, self._bg_alpha_percent * 2.55)))
-        style = f"background-color: rgba(0, 0, 139, {alpha_value}); border-radius: 8px;"
-        self._bg_frame.setStyleSheet(style)
-        logger.debug("BgFrame stylesheet updated: alpha_val=%d, pct=%.1f", alpha_value, self._bg_alpha_percent)
-
-    def _update_drag_hint_style(self) -> None:
-        """Update border style to indicate drag mode is enabled/disabled."""
-        alpha_value = int(max(0, min(255, self._bg_alpha_percent * 2.55)))
-        if self._drag_enabled:
-            style = f"background-color: rgba(0, 0, 139, {alpha_value}); border: 2px solid #ffaa00; border-radius: 8px;"
-        else:
-            style = f"background-color: rgba(0, 0, 139, {alpha_value}); border-radius: 8px;"
-        self._bg_frame.setStyleSheet(style)
-
-    def setText(self, html: str) -> None:
-        self._label.setText(html)
-        logger.debug("Label text set, length=%d", len(html))
-
-    def setFont(self, font: QFont) -> None:
-        self._label.setFont(font)
-        logger.info("Label font set: %s %dpt", font.family(), font.pointSize())
+    def closeEvent(self, event) -> None:
+        self.remember_position()
+        super().closeEvent(event)

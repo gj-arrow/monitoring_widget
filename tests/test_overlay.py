@@ -11,6 +11,7 @@ paintEvent creates into a QImage the test owns, which is the only way to see
 what the panel draws without putting a window on screen.
 """
 
+import inspect
 import logging
 import os
 import subprocess
@@ -43,25 +44,76 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # qFatal() for an exception escaping a reimplemented virtual method, and if the
 # render guard ever regresses there is no failure to report -- the run simply
 # stops where that test is. Ordering cannot help, because the first such test in
-# the file is the one that dies. So those tests only run in a child process,
-# which test_a_failed_frame_does_not_take_the_process_with_it starts and asserts
-# on; a regression then costs one readable failure instead of every result after
-# it, the painter goldens included.
+# the file is the one that dies. So those tests run in a child process, which
+# test_a_failed_frame_does_not_take_the_process_with_it starts and asserts on; a
+# regression then costs one readable failure instead of every result after it.
 #
-# Every test that renders a frame which raises has to be listed here. Adding one
-# without listing it puts the abort back in the parent run, which is exactly how
-# this arrangement nearly shipped broken.
+# This list is built, not written. A test that renders frames which raise is
+# decorated with @renders_failing_frames, which appends its name here as the
+# module is imported -- so the canary's list is complete before a single test
+# runs -- and marks it as child-process-only. Both halves matter: the decorator
+# on its own is a convention somebody can forget, so render_panel() and
+# failing_render() also refuse to work for a caller that is not on the list.
+# Without that second half, adding one test and forgetting the decorator
+# reinstated the abort with nothing to warn about it, which is exactly what
+# happened twice.
 ABORT_CANARY_CHILD = "MONITOR_ABORT_CANARY_CHILD"
 
-ABORT_PRONE_TESTS = (
-    "test_a_failed_frame_still_ends_its_painter",
-    "test_one_failing_fault_is_logged_once_not_once_per_tick",
-)
+ABORT_PRONE_TESTS: list[str] = []
 
-abort_prone = pytest.mark.skipif(
-    os.environ.get(ABORT_CANARY_CHILD) != "1",
-    reason="runs in the child process; the parent asserts on its exit code",
-)
+_real_paint = paint
+
+
+def abort_prone(func):
+    """Mark one test as child-process-only."""
+    return pytest.mark.skipif(
+        os.environ.get(ABORT_CANARY_CHILD) != "1",
+        reason="renders frames which raise: runs in the child process, and the "
+               "parent asserts on its exit code",
+    )(func)
+
+
+def renders_failing_frames(func):
+    """The only way to write a test that renders frames which raise.
+
+    Registers the test in ABORT_PRONE_TESTS at import time and hands it the
+    child-process-only marker. Install the failing renderer with failing_render()
+    and draw through render_panel(); both of those check this registration.
+    """
+    ABORT_PRONE_TESTS.append(func.__name__)
+    return abort_prone(func)
+
+
+def _calling_test_name():
+    """The nearest enclosing test function's name, or None off the test path."""
+    frame = inspect.currentframe()
+    while frame is not None:
+        name = frame.f_code.co_name
+        if name.startswith("test_"):
+            return name
+        frame = frame.f_back
+    return None
+
+
+def _require_registered_caller(what):
+    caller = _calling_test_name()
+    if caller not in ABORT_PRONE_TESTS:
+        raise RuntimeError(
+            f"{caller} {what} with a renderer that raises, and is not in "
+            f"ABORT_PRONE_TESTS. Decorate it with @renders_failing_frames: an "
+            f"exception escaping paintEvent reaches Qt's qFatal(), so running it "
+            f"here would end the interpreter and lose every result after it, "
+            f"instead of failing one test."
+        )
+
+
+@contextmanager
+def failing_render(monkeypatch, fault):
+    """Install `fault` as the renderer, for a registered test only."""
+    _require_registered_caller("renders frames")
+    with monkeypatch.context() as patch:
+        patch.setattr(overlay, "paint", fault)
+        yield
 
 
 def make_panel():
@@ -133,7 +185,17 @@ def blank_canvas():
 
 
 def render_panel(panel):
-    """Paint the widget into an image, hidden, without repainting the screen."""
+    """Paint the widget into an image, hidden, without repainting the screen.
+
+    The one door to widget.render() in this file, because that is what can end
+    the interpreter: an exception raised by the renderer under test escapes
+    paintEvent and reaches qFatal(). If the renderer has been swapped for
+    something that may raise, the calling test has to be registered in
+    ABORT_PRONE_TESTS; otherwise this raises instead, which costs one test and
+    says what to do about it.
+    """
+    if overlay.paint is not _real_paint:
+        _require_registered_caller("renders frames")
     image = blank_canvas()
     panel.render(image)
     return image
@@ -604,8 +666,8 @@ def test_a_double_click_drives_the_panel_back_to_the_corner():
     ))
 
     assert panel.pos() == QPoint(
-        available.right() - panel.width() - overlay.CORNER_MARGIN,
-        available.top() + overlay.CORNER_MARGIN,
+        available.right() - panel.width() - theme.CORNER_MARGIN,
+        available.top() + theme.CORNER_MARGIN,
     ), f"left at {panel.pos()} instead of the corner"
 
 
@@ -822,7 +884,7 @@ def test_the_render_guard_is_wide_enough_for_any_fault(caplog, monkeypatch, erro
     )
 
 
-@abort_prone
+@renders_failing_frames
 def test_a_failed_frame_still_ends_its_painter(monkeypatch):
     """The guard must not swallow the painter along with the exception.
 
@@ -835,14 +897,14 @@ def test_a_failed_frame_still_ends_its_painter(monkeypatch):
     whole test: QPainter on a widget that was never shown never activates, so
     isActive() would read False for a painter that never began. render()
     redirects the painter onto a real device, which is what makes "ended" mean
-    something here.
+    something here -- and is why this test, and only this kind, runs in the
+    child process.
     """
     panel = make_panel()
     panel.apply_snapshot(Snapshot(cpu_pct=34.0))
 
     with recording_painters(monkeypatch) as opened:
-        with monkeypatch.context() as patch:
-            patch.setattr(overlay, "paint", failing_paint("simulated render failure"))
+        with failing_render(monkeypatch, failing_paint("simulated render failure")):
             render_panel(panel)
 
         assert opened, "paintEvent opened no painter, so this test proves nothing"
@@ -853,7 +915,7 @@ def test_a_failed_frame_still_ends_its_painter(monkeypatch):
         )
 
 
-@abort_prone
+@renders_failing_frames
 def test_one_failing_fault_is_logged_once_not_once_per_tick(caplog, monkeypatch):
     """update() fires every theme.TICK_MS for as long as the widget is up.
 
@@ -866,8 +928,7 @@ def test_one_failing_fault_is_logged_once_not_once_per_tick(caplog, monkeypatch)
     panel.apply_snapshot(Snapshot(cpu_pct=34.0))
 
     with caplog.at_level(logging.ERROR, logger="widget.overlay"):
-        with monkeypatch.context() as patch:
-            patch.setattr(overlay, "paint", failing_paint("simulated render failure"))
+        with failing_render(monkeypatch, failing_paint("simulated render failure")):
             for _ in range(5):
                 render_panel(panel)
 
@@ -902,10 +963,11 @@ def test_a_clean_frame_no_longer_unblocks_the_log(caplog, monkeypatch):
             # the exact path the previous test covered, and the one that used to
             # be reported immediately.
             patch.undo()
-            render_panel(panel)
-            assert len(caplog.records) == 1, (
-                "the healthy frame was never logged, so this is not testing "
-                "anything"
+            healthy = render_panel(panel)
+            assert max_channel_delta(healthy, fresh_paint(panel)) == 0, (
+                "the frame meant to be healthy did not paint the panel, so what "
+                "follows is not measuring what it claims: the renderer was "
+                "still a raiser, or the frame drew nothing"
             )
 
             patch.setattr(overlay, "paint", fault_from_probe_b)
@@ -1027,6 +1089,148 @@ def test_paint_event_reads_alpha_through_the_accessor():
     assert asked, "paintEvent read _settings.alpha directly instead of the accessor"
 
 
+def test_installing_a_failing_renderer_needs_registration(monkeypatch):
+    """The mechanism itself, checked from the outside.
+
+    This test is deliberately *not* registered, and it is what proves the guard
+    is real: without it, adding an abort-prone test and forgetting the decorator
+    put the abort straight back into the parent run with nothing to warn about
+    it, twice. A guard that only existed as a comment could not fail here.
+    """
+    with pytest.raises(RuntimeError, match="renders_failing_frames"):
+        with failing_render(monkeypatch, failing_paint("never installed")):
+            pass
+
+
+def test_installing_a_failing_renderer_is_refused_by_render_panel(monkeypatch):
+    """...and so does the door itself, in case the patch is made by hand.
+
+    render_panel() is the only thing in this file that calls widget.render(), so
+    it is where an unregistered failing renderer gets caught. The exception is
+    raised before a single frame is drawn, which is the whole point: a failure
+    here costs one test, where the abort costs every result after it.
+    """
+    panel = make_panel()
+    panel.apply_snapshot(Snapshot(cpu_pct=34.0))
+    monkeypatch.setattr(overlay, "paint", failing_paint("never installed"))
+
+    with pytest.raises(RuntimeError, match="renders_failing_frames"):
+        render_panel(panel)
+
+
+def test_a_registered_test_may_render_failing_frames(monkeypatch):
+    """The guard must not be a blanket ban, or nobody would use it.
+
+    A registered test draws a failing frame and gets a normal failure out of it,
+    which is what the two registered tests above rely on.
+    """
+    assert "test_a_failed_frame_still_ends_its_painter" in ABORT_PRONE_TESTS
+    assert "test_one_failing_fault_is_logged_once_not_once_per_tick" in ABORT_PRONE_TESTS
+    assert set(ABORT_PRONE_TESTS) <= set(globals()), (
+        f"ABORT_PRONE_TESTS names something that is not a test in this file: "
+        f"{ABORT_PRONE_TESTS}"
+    )
+
+
+def test_a_painter_that_cannot_be_created_does_not_take_the_process(caplog, monkeypatch):
+    """QPainter(self) is inside the guard, not in front of it.
+
+    The documented contract is that a frame which fails costs a frame, and the
+    painter construction is the one statement in paintEvent that could raise
+    before the guarded call -- a widget whose paint device cannot give a painter
+    out. Driven through paintEvent directly, so this stays out of the child
+    process: it never renders.
+    """
+    panel = make_panel()
+    panel.apply_snapshot(Snapshot(cpu_pct=34.0))
+
+    def refusing_painter(*args, **kwargs):
+        raise RuntimeError("no paint device available")
+
+    monkeypatch.setattr(overlay, "QPainter", refusing_painter)
+    panel.paintEvent(None)
+
+    assert "no paint device available" in caplog.text
+
+
+def test_a_cancelled_drag_still_remembers_where_the_panel_landed():
+    """Ending a drag writes down where the panel ended up, however it ended.
+
+    The panel has already moved by the time any of these paths run: the cancel
+    is about the grab, not the position. Leaving the position to closeEvent
+    meant that dragging the panel somewhere and then hiding it lost the drop --
+    settings.json still held the old corner, and the panel came back there on
+    the next start.
+    """
+    panel = make_panel()
+    panel.move(400, 300)
+    panel.mousePressEvent(mouse_event(
+        QMouseEvent.Type.MouseButtonPress, panel, QPoint(410, 310),
+        Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+    ))
+    panel.mouseMoveEvent(mouse_event(
+        QMouseEvent.Type.MouseMove, panel, QPoint(470, 350),
+        Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton,
+    ))
+    assert panel.pos() == QPoint(460, 340)
+
+    panel.hideEvent(QHideEvent())
+
+    assert panel._settings.x == 460
+    assert panel._settings.y == 340, (
+        f"the panel was dropped at {panel.pos()} but the settings still say "
+        f"{panel._settings.x}, {panel._settings.y}"
+    )
+
+
+def test_a_button_less_move_remembers_where_the_panel_landed():
+    """Same, for the other way a drag is cancelled: the cursor stops dragging."""
+    panel = make_panel()
+    panel.move(400, 300)
+    panel.mousePressEvent(mouse_event(
+        QMouseEvent.Type.MouseButtonPress, panel, QPoint(410, 310),
+        Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+    ))
+    panel.mouseMoveEvent(mouse_event(
+        QMouseEvent.Type.MouseMove, panel, QPoint(470, 350),
+        Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton,
+    ))
+    panel.mouseReleaseEvent(mouse_event(
+        QMouseEvent.Type.MouseButtonRelease, panel, QPoint(470, 350),
+        Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton,
+    ))
+    panel.mouseMoveEvent(mouse_event(
+        QMouseEvent.Type.MouseMove, panel, QPoint(9999, 9999),
+        Qt.MouseButton.NoButton, Qt.MouseButton.NoButton,
+    ))
+
+    assert panel._settings.x == 460
+    assert panel._settings.y == 340
+
+
+def test_a_button_less_move_is_accepted():
+    """Every other branch of this class accepts the event it handled."""
+    panel = make_panel()
+    panel.move(400, 300)
+    panel.mousePressEvent(mouse_event(
+        QMouseEvent.Type.MouseButtonPress, panel, QPoint(410, 310),
+        Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+    ))
+    stray = mouse_event(
+        QMouseEvent.Type.MouseMove, panel, QPoint(420, 320),
+        Qt.MouseButton.NoButton, Qt.MouseButton.NoButton,
+    )
+    # A fresh QMouseEvent arrives accepted, so the assertion would be vacuous.
+    stray.ignore()
+
+    panel.mouseMoveEvent(stray)
+
+    assert stray.isAccepted(), (
+        "the move that cancelled the drag was left unhandled: it fell through "
+        "to QWidget, which ignores it"
+    )
+
+
 def test_a_failed_frame_does_not_take_the_process_with_it():
     """A failing render costs a frame, not the process -- proven out of process.
 
@@ -1040,14 +1244,23 @@ def test_a_failed_frame_does_not_take_the_process_with_it():
     Asserting that here is impossible: the test that proves it has to drive a
     failing render(), and if the guard is gone that test does not fail, it
     aborts -- taking the run with it. Ordering does not help, because the first
-    such test in the file is the one that dies. So the render-driven tests run in
-    a child process and this asserts on its exit code, which means a regression
-    costs one failure with the child's output attached instead of every result
-    after it, the painter goldens included.
+    such test in the file is the one that dies. So the tests decorated
+    @renders_failing_frames run in a child process and this asserts on its exit
+    code, which means a regression costs one failure with the child's output
+    attached instead of every result after it, the painter goldens included.
+
+    The list comes from the decorators, so it cannot be out of date; what is
+    checked here is the other half -- that each of those tests really does run,
+    really does pass, in the child.
     """
     if os.environ.get(ABORT_CANARY_CHILD) == "1":
         pytest.skip("this is the child run; the parent asserts on its exit code")
 
+    assert ABORT_PRONE_TESTS, (
+        "no test is registered as rendering failing frames, so the canary has "
+        "nothing to contain: either the registration decorator stopped being "
+        "used, or the render guard's coverage is no longer being exercised"
+    )
     child = subprocess.run(
         [sys.executable, "-m", "pytest", __file__, "-v", "-k", " or ".join(ABORT_PRONE_TESTS)],
         cwd=str(REPO_ROOT),
@@ -1056,6 +1269,9 @@ def test_a_failed_frame_does_not_take_the_process_with_it():
         text=True,
         timeout=300,
     )
+    # A PyQt abort writes no summary, so its own output is usually empty; a
+    # child that died collecting, or on an assertion, puts the reason on stderr.
+    report = f"stdout:\n{child.stdout[-2000:]}\nstderr:\n{child.stderr[-2000:]}"
 
     # Anti-vacuity first: a child that selected nothing, or that skipped them,
     # would exit 0 and this test would pass without ever driving a failing
@@ -1063,12 +1279,12 @@ def test_a_failed_frame_does_not_take_the_process_with_it():
     for name in ABORT_PRONE_TESTS:
         assert f"{name} PASSED" in child.stdout, (
             f"{name} did not run and pass in the child process, so the abort it "
-            f"is here to contain would still land in this run:\n{child.stdout[-2000:]}"
+            f"is here to contain would still land in this run:\n{report}"
         )
     assert child.returncode == 0, (
         f"the child process that drives failing renders exited {child.returncode} "
         f"rather than 0. On Windows a negative code is the abort PyQt raises for "
         f"an exception escaping paintEvent, so the render guard is gone -- and the "
         f"render-driven tests in this file would otherwise have taken this run "
-        f"with them:\n{child.stdout[-2000:]}"
+        f"with them:\n{report}"
     )

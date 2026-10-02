@@ -30,14 +30,6 @@ logger = logging.getLogger("widget.overlay")
 
 WINDOW_TITLE = "System Monitor"
 
-# Widget placement policy rather than a design token: how far from the screen
-# corner the panel comes to rest. No renderer code reads it, and the tokens in
-# theme.py are the ones the panel's pixels are drawn from. WHEEL_ALPHA_STEP went
-# the other way in wave 1 and lives in theme.py, which is the more consistent
-# home for a constant a test wants to quote; moving this one there is a one-line
-# change in any commit allowed to touch theme.py.
-CORNER_MARGIN = 10
-
 # Seconds between two render-failure records, whatever the faults are, and
 # however many frames pass in between. update() fires every theme.TICK_MS, so
 # 300 s is 150 frames of silence between records: 288 a day for a fault that
@@ -117,15 +109,20 @@ class MonitorPanel(QWidget):
         """
         if self._snapshot is None:
             return
-        painter = QPainter(self)
+        painter = None
         try:
+            painter = QPainter(self)
             paint(painter, self._snapshot, self._histories, self.current_alpha())
         except Exception:
             self._log_paint_failure()
         finally:
             # end() in a finally, so neither a raise nor the guard above can
-            # leave the painter holding the widget's paint device.
-            painter.end()
+            # leave the painter holding the widget's paint device. The
+            # construction is inside the try too: "a frame costs a frame" covers
+            # every statement of the frame, and a widget that cannot hand out a
+            # painter is the one that has none left.
+            if painter is not None:
+                painter.end()
 
     def _log_paint_failure(self) -> None:
         """At most one record per PAINT_ERROR_LOG_INTERVAL. That is the whole rule.
@@ -169,8 +166,8 @@ class MonitorPanel(QWidget):
     def restore_default_position(self) -> None:
         available = self.screen().availableGeometry()
         target = QPoint(
-            available.right() - self.width() - CORNER_MARGIN,
-            available.top() + CORNER_MARGIN,
+            available.right() - self.width() - theme.CORNER_MARGIN,
+            available.top() + theme.CORNER_MARGIN,
         )
         self.move(self.clamp_to_screen(target))
         self.remember_position()
@@ -204,34 +201,42 @@ class MonitorPanel(QWidget):
             if not event.buttons() & Qt.MouseButton.LeftButton:
                 # No button down, so nothing is being carried: a release went
                 # missing (hidden and re-shown, a lost grab) and this move is
-                # the first sign of it. Give the state back rather than drag on.
+                # the first sign of it. Give the state back rather than drag on,
+                # and say the event was handled, as every other branch here does.
                 self._cancel_drag()
-            else:
-                target = event.globalPosition().toPoint() - self._drag_origin
-                self.move(self.clamp_to_screen(target))
                 event.accept()
                 return
+            target = event.globalPosition().toPoint() - self._drag_origin
+            self.move(self.clamp_to_screen(target))
+            event.accept()
+            return
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton and self._drag_origin is not None:
             self._cancel_drag()
-            self.remember_position()
             event.accept()
             return
         super().mouseReleaseEvent(event)
 
     def _cancel_drag(self) -> None:
-        """Forget the grab and give back the cursor. No position is saved.
+        """Forget the grab, give back the cursor, and write down where the panel is.
 
-        A release that was swallowed leaves a grab armed against a panel
-        nobody is holding, and the next move -- with no button down -- walks it
-        across the screen. apply_window_flags() re-shows a visible widget, and
-        Qt does not deliver the release that was in flight across the hide, so
+        A release that was swallowed leaves a grab armed against a panel nobody
+        is holding, and the next move -- with no button down -- walks it across
+        the screen. apply_window_flags() re-shows a visible widget, and Qt does
+        not deliver the release that was in flight across the hide, so
         hideEvent cancels the drag for the same reason.
+
+        The position is saved because the panel has already moved by the time any
+        of these paths run: the cancel is about the grab, not about where the
+        panel ended up. Leaving that to closeEvent lost the drop whenever a drag
+        was cancelled rather than released -- dragged somewhere, then hidden, and
+        settings.json still held the corner the panel started from.
         """
         self._drag_origin = None
         self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.remember_position()
 
     def hideEvent(self, event) -> None:
         self._cancel_drag()

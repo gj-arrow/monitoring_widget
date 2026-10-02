@@ -77,6 +77,11 @@ BLEED = 8
 CANVAS_W = WIDTH + 2 * BLEED
 CANVAS_H = HEIGHT + 2 * BLEED
 
+# Placement, not panel geometry: how far from the screen corner the panel comes
+# to rest. It lives here beside the other tokens a test quotes rather than in
+# overlay.py, which is the same reasoning that put WHEEL_ALPHA_STEP here.
+CORNER_MARGIN = 10
+
 CALM = QColor("#5ac8fa")
 WARN_COLOR = QColor("#ffb454")
 CRITICAL_COLOR = QColor("#ff5c5c")

@@ -117,6 +117,24 @@ def test_panel_width_is_pinned_to_280():
     assert theme.panel_rect().width() == 280.0
 
 
+def test_canvas_is_the_panel_plus_a_bleed_margin():
+    assert theme.CANVAS_W == theme.WIDTH + 2 * theme.BLEED
+    assert theme.CANVAS_H == theme.HEIGHT + 2 * theme.BLEED
+
+
+def test_canvas_is_larger_than_the_panel_on_every_side():
+    assert theme.BLEED > 0
+    assert theme.CANVAS_W > theme.WIDTH
+    assert theme.CANVAS_H > theme.HEIGHT
+
+
+def test_the_bleed_does_not_move_the_panel():
+    """280 x 280 is the panel, not the window: its rect stays at the origin."""
+    panel = theme.panel_rect()
+    assert (panel.left(), panel.top()) == (0.0, 0.0)
+    assert (panel.width(), panel.height()) == (theme.WIDTH, theme.HEIGHT)
+
+
 def test_row_value_reads_a_pct_row():
     spec = theme.METRICS_BY_KEY["cpu_pct"]
     assert theme.row_value(spec, snapshot(cpu_pct=42.0)) == 42.0

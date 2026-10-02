@@ -66,6 +66,15 @@ HEIGHT = (
     + PAD_BOTTOM
 )
 
+# WIDTH and HEIGHT describe the panel, and every rect above is 0-based inside
+# it. The canvas the renderer paints on is the panel plus a margin, because
+# the drop shadow is drawn *outside* panel_rect() and a canvas equal to the
+# panel clips it away. paint() shifts the whole panel by BLEED; nothing above
+# this line moves.
+BLEED = 8
+CANVAS_W = WIDTH + 2 * BLEED
+CANVAS_H = HEIGHT + 2 * BLEED
+
 CALM = QColor("#5ac8fa")
 WARN_COLOR = QColor("#ffb454")
 CRITICAL_COLOR = QColor("#ff5c5c")

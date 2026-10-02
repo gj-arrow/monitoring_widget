@@ -6,6 +6,11 @@ QImage with no window on screen and compare the result against a reference.
 Layout per row: a 52 px rounded slab holding the label on the left, the value
 and its auxiliary reading on the right, and a 26 px graph strip along the
 bottom whose filled area is the row's history.
+
+The panel is 280 x 280 but the canvas it is painted on is larger: the drop
+shadow is drawn outside panel_rect(), and a canvas the same size as the panel
+clips it away. paint() shifts everything by theme.BLEED and theme's rects stay
+0-based, so no layout arithmetic had to change.
 """
 
 from __future__ import annotations
@@ -36,10 +41,15 @@ def paint(
     `now` pins the clock used for the header's "Xs ago" age. It defaults to
     wall clock time in the app, but tests pass a fixed value: otherwise the
     age text changes every run and the golden images could never match.
+
+    The paint target must be at least theme.CANVAS_W x theme.CANVAS_H; the
+    translate below leaves room for the drop shadow outside the panel, and the
+    matching restore() puts the caller's transform back.
     """
     painter.save()
     painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
     painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+    painter.translate(theme.BLEED, theme.BLEED)
 
     _draw_panel(painter, theme.panel_rect(), alpha)
     _draw_header(painter, theme.header_rect(), snapshot, now)

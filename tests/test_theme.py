@@ -141,6 +141,19 @@ def test_row_text_inset_is_a_theme_constant_and_sits_inside_the_padding():
     assert theme.ROW_TEXT_INSET + theme.ROW_TEXT_INSET < theme.WIDTH - 2 * theme.PAD_X
 
 
+def test_the_header_dot_fits_to_the_left_of_the_aligned_title():
+    """The title lines up with the row labels, so the dot has to squeeze in.
+
+    Placing the dot first and the title after it left the two left edges 6 px
+    apart, with SYSTEM starting further right than the CPU/RAM/GPU/VRAM labels
+    beneath it. The dot now hangs off the title's left edge by a fixed gap.
+    """
+    title_x = theme.PAD_X + theme.ROW_TEXT_INSET
+    dot_left = title_x - theme.DOT_GAP - 2 * theme.DOT_R
+    assert dot_left >= theme.PAD_X - theme.DOT_R, "the dot hangs outside the panel padding"
+    assert theme.DOT_GAP > 0
+
+
 def test_row_value_reads_a_pct_row():
     spec = theme.METRICS_BY_KEY["cpu_pct"]
     assert theme.row_value(spec, snapshot(cpu_pct=42.0)) == 42.0

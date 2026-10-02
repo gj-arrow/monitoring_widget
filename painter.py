@@ -94,12 +94,17 @@ def _draw_header(painter: QPainter, rect: QRectF, snapshot, now: float | None = 
         dot_color = theme.NEUTRAL
 
     centre_y = rect.center().y()
-    dot_x = rect.left() + theme.DOT_R + 1.0
+    # The title's left edge lines up with the row labels underneath it, and the
+    # dot hangs off that edge by a fixed gap. Placing the dot first and the
+    # title after it is what left the two left edges 6 px apart, with SYSTEM
+    # starting further right than the CPU/RAM/GPU/VRAM labels below it.
+    title_x = rect.left() + theme.ROW_TEXT_INSET
+    dot_x = title_x - theme.DOT_GAP - 2.0 * theme.DOT_R
     painter.setBrush(dot_color)
     painter.setPen(Qt.PenStyle.NoPen)
     painter.drawEllipse(QPointF(dot_x, centre_y), theme.DOT_R, theme.DOT_R)
 
-    title_rect = QRectF(dot_x + theme.DOT_R * 2.0 + 5.0, rect.top(), rect.width(), rect.height())
+    title_rect = QRectF(title_x, rect.top(), rect.width(), rect.height())
     _draw_text(painter, theme.HEADER_TITLE, title_rect, theme.label_font(), theme.HEADER_LABEL)
 
     age = _format_age(snapshot, now)

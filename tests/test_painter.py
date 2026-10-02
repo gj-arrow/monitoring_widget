@@ -18,8 +18,8 @@ import os
 from pathlib import Path
 from types import SimpleNamespace
 
-from PyQt6.QtCore import QPointF
-from PyQt6.QtGui import QColor, QImage, QPainter
+from PyQt6.QtCore import QPointF, QRectF, Qt
+from PyQt6.QtGui import QColor, QFont, QImage, QPainter, QPen, QTransform
 
 import painter
 import theme
@@ -43,20 +43,41 @@ def build_histories(values_by_key):
 def render(snapshot, values_by_key=None, alpha=theme.DEFAULT_ALPHA, histories=None):
     image = QImage(theme.CANVAS_W, theme.CANVAS_H, QImage.Format.Format_ARGB32_Premultiplied)
     image.fill(QColor(0, 0, 0, 0))
-    painter = QPainter(image)
+    # Not named `painter`: that would shadow the module the monkeypatch tests use.
+    canvas_painter = QPainter(image)
     try:
         # now is pinned: the header shows the sample age, and a wall clock would
         # change the pixels on every run.
         paint(
-            painter,
+            canvas_painter,
             snapshot,
             build_histories(values_by_key or {}) if histories is None else histories,
             alpha,
             now=snapshot.ts + 2.0,
         )
     finally:
-        painter.end()
+        canvas_painter.end()
     return image
+
+
+def painter_state(p):
+    """Everything a caller's paintEvent would mind paint() having changed."""
+    pen = p.pen()
+    transform = p.transform()
+    return {
+        "pen": (pen.color().rgba(), pen.widthF(), pen.style(), pen.joinStyle(), pen.capStyle()),
+        "brush": p.brush().color().rgba(),
+        "brush_style": p.brush().style(),
+        "font": p.font().toString(),
+        "transform": (
+            transform.m11(), transform.m12(), transform.m13(),
+            transform.m21(), transform.m22(), transform.m23(),
+            transform.m31(), transform.m32(), transform.m33(),
+        ),
+        "clip": p.clipRegion(),
+        "hints": p.renderHints(),
+        "composition": p.compositionMode(),
+    }
 
 
 def blank_canvas():
@@ -214,6 +235,70 @@ def test_the_panel_is_inset_by_the_bleed_rather_than_moved():
     assert max(fill.red(), fill.green(), fill.blue()) < 96
 
 
+def test_paint_restores_the_painter_it_was_given():
+    """paint() must hand the painter back exactly as it found it.
+
+    overlay.py calls paint() from a paintEvent on a painter it reuses every
+    tick, so a missing save() or restore() is not a cosmetic problem: the
+    translate(8, 8) would accumulate on every tick and walk the panel off-screen
+    while the golden images, which each use a fresh painter, stayed green.
+
+    Every mutable piece of painter state is armed with a distinctive value
+    first, including a pre-existing clip -- paint() installs a nested one for
+    the graph, and that has to come off again too.
+    """
+    image = blank_canvas()
+    caller_painter = QPainter(image)
+    try:
+        caller_painter.setPen(
+            QPen(QColor(12, 200, 90, 210), 3.5, Qt.PenStyle.DashDotLine,
+                 Qt.PenCapStyle.SquareCap, Qt.PenJoinStyle.BevelJoin)
+        )
+        caller_painter.setBrush(QColor(200, 30, 30, 180))
+        caller_painter.setFont(QFont("Courier New", 19, QFont.Weight.Bold, italic=True))
+        caller_painter.setTransform(QTransform().translate(3.0, 4.0).scale(1.5, 0.5))
+        caller_painter.setClipRect(QRectF(2.0, 3.0, 400.0, 400.0))
+        caller_painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        before = painter_state(caller_painter)
+
+        paint(caller_painter, CALM, build_histories(RAMPS), theme.DEFAULT_ALPHA,
+              now=CALM.ts + 2.0)
+
+        after = painter_state(caller_painter)
+    finally:
+        caller_painter.end()
+
+    changed = {key: (before[key], after[key]) for key in before if after[key] != before[key]}
+    assert not changed, f"paint() left the caller's painter state changed: {changed}"
+
+
+def test_a_lost_restore_would_accumulate_the_bleed_translate(monkeypatch):
+    """The failure this guards against, shown rather than asserted by proxy.
+
+    overlay.py reuses one painter for every tick. A missing restore() leaves
+    the translate on it, so tick two starts 8 px further right than tick one --
+    which is why the restoration test above has to compare against state the
+    caller set up, not against a default painter.
+    """
+    monkeypatch.setattr(painter, "_draw_panel", lambda *args, **kwargs: None)
+    image = QImage(theme.CANVAS_W, theme.CANVAS_H, QImage.Format.Format_ARGB32_Premultiplied)
+    image.fill(QColor(0, 0, 0, 0))
+    caller_painter = QPainter(image)
+    try:
+        origin = QTransform()
+        paint(caller_painter, CALM, {}, 1.0, now=CALM.ts + 2.0)
+        first = caller_painter.transform()
+        assert first == origin, "the first tick already drifted; restore() is broken now"
+        paint(caller_painter, CALM, {}, 1.0, now=CALM.ts + 2.0)
+        second = caller_painter.transform()
+    finally:
+        caller_painter.end()
+    assert second == origin, (
+        "two ticks moved the painter: "
+        f"{first.m31()}, {first.m32()} -> {second.m31()}, {second.m32()}"
+    )
+
+
 def test_calm_panel_matches_golden():
     assert_golden("calm", CALM, RAMPS)
 
@@ -237,7 +322,7 @@ def test_render_is_never_blank_without_data():
     image = render(EMPTY, {})
     colours = {image.pixelColor(x, y).rgba() for y in range(0, theme.CANVAS_H, 3)
                for x in range(0, theme.CANVAS_W, 3)}
-    # Measured 78 on this grid: a panel fill, four row slabs, a header dot and
+    # Measured 60 on this grid: a panel fill, four row slabs, a header dot and
     # the five "--" labels all contribute their own antialiased values. A blank
     # image yields exactly 1, so the floor below fails it by a wide margin
     # while leaving room for a font change.
@@ -245,13 +330,15 @@ def test_render_is_never_blank_without_data():
 
 
 def test_each_rows_graph_sits_inside_its_own_slab():
-    """A row's history belongs to that row, horizontally as well as vertically.
+    """A row's history must fill its slab: inside it *and* out to both edges.
 
     The graph is drawn from resample()'s column indices, which count from zero
     and are not panel coordinates. Used raw they put the fill 14 px left of the
     slab -- over the panel's own padding -- and leave the same width of bare
     slab on the right. Rendered with and without history, the difference is
-    exactly the graph, so its extent is read straight off the pixels.
+    exactly the graph, so its extent is read straight off the pixels. Both
+    bounds are asserted: an upper bound alone would not notice the graph
+    quietly shrinking to a stub in the middle of the row.
     """
     graph_pixels = differing_pixels(render(CALM, RAMPS), render(CALM, {}))
     assert graph_pixels, "no graph was drawn at all, so this test proves nothing"
@@ -262,6 +349,14 @@ def test_each_rows_graph_sits_inside_its_own_slab():
         left, right = min(x for x, _ in in_row), max(x for x, _ in in_row)
         assert left >= slab.left(), f"{spec.key}: graph starts at x={left}, slab at {slab.left()}"
         assert right <= slab.right(), f"{spec.key}: graph ends at x={right}, slab at {slab.right()}"
+        assert left - slab.left() <= 1, (
+            f"{spec.key}: graph starts at x={left}, {left - slab.left():.0f} px short of "
+            f"the slab's left edge at {slab.left()}"
+        )
+        assert slab.right() - right <= 1, (
+            f"{spec.key}: graph ends at x={right}, {slab.right() - right:.0f} px short of "
+            f"the slab's right edge at {slab.right()}"
+        )
         strip_top = slab.bottom() - theme.GRAPH_H
         assert min(y for _, y in in_row) >= strip_top, f"{spec.key}: graph climbs above its strip"
 
@@ -319,6 +414,12 @@ def test_a_snapshot_without_a_gpu_temperature_renders_a_dash():
     Reading snapshot.gpu_temp_c directly raises out of paint() instead, even
     though every other reading in the module tolerates the field being absent
     and _draw_header already renders such a snapshot without complaint.
+
+    Two things are asserted, and both matter. The missing field must render
+    exactly like an explicit None -- so it is not quietly invented -- and it
+    must render *differently* from a snapshot that has a temperature, which is
+    what pins the dash itself. Comparing only against None would still pass if
+    the auxiliary returned an empty string.
     """
     no_temp = SimpleNamespace(
         cpu_pct=34.0, cpu_mhz=4500.0, cpu_max_mhz=4500.0,
@@ -333,6 +434,10 @@ def test_a_snapshot_without_a_gpu_temperature_renders_a_dash():
     )
     assert max_channel_delta(image, render(explicit_none, RAMPS)) == 0, (
         "a missing gpu_temp_c rendered differently from an explicit None"
+    )
+    assert max_channel_delta(image, render(CALM, RAMPS)) > 60, (
+        "a missing gpu_temp_c renders the same as a real temperature: the GPU "
+        "auxiliary is not showing a dash"
     )
 
 

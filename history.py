@@ -46,9 +46,19 @@ def resample(points: list[float], width: int) -> list[QPointF]:
 
     Uniform sampling would drop spikes: with more samples than pixels a
     one-sample spike is easily averaged away, and the graph would lie about
-    exactly the moment it exists to reveal. Instead each column picks the
-    value furthest from the previously drawn point, which keeps the spike
-    and stays visually continuous.
+    exactly the moment it exists to reveal. Instead every column after the
+    first picks the value furthest from the point drawn just before it.
+
+    The trade-off is on purpose. Measuring "furthest" from the previous
+    point means taking the largest step in the window, so the line breaks
+    its continuity at a spike in order to keep the spike. Column 0 has no
+    predecessor to measure a step from, so it falls back to plain
+    `max(window)`: with nothing to stay continuous with, the column's peak
+    is the only spike-preserving choice left.
+
+    Chosen values are copied out of the window, never interpolated, so the
+    graph shows measured numbers only. Input is not clamped here --
+    `History.append` clamps before anything reaches the buffer.
     """
     if width <= 0 or not points:
         return []
@@ -103,8 +113,12 @@ class HistoryLog:
         values = snapshot.as_dict()
         try:
             with self._path.open("a", encoding="utf-8") as handle:
-                # The header is derived from the same dict as the row, so the
-                # two can never drift apart.
+                # Both strings come from one dict, so they agree within a
+                # single write. Across runs they can still disagree: a file
+                # left by a build with other columns is trusted as-is,
+                # because `enable()` cannot know this build's column list
+                # until the first write, and rewriting a user's existing
+                # log to hide that would trade data for cosmetics.
                 if not self._has_header:
                     handle.write(",".join(values.keys()) + "\n")
                     self._has_header = True

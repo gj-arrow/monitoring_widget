@@ -57,15 +57,30 @@ _NOMINAL_SOURCES = (
     ("SELECT ProcessorFrequency FROM Win32_Processor", "ProcessorFrequency"),
 )
 
-# The ceiling PercentProcessorPerformance is believed to. It is a percentage of
-# the nominal clock: 100 is nominal and above it is turbo. The bound has to clear
-# every boost ratio real silicon reaches -- the widest is a ~3.7 GHz Xeon over a
-# 2.4 GHz base, about 154% -- while still rejecting values no counter could have
-# produced. Nothing clocks a CPU at twice nominal, so 200 is the honest place to
-# stop; a plausible turbo figure has to keep working, so this is a ceiling and
-# not a target. It is a ceiling only: positivity and finiteness are _speed()'s
-# job, so that one gate covers the nominal and this signal alike.
+# How far PercentProcessorPerformance is believed. It is a percentage of the
+# nominal clock: 100 is nominal and above it is turbo, so the bounds have to
+# clear every clock state real silicon reaches while still rejecting values no
+# counter could have produced.
+#
+# Ceiling: nothing clocks a CPU at twice nominal, so 200 is the honest place to
+# stop, and it clears the widest boost ratio on any shipping part -- a ~3.7 GHz
+# Xeon over a 2.4 GHz base, about 154% -- so a genuine turbo figure is never
+# thrown away. This is a ceiling and not a target.
+#
+# Floor: 10%, because no x86 core has run at a tenth of its nominal clock while
+# an OS is scheduling it -- the counter reports the effective clock, not the one
+# a core would idle at, so even a deeply gated machine reads near nominal (this
+# one idles at 99). A formatted counter reports integer percent and uses 0 as its
+# not-collected-yet sentinel, so there is nothing real down there to keep: 1%
+# rendered 0.04 GHz and 1e-6 rendered 0.00 GHz before this bound existed.
+_PERF_RATIO_MIN = 10.0
 _PERF_RATIO_MAX = 200.0
+
+# The fastest core in production is about 5.7 GHz, so a ceiling at 20 GHz cannot
+# reject a real part while catching a unit slip: 450100 -- a plausible-looking
+# number that is not a clock -- rendered "450.10 GHz" and would multiply into a
+# 445 GHz reading beside it. Positive and finite is not enough on its own.
+_NOMINAL_MAX_MHZ = 20_000.0
 
 # Adapters whose name is the only thing that identifies them. The loopback
 # pseudo-interface is on every Windows box and its counters move with whatever
@@ -229,20 +244,27 @@ def _psutil_nominal_mhz() -> float | None:
     return float(maximum) if maximum else None
 
 
-def _speed(value: Any) -> float | None:
-    """`value` as a positive, finite number, or None if it is not one.
+def _reading(value: Any, floor: float | None = None, ceiling: float | None = None) -> float | None:
+    """`value` as a usable number, or None if it is not one.
 
-    One gate for both readings this module derives from a counter, because a
+    One gate for every reading this module takes from a counter, because a
     truthiness test passes a negative, a NaN and an infinity -- all perfectly
-    truthy -- and each of those reaches the panel as a fabricated number. 0 is
-    included: a driver with nothing to report is not reporting a ceiling, and a
-    perf counter's zero is its not-collected-yet sentinel.
+    truthy -- and each of those reaches the panel as a fabricated number.
+
+    `floor` and `ceiling` are inclusive and optional. Both are about
+    plausibility rather than type: a value can be a perfectly good finite
+    positive float and still not be a thing that exists. What bound belongs on
+    what is a property of the quantity, so it is named at the call site.
     """
     try:
         number = float(value)
     except (TypeError, ValueError):
         return None
-    return number if math.isfinite(number) and number > 0.0 else None
+    if not math.isfinite(number) or number <= 0.0:
+        return None
+    if floor is not None and number < floor:
+        return None
+    return number if ceiling is None or number <= ceiling else None
 
 
 class CpuClockProbe:
@@ -274,18 +296,34 @@ class CpuClockProbe:
     bug this probe was written to fix; the cost buys an honest timestamp, not a
     fast one.
 
-    That wall figure is not a floor, and the obvious next reader should know it.
-    `ctypes` against `pdh.dll` -- `PdhCollectQueryData` then
-    `PdhGetFormattedCounterValue` on
-    `\\Processor Information(0,0)\\% Processor Performance` -- returns the same
-    value in **~0.018 ms**, stdlib only, no new dependency: roughly 20000x less
-    latency for the same signal. It is not a drop-in replacement, and no code
-    here attempts it: a wildcard instance array returns `PDH_CSTATUS_INVALID_DATA`,
-    the single-instance form needs two collections before the first value is
-    valid, and keeping the average over all logical processors means one query
-    handle per processor -- twelve on this machine. That is about 100 lines of
-    ctypes and a re-derivation of the averaging rule. Tracked as the open
-    follow-up in .superpowers/sdd/progress.md.
+That wall figure is not a floor, and the obvious next reader should know it.
+    `ctypes` against `pdh.dll` reads the same quantity directly. Measured here,
+    with a throwaway script outside this repository (nothing in the project calls
+    PDH and no PDH code is written):
+
+    - `PdhCollectQueryData` + `PdhGetFormattedCounterValue` on
+      `\\Processor Information(0,0)\\% Processor Performance` cost **0.0056 ms**
+      per cycle over 200 cycles -- roughly 60,000x less latency than the WMI
+      query. Stdlib only, no new dependency.
+    - At the tick cadence it reads **99.98-99.997 %** of nominal, against WMI's
+      12-row mean of 99.0-99.1 % on the same machine at the same instants. The
+      small difference is one boosted core against a 12-core mean.
+    - The single-instance form needs **two** collections before the value is
+      valid: the first returns `0xC0000BC6` (PDH_INVALID_DATA), the second
+      `0x00000000`.
+    - A wildcard instance array is not a shortcut: the *call* succeeds and the
+      *value* comes back carrying `0xC0000BBA` = `PDH_CSTATUS_INVALID_DATA`.
+      Keeping the average over all logical processors therefore means one query
+      handle per processor -- twelve on this machine -- which is where most of
+      the ~100 lines of ctypes go.
+
+    One trap worth recording, because it is how you would conclude the counter is
+    broken: the counter is average-based, so collecting it in a tight loop
+    divides by a near-zero interval. Hammering it 200 times inside a millisecond
+    measured **4.38 %** of nominal -- a plausible-looking wrong answer, not an
+    error. One collect per tick is all the cost there is, because the two-second
+    tick already *is* the interval. Tracked as the open follow-up in
+    .superpowers/sdd/progress.md.
     """
 
     def __init__(self, wmi: Any | None = None, nominal_max: Callable[[], float | None] | None = None) -> None:
@@ -300,6 +338,7 @@ class CpuClockProbe:
         self._nominal_max = nominal_max or _psutil_nominal_mhz
         self._nominal: float | None = None
         self._reconnected = False
+        self._rejected: set[str] = set()
         if wmi is not None:
             try:
                 self._conn = wmi.WMI()
@@ -311,14 +350,32 @@ class CpuClockProbe:
         """Rows for `wql`, rebuilding the connection once if the handle has gone.
 
         `_query_once` answers None for "this handle did not work", which is not
-        the same answer as "no rows" and is what tells the two apart here: the
-        first is worth a reconnect, the second is a measurement of nothing.
+        the same answer as "no rows", and that distinction is the whole reason
+        the reconnect happens here rather than inside the query.
+
+        A second distinction matters too, and it is the one a failed query cannot
+        make for itself. A stale handle and a permanently invalid projection both
+        arrive as an exception, and only the second is not worth retrying: a
+        repository that rejects the WQL every time made this rebuild the COM
+        connection on every tick -- measured at 1.3 connects a tick over three
+        reads -- which makes "one connection per process" untrue in exactly the
+        degraded case. So a projection is remembered as rejected only after it
+        has failed against a *live* freshly-rebuilt handle, which is the only
+        evidence that the handle was not the problem. A query that failed
+        because the service was down is remembered by nobody, and recovers.
         """
         rows = self._query_once(wql)
         if rows is not None:
             return rows
+        if wql in self._rejected:
+            return []
         self._reconnect()
+        if self._conn is None:
+            return []  # the service is down; that says nothing about the WQL
         rows = self._query_once(wql)
+        if rows is None:
+            self._rejected.add(wql)
+            logger.info("WMI projection rejected outright, not retried: %s", wql)
         return rows if rows is not None else []
 
     def _query_once(self, wql: str) -> list[Any] | None:
@@ -368,12 +425,12 @@ class CpuClockProbe:
             return self._nominal
         for wql, column in _NOMINAL_SOURCES:
             for row in self._query(wql):
-                speed = _speed(getattr(row, column, None))
+                speed = _reading(getattr(row, column, None), ceiling=_NOMINAL_MAX_MHZ)
                 if speed is not None:
                     self._nominal = speed
                     return speed
         try:
-            fallback = _speed(self._nominal_max())
+            fallback = _reading(self._nominal_max(), ceiling=_NOMINAL_MAX_MHZ)
         except Exception:
             logger.warning("nominal CPU frequency failed", exc_info=True)
             return None
@@ -410,13 +467,10 @@ class CpuClockProbe:
             raw = getattr(row, "PercentProcessorPerformance", None)
             if raw is None:
                 continue  # one processor's counter missing is not a zero reading
-            ratio = _speed(raw)
-            # _speed has already dropped anything not positive and finite -- NaN
-            # and both infinities included -- so all that is left to reject here
-            # is a positive value above any clock a CPU can run at. A row outside
-            # the bound is skipped rather than voiding the mean, so one garbled
-            # core does not cost the panel the other eleven.
-            if ratio is not None and ratio <= _PERF_RATIO_MAX:
+            ratio = _reading(raw, floor=_PERF_RATIO_MIN, ceiling=_PERF_RATIO_MAX)
+            # Outside the band is skipped rather than voiding the mean, so one
+            # garbled core does not cost the panel the other eleven.
+            if ratio is not None:
                 ratios.append(ratio)
         if not ratios:
             return None
@@ -456,20 +510,20 @@ class NetProbe:
             io_counters = psutil.net_io_counters
         self._io_counters = io_counters
         self._now = now or time.time
-        self._previous: tuple[float, float, float] | None = None
+        self._previous: tuple[float, frozenset[str], float, float] | None = None
         self._averaged: dict[str, float | None] = {key: None for key in NET_KEYS}
 
     def read(self) -> dict[str, float | None]:
         out = _empty(NET_KEYS)
         try:
-            totals = _summed_adapters(self._io_counters(pernic=True))
+            names, totals = _summed_adapters(self._io_counters(pernic=True))
             moment = self._now()
         except Exception:
             logger.warning("net_io_counters failed", exc_info=True)
             return out
 
         previous = self._previous
-        now = (moment, *(totals[key] for key in NET_KEYS))
+        now = (moment, names, *(totals[key] for key in NET_KEYS))
         # Only on a read that worked. The reference survives an outage on
         # purpose: the counters kept moving while we could not see them, and
         # the bytes over the whole elapsed interval is a true rate, whereas
@@ -480,8 +534,25 @@ class NetProbe:
         elapsed = moment - previous[0]
         if elapsed <= 0.0:
             return out  # a rate is bytes over seconds; with no seconds, no rate
+        if names != previous[1]:
+            # The adapter set changed, so the sum no longer has a term for every
+            # interface and this interval cannot be differenced. An adapter that
+            # appears brings cumulative counters with it, and summing those in
+            # publishes its whole lifetime -- measured with a VPN adapter
+            # carrying 9 GB, 1,575,001,000 B/s on one tick, and then six more
+            # ticks of the EMA decaying from that peak. An adapter that vanishes
+            # leaves the sum missing a term. Neither is the machine's traffic.
+            #
+            # Unmeasured is the honest answer, and it is the same answer a
+            # counter that went backwards gets below: these are one defect --
+            # a discontinuity in a cumulative counter -- read in two directions.
+            # Summing only the adapters present in both samples was the
+            # alternative; it avoids the dash but publishes a subset of the
+            # traffic as though it were all of it, which is wrong by an unknown
+            # amount exactly when a freshly connected adapter is moving data.
+            return out
 
-        for index, key in enumerate(NET_KEYS, start=1):
+        for index, key in enumerate(NET_KEYS, start=2):
             moved = now[index] - previous[index]
             if moved < 0.0:
                 # The adapter was re-enumerated and its counters restarted, so
@@ -490,35 +561,43 @@ class NetProbe:
                 # shape of answer: an EMA decays from its peak, and this was
                 # measured decaying 300 -> 195 -> 127 -> 82 -> 54 -> 35 -> 23
                 # KB/s, six ticks of throughput nobody sent after the link died.
-                # A dead average is replaced, not averaged away.
-                out[key] = self._seed(key, 0.0)
+                # A dead average is dropped so the next sample seeds from a real
+                # measurement, and this tick says nothing rather than claiming no
+                # traffic moved.
+                self._averaged[key] = None
                 continue
             out[key] = self._smooth(key, moved / elapsed)
         return out
-
-    def _seed(self, key: str, raw: float) -> float:
-        self._averaged[key] = raw
-        return raw
 
     def _smooth(self, key: str, raw: float) -> float:
         previous = self._averaged[key]
         if previous is None:
             # The first measured sample is the average. Averaging it against
             # nothing would halve the first real figure the panel ever shows.
-            return self._seed(key, raw)
+            self._averaged[key] = raw
+            return raw
         self._averaged[key] = NET_SMOOTHING * raw + (1.0 - NET_SMOOTHING) * previous
         return self._averaged[key]
 
 
-def _summed_adapters(counters: Any) -> dict[str, float]:
-    """Download and upload bytes so far, summed over the real adapters."""
+def _summed_adapters(counters: Any) -> tuple[frozenset[str], dict[str, float]]:
+    """The real adapters present, and download and upload bytes so far.
+
+    The names come back as well as the totals because the probe has to know
+    whether the set is the same one it saw last time: see read(). Pseudo
+    interfaces are dropped *before* the set is built, so a loopback appearing or
+    vanishing -- which Windows does on its own -- cannot cost a measurable tick.
+    """
+    names: set[str] = set()
     download = upload = 0.0
     for name, stats in counters.items():
         if any(token in str(name).lower() for token in _PSEUDO_ADAPTERS):
             continue
+        names.add(str(name))
         download += float(getattr(stats, "bytes_recv", 0) or 0)
         upload += float(getattr(stats, "bytes_sent", 0) or 0)
-    return {"net_down_bytes_per_sec": download, "net_up_bytes_per_sec": upload}
+    totals = {"net_down_bytes_per_sec": download, "net_up_bytes_per_sec": upload}
+    return frozenset(names), totals
 
 
 class SystemProbe:

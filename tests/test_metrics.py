@@ -155,11 +155,13 @@ class FakeWmi:
         self.connects = 0
         self._connection = connection
         self._fail_connect = fail_connect
+        self.down = False
 
     def WMI(self):
         self.connects += 1
-        if self._fail_connect:
+        if self._fail_connect or self.down:
             raise RuntimeError("the WMI service has stopped")
+        self._connection.fail = False   # a fresh handle is not a stale one
         return self._connection
 
 
@@ -683,15 +685,18 @@ def test_the_rate_is_unmeasured_when_no_time_passed_between_two_samples():
     assert probe.read()["net_down_bytes_per_sec"] == 15_000.0
 
 
-def test_a_counter_that_went_backwards_reads_as_quiet_not_negative():
+def test_a_counter_that_went_backwards_reads_as_unmeasured_not_as_zero():
     # Adapters are re-enumerated and counters restart. The bytes did not
-    # un-transfer, so a negative rate is a nonsense number on screen; zero is
-    # the conservative reading of an unknown amount.
+    # un-transfer, so the amount is unknown -- and unknown is what this module
+    # renders as a dash everywhere else. Seeding the average with 0.0 here said
+    # "nothing moved", which is a different claim, and the seed then decayed from
+    # the pre-reset peak for six ticks: throughput nobody sent, in the panel and
+    # in the CSV.
     probe = net_probe([[("Ethernet", 900_000, 900_000)],
                        [("Ethernet", 0, 0)]])
     probe.read()
     probe._now.advance(2.0)
-    assert probe.read() == {"net_down_bytes_per_sec": 0.0, "net_up_bytes_per_sec": 0.0}
+    assert probe.read() == {"net_down_bytes_per_sec": None, "net_up_bytes_per_sec": None}
 
 
 def test_a_failing_counter_read_leaves_the_next_sample_measured():
@@ -779,28 +784,46 @@ def test_an_aggregate_at_a_plausible_ratio_is_still_not_a_processor():
 
 @pytest.mark.parametrize(
     "ratio",
-    [0, 0.0, -1, -42, float("inf"), float("-inf"), float("nan"), 201, 255, 4501],
+    [0, 0.0, -1, -42, float("inf"), float("-inf"), float("nan"),
+     0.5, 1.0, 1e-06, 9.9, 201, 255, 4501],
 )
 def test_a_ratio_outside_the_plausible_band_is_not_a_measurement(ratio):
     # The module's own docstring promises nothing here invents a number, and a
-    # counter with no range check does: 0 renders 0.00 GHz, -42 renders
-    # -1.89 GHz, inf renders inf, and 255 renders 11.48 GHz on a 4.5 GHz part.
-    # All four were measured on this code before the band existed.
+    # counter with no range check does: 0 renders 0.00 GHz, -42 as -1.89 GHz,
+    # inf as inf, 255 as 11.48 GHz on a 4.5 GHz part, and a merely tiny positive
+    # ratio renders 0.04 GHz. All measured on this code.
     probe = clock_probe(perf=perf_rows(ratio),
                         processors=[SimpleNamespace(MaxClockSpeed=4501)])
     assert probe.read() == {"cpu_nominal_mhz": 4501.0, "cpu_live_mhz": None}, ratio
 
 
-@pytest.mark.parametrize("ratio", [1.0, 99.0, 100.0, 118.0, 155.0, 200.0])
+@pytest.mark.parametrize("ratio", [10.0, 99.0, 100.0, 118.0, 155.0, 200.0])
 def test_a_plausible_ratio_is_still_derived(ratio):
     # The band has to leave room for genuine boost, not just for the 99-100 this
     # machine idles at. 155% is below what real silicon reaches: the widest turbo
     # ratio on any shipping part is a ~3.7 GHz Xeon over a 2.4 GHz base, about
     # 154%. A ceiling at 200 clears that with room and still rejects garbage,
-    # since nothing clocks a CPU at twice nominal.
+    # since nothing clocks a CPU at twice nominal. 10% is the floor for the same
+    # reason at the bottom: no x86 core has ever run at a tenth of its nominal
+    # clock while an OS is scheduling it, and a formatted counter reports integer
+    # percent, so there is nothing real down there to keep.
     probe = clock_probe(perf=perf_rows(ratio),
                         processors=[SimpleNamespace(MaxClockSpeed=4500)])
     assert probe.read()["cpu_live_mhz"] == round(4500 * ratio / 100.0, 1), ratio
+
+
+@pytest.mark.parametrize("speed", [20001.0, 450100.0, 1e30, 1e300])
+def test_a_nominal_faster_than_any_shipped_core_is_dropped(speed):
+    # Positive and finite is not enough. The fastest core in production is about
+    # 5.7 GHz, so a ceiling at 20 GHz cannot reject a real part, while 450100 --
+    # a unit slip in whatever produced the value -- renders "450.10 GHz" as
+    # though it were a clock. There is no part to measure, so it is not measured.
+    probe = CpuClockProbe(
+        wmi=FakeWmi(FakeWmiConnection(processors=[SimpleNamespace(MaxClockSpeed=speed)],
+                                      perf=perf_rows(99.0))),
+        nominal_max=lambda: None,
+    )
+    assert probe.read() == {"cpu_nominal_mhz": None, "cpu_live_mhz": None}, speed
 
 
 @pytest.mark.parametrize("speed", [0, -4501, -0.5, float("nan"), float("inf")])
@@ -816,10 +839,14 @@ def test_a_nominal_that_is_not_a_positive_finite_speed_is_dropped(speed):
     assert probe.read() == {"cpu_nominal_mhz": None, "cpu_live_mhz": None}, speed
 
 
-@pytest.mark.parametrize("speed", [0, -4501, float("nan"), float("inf")])
+@pytest.mark.parametrize("speed", [0, -4501, float("nan"), float("inf"),
+                                  20001.0, 450100.0, 1e300])
 def test_a_secondary_nominal_that_is_not_a_positive_finite_speed_is_dropped(speed):
-    # The psutil fallback is a source like any other and gets the same check.
-    # Trusting one path and not the other is how -4501 gets onto the panel.
+    # The psutil fallback is a source like any other and gets the same checks,
+    # bounds included. Trusting one path and not the other is how -4501 gets onto
+    # the panel, and how a unit slip in psutil's own field would too: the absurd
+    # values are here as well as in the WMI test because the ceiling is a property
+    # of the quantity, not of where it was read from.
     probe = clock_probe(perf=perf_rows(99.0), processors=[], nominal=speed)
     assert probe.read() == {"cpu_nominal_mhz": None, "cpu_live_mhz": None}, speed
 
@@ -854,23 +881,18 @@ def test_the_cpu_clock_probe_reconnects_once_when_the_cached_handle_goes_stale()
     # A WMI service that restarts mid-session leaves the cached connection
     # unusable and every later query failing. Without a reconnect the nominal
     # falls back to psutil and the derived clock reads -- for the rest of the
-    # session, however many ticks go by.
+    # session, however many ticks go by. A handle that recovers on reconnect
+    # costs not even a dash, because the retry happens inside the same read.
     connection = FakeWmiConnection(processors=[SimpleNamespace(MaxClockSpeed=4501)],
                                    perf=perf_rows(99.0))
     wmi = FakeWmi(connection)
     probe = CpuClockProbe(wmi=wmi, nominal_max=lambda: None)
     assert probe.read()["cpu_live_mhz"] == 4456.0
 
-    connection.fail = True                      # the service goes away
-    assert probe.read()["cpu_live_mhz"] is None, (
-        "a stale handle still produced a derived clock"
+    connection.fail = True                      # the service restarts
+    assert probe.read()["cpu_live_mhz"] == 4456.0, (
+        "the probe did not recover on the reconnect inside its own read"
     )
-
-    replacement = FakeWmiConnection(processors=[SimpleNamespace(MaxClockSpeed=4501)],
-                                    perf=perf_rows(99.0))
-    connection.fail = False                     # and comes back on a new handle
-    wmi._connection = replacement
-    assert probe.read()["cpu_live_mhz"] == 4456.0
     assert wmi.connects == 2
 
 
@@ -889,23 +911,129 @@ def test_a_dead_wmi_service_is_not_reconnected_to_once_per_query():
 
 
 def test_a_counter_reset_reseeds_the_average_instead_of_decaying_it():
-    # 300 KB/s, then the link dies and the adapter's counters restart. An EMA
-    # decays from its peak -- measured here as 300 -> 195 -> 127 -> 82 -> 54 ->
-    # 35 -> 23 KB/s, six ticks of throughput nobody sent after the link has
-    # gone. The counters restarted, so the bytes since the last sample are
-    # unknown rather than zero, and the honest thing to do with a dead average
-    # is replace it instead of averaging it away.
+    # 300 KB/s, then the link dies and the adapter's counters restart. The
+    # tick that notices says nothing -- the bytes are unknown, not zero -- and
+    # the average is dropped rather than averaged, because an EMA decays from
+    # its peak: measured here as 300 -> 195 -> 127 -> 82 -> 54 -> 35 -> 23 KB/s,
+    # six ticks of throughput nobody sent after the link had gone. The tick
+    # after that seeds from a real measurement instead.
     probe = net_probe([[("Ethernet", 600_000, 600_000)],
                        [("Ethernet", 1_200_000, 1_200_000)],
                        [("Ethernet", 0, 0)],
-                       [("Ethernet", 0, 0)]])
+                       [("Ethernet", 40_000, 40_000)]])
     probe.read()
     probe._now.advance(2.0)
     assert probe.read()["net_down_bytes_per_sec"] == 300_000.0
     probe._now.advance(2.0)
-    assert probe.read()["net_down_bytes_per_sec"] == 0.0
+    assert probe.read() == {"net_down_bytes_per_sec": None, "net_up_bytes_per_sec": None}
     probe._now.advance(2.0)
-    assert probe.read()["net_down_bytes_per_sec"] == 0.0
+    # 40000 bytes over 2 s, seeded fresh: 20_000, not 0.65 * 300_000 = 195_000.
+    assert probe.read()["net_down_bytes_per_sec"] == 20_000.0
+
+
+def test_a_new_adapter_publishes_its_lifetime_as_this_interval():
+    """The defect: a cumulative counter's whole history, read as one delta.
+
+    A VPN adapter appears between two ticks carrying 9 GB of counters accumulated
+    since boot. Summed into this interval that is 1,575,001,000 B/s -- DN 1575.0
+    MB/s on the panel, and a row in the CSV -- and the EMA then carries it for
+    roughly six more ticks as it decays at 0.65 per tick. About 30 seconds of
+    throughput nobody sent.
+    """
+    giga = 1024 ** 3
+    probe = net_probe([[("Ethernet", 100_000_000, 50_000_000)],
+                       [("Ethernet", 120_000_000, 60_000_000),
+                        ("VPN Adapter", 9 * giga, 3 * giga)]])
+    probe.read()
+    probe._now.advance(2.0)
+    values = probe.read()
+    assert values == {"net_down_bytes_per_sec": None, "net_up_bytes_per_sec": None}, values
+
+
+def test_an_adapter_that_appears_and_stays_measures_normally_from_the_next_tick():
+    # The recovery is the half that matters: a policy that simply gave up on the
+    # network would pass the test above and break the panel permanently. Both
+    # adapters are in both samples by the third tick, so both real deltas count.
+    giga = 1024 ** 3
+    probe = net_probe([
+        [("Ethernet", 0, 0)],
+        [("Ethernet", 20_000, 10_000), ("VPN Adapter", 9 * giga, 3 * giga)],
+        [("Ethernet", 40_000, 20_000), ("VPN Adapter", 9 * giga + 30_000, 3 * giga + 20_000)],
+    ])
+    probe.read()
+    probe._now.advance(2.0)
+    assert probe.read() == {"net_down_bytes_per_sec": None, "net_up_bytes_per_sec": None}
+    probe._now.advance(2.0)
+    # Ethernet moved 20 kB, the VPN 30 kB: 50 kB over 2 s, not 9 GB.
+    assert probe.read() == {"net_down_bytes_per_sec": 25_000.0,
+                            "net_up_bytes_per_sec": 15_000.0}
+
+
+def test_an_adapter_disappearing_also_makes_the_tick_unmeasured():
+    # Set equality rather than a one-directional "anything new appeared" check.
+    # A vanished adapter's last interval is unaccounted for, so the sum is not
+    # the machine's traffic either; and one condition a reader can check at a
+    # glance is worth more than saving a tick that costs one dash.
+    probe = net_probe([[("Ethernet", 0, 0), ("VPN Adapter", 0, 0)],
+                       [("Ethernet", 20_000, 10_000)]])
+    probe.read()
+    probe._now.advance(2.0)
+    assert probe.read() == {"net_down_bytes_per_sec": None, "net_up_bytes_per_sec": None}
+
+
+def test_a_pseudo_adapter_appearing_does_not_cost_the_tick():
+    # The exclusion happens before the names are compared, so a loopback or
+    # pseudo interface coming and going -- which Windows does on its own -- must
+    # not blank a rate that was perfectly measurable throughout.
+    probe = net_probe([
+        [("Ethernet", 0, 0)],
+        [("Ethernet", 20_000, 10_000), ("Loopback Pseudo-Interface 1", 5_000_000, 5_000_000)],
+        [("Ethernet", 40_000, 20_000), ("Loopback Pseudo-Interface 1", 9_000_000, 9_000_000)],
+    ])
+    probe.read()
+    probe._now.advance(2.0)
+    assert probe.read() == {"net_down_bytes_per_sec": 10_000.0,
+                            "net_up_bytes_per_sec": 5_000.0}
+
+
+def test_a_repository_that_rejects_a_projection_is_not_reconnected_to_every_tick():
+    # A permanently invalid projection is not a stale handle. Answering both with
+    # "reconnect" made "one connection per process" untrue in exactly the degraded
+    # case: measured at 1.3 connects a tick over three reads, ~2.3 ms each.
+    connection = FakeWmiConnection(processors=[], perf=[],
+                                   absent=("MaxClockSpeed", "ProcessorFrequency",
+                                           "PercentProcessorPerformance"))
+    wmi = FakeWmi(connection)
+    probe = CpuClockProbe(wmi=wmi, nominal_max=lambda: None)
+    for _ in range(3):
+        assert probe.read() == {"cpu_nominal_mhz": None, "cpu_live_mhz": None}
+    settled = wmi.connects
+    for _ in range(20):
+        probe.read()
+    assert wmi.connects == settled, (
+        f"connect attempts went {settled} -> {wmi.connects} over 20 reads of a "
+        "projection the repository rejects outright"
+    )
+
+
+def test_a_repository_that_rejects_a_projection_still_takes_a_fresh_connection():
+    # Marking a query rejected must not stop the probe recovering from a stale
+    # handle later, which is the opposite failure: the clock would go dashed for
+    # the rest of the session after one transient outage.
+    connection = FakeWmiConnection(processors=[SimpleNamespace(MaxClockSpeed=4501)],
+                                   perf=perf_rows(99.0))
+    wmi = FakeWmi(connection)
+    probe = CpuClockProbe(wmi=wmi, nominal_max=lambda: None)
+    assert probe.read()["cpu_live_mhz"] == 4456.0
+
+    connection.fail = True          # the service restarts
+    wmi.down = True
+    assert probe.read()["cpu_live_mhz"] is None
+
+    connection.fail = False         # and returns; nothing was marked rejected
+    wmi.down = False
+    assert probe.read()["cpu_live_mhz"] == 4456.0
+    assert wmi.connects == 3
 
 
 def test_real_net_probe_reads_this_machine():

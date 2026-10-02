@@ -7,6 +7,10 @@ Layout per row: a 52 px rounded slab holding the label on the left, the value
 and its auxiliary reading on the right, and a 26 px graph strip along the
 bottom whose filled area is the row's history.
 
+The header carries the status dot -- the worst state across the rows -- and the
+network throughput in both directions, which is the panel's one non-metric
+reading and is therefore drawn in one neutral colour whatever its magnitude.
+
 The panel is 280 x 280 but the canvas it is painted on is larger: the drop
 shadow is drawn outside panel_rect(), and a canvas the same size as the panel
 clips it away. paint() shifts everything by theme.BLEED and theme's rects stay
@@ -14,8 +18,6 @@ clips it away. paint() shifts everything by theme.BLEED and theme's rects stay
 """
 
 from __future__ import annotations
-
-import time
 
 from PyQt6.QtCore import QPointF, QRectF, Qt
 from PyQt6.QtGui import QColor, QFontMetricsF, QPainter, QPainterPath, QPen
@@ -29,19 +31,25 @@ TEXT_CLEARANCE = 2.0
 GRAPH_LINE_WIDTH = 1.4
 GRAPH_FILL_ALPHA = 0.22
 
+NET_LABEL_GAP = "  "
+DOWN_LABEL = "DN"
+UP_LABEL = "UP"
+
+# Decimal, unlike the binary GB the memory rows use. The unit has to change
+# where the figure resets to 1.0 -- 999.9 KB/s, then 1.0 MB/s -- which is what
+# every network tool on the machine does and what keeps "1024.0 KB/s" from ever
+# being printed. Memory stays binary because that is what the OS reports.
+_KB = 1000
+_MB = 1000 ** 2
+
 
 def paint(
     painter: QPainter,
     snapshot,
     histories: dict[str, History],
     alpha: float,
-    now: float | None = None,
 ) -> None:
     """Draw the whole panel. `histories` may be missing keys; rows degrade.
-
-    `now` pins the clock used for the header's "Xs ago" age. It defaults to
-    wall clock time in the app, but tests pass a fixed value: otherwise the
-    age text changes every run and the golden images could never match.
 
     The paint target must be at least theme.CANVAS_W x theme.CANVAS_H; the
     translate below leaves room for the drop shadow outside the panel, and the
@@ -53,7 +61,7 @@ def paint(
     painter.translate(theme.BLEED, theme.BLEED)
 
     _draw_panel(painter, theme.panel_rect(), alpha)
-    _draw_header(painter, theme.header_rect(), snapshot, now)
+    _draw_header(painter, theme.header_rect(), snapshot)
 
     for spec, rect in theme.metric_rects():
         _draw_row(painter, spec, rect, snapshot, histories.get(spec.key))
@@ -86,7 +94,7 @@ def _draw_panel(painter: QPainter, rect: QRectF, alpha: float) -> None:
     painter.setPen(Qt.PenStyle.NoPen)
 
 
-def _draw_header(painter: QPainter, rect: QRectF, snapshot, now: float | None = None) -> None:
+def _draw_header(painter: QPainter, rect: QRectF, snapshot) -> None:
     if theme.has_any_data(snapshot):
         state = theme.worst_state(theme.metric_state(spec, snapshot) for spec in theme.METRICS)
         dot_color = theme.state_color(state)
@@ -94,30 +102,49 @@ def _draw_header(painter: QPainter, rect: QRectF, snapshot, now: float | None = 
         dot_color = theme.NEUTRAL
 
     centre_y = rect.center().y()
-    # The title's left edge lines up with the row labels underneath it, and the
-    # dot hangs off that edge by a fixed gap. Placing the dot first and the
-    # title after it is what left the two left edges 6 px apart, with SYSTEM
-    # starting further right than the CPU/RAM/GPU/VRAM labels below it.
-    title_x = rect.left() + theme.ROW_TEXT_INSET
-    dot_x = title_x - theme.DOT_GAP - 2.0 * theme.DOT_R
+    # Both edges come from theme, so the dot and the text cannot end up placed
+    # against different lines. The dot hangs off the text's left edge by a fixed
+    # gap, which is what kept the header and the row labels on one alignment.
+    text_x = theme.header_text_x()
     painter.setBrush(dot_color)
     painter.setPen(Qt.PenStyle.NoPen)
-    painter.drawEllipse(QPointF(dot_x, centre_y), theme.DOT_R, theme.DOT_R)
+    painter.drawEllipse(QPointF(theme.header_dot_x(), centre_y), theme.DOT_R, theme.DOT_R)
 
-    title_rect = QRectF(title_x, rect.top(), rect.width(), rect.height())
-    _draw_text(painter, theme.HEADER_TITLE, title_rect, theme.label_font(), theme.HEADER_LABEL)
-
-    age = _format_age(snapshot, now)
-    if age:
-        _draw_text(painter, age, rect, theme.label_font(), theme.NEUTRAL, right=True)
+    text = _format_net(snapshot)
+    if text:
+        _draw_text(painter, text, QRectF(text_x, rect.top(), rect.right() - text_x, rect.height()),
+                   theme.aux_font(), theme.NEUTRAL)
 
 
-def _format_age(snapshot, now: float | None = None) -> str:
-    if not snapshot.ts:
-        return ""
-    moment = time.time() if now is None else now
-    seconds = max(0, int(moment - snapshot.ts))
-    return "now" if seconds < 1 else f"{seconds}s ago"
+def _format_net(snapshot) -> str:
+    """Download and upload throughput, in that order, as one string.
+
+    Download first, which is the order metrics.NET_KEYS declares and therefore
+    the order the CSV records the two in: the panel and the trace agree on which
+    figure is which without a legend. One drawText call rather than two -- the two
+    directions belong together as a single reading, and one call means one string
+    that either fits the header or does not.
+    """
+    return f"{DOWN_LABEL} {_format_rate(snapshot.net_down_bytes_per_sec)}" \
+           f"{NET_LABEL_GAP}{UP_LABEL} {_format_rate(snapshot.net_up_bytes_per_sec)}"
+
+
+def _format_rate(value: float | None) -> str:
+    """Bytes per second in the unit its magnitude calls for.
+
+    Whole bytes below a kilobyte, one decimal above it. A two-second delta that
+    small moves in ones, so a decimal place claims a resolution the counter does
+    not have; above a kilobyte the figure moves by whole units often enough that
+    one decimal is the finest change which still reads as a change rather than
+    as the smoothing factor's own noise.
+    """
+    if value is None:
+        return "--"
+    if abs(value) >= _MB:
+        return f"{value / _MB:.1f} MB/s"
+    if abs(value) >= _KB:
+        return f"{value / _KB:.1f} KB/s"
+    return f"{value:.0f} B/s"
 
 
 def _draw_row(painter: QPainter, spec, rect: QRectF, snapshot, history) -> None:
@@ -261,9 +288,22 @@ def _format_aux(spec, snapshot) -> str:
 
 
 def _format_frequency(snapshot) -> str:
-    current, maximum = snapshot.cpu_mhz, snapshot.cpu_max_mhz
-    if current is None:
+    """The derived clock beside the nominal one it was derived from.
+
+    Two decimals, because the derived figure moves in the hundredths of a GHz:
+    99.0% of nominal idle and 99.5% loaded on this machine, so 4460 and 4501
+    both read "4.5" at one place and the row looks frozen even though the
+    reading is alive.
+
+    With no derived clock the answer is a dash. The nominal is a ceiling, not a
+    measurement of what the core is running at, and printing it in the live
+    position is the frozen-constant bug this replaces -- so it is only shown
+    beside a clock that was actually derived.
+    """
+    live = snapshot.cpu_live_mhz
+    if live is None:
         return "--"
-    if maximum:
-        return f"{current / 1000:.1f} / {maximum / 1000:.1f} GHz"
-    return f"{current / 1000:.1f} GHz"
+    nominal = snapshot.cpu_nominal_mhz
+    if nominal:
+        return f"{live / 1000:.2f} / {nominal / 1000:.2f} GHz"
+    return f"{live / 1000:.2f} GHz"

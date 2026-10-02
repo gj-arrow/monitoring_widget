@@ -90,13 +90,11 @@ SUBTLE = QColor("#9aa3b0")
 VALUE = QColor("#f2f3f5")
 
 ROW_BG = QColor(255, 255, 255, 9)
-HEADER_LABEL = QColor("#7e8592")
 
 LABEL_PT = 7.5
 VALUE_PT = 12.0
 AUX_PT = 8.5
 FAMILY = "Segoe UI Variable Display"
-HEADER_TITLE = "SYSTEM"
 
 HISTORY_LEN = 60
 TICK_MS = 2000
@@ -186,6 +184,24 @@ def panel_rect() -> QRectF:
 
 def header_rect() -> QRectF:
     return QRectF(float(PAD_X), float(PAD_TOP), float(WIDTH - 2 * PAD_X), float(HEADER_H))
+
+
+def header_text_x() -> float:
+    """Left edge of the header's text, aligned with the row labels beneath it.
+
+    Stated here rather than beside the renderer so the dot and the text cannot
+    be placed against two different edges of the panel.
+    """
+    return float(PAD_X + ROW_TEXT_INSET)
+
+
+def header_dot_x() -> float:
+    """Centre of the status dot, hanging off the header text's left edge.
+
+    The dot is the panel's alarm -- the worst state across the rows -- so it
+    sits left of the header's one reading and is never coloured by that reading.
+    """
+    return header_text_x() - DOT_GAP - 2.0 * DOT_R
 
 
 def metric_rects() -> tuple[tuple[MetricSpec, QRectF], ...]:

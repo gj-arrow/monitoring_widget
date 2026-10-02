@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from PyQt6.QtCore import QPointF, QRectF, Qt
 from PyQt6.QtGui import QColor, QFont, QImage, QPainter, QPen, QTransform
 
@@ -46,14 +47,11 @@ def render(snapshot, values_by_key=None, alpha=theme.DEFAULT_ALPHA, histories=No
     # Not named `painter`: that would shadow the module the monkeypatch tests use.
     canvas_painter = QPainter(image)
     try:
-        # now is pinned: the header shows the sample age, and a wall clock would
-        # change the pixels on every run.
         paint(
             canvas_painter,
             snapshot,
             build_histories(values_by_key or {}) if histories is None else histories,
             alpha,
-            now=snapshot.ts + 2.0,
         )
     finally:
         canvas_painter.end()
@@ -137,18 +135,23 @@ def assert_golden(name, snapshot, values_by_key=None):
 
 
 CALM = Snapshot(
-    cpu_pct=34.0, cpu_mhz=4500.0, cpu_max_mhz=4500.0,
+    cpu_pct=34.0, cpu_live_mhz=4460.0, cpu_nominal_mhz=4501.0,
     ram_used_gb=11.4, ram_total_gb=32.0,
     gpu_pct=61.0, gpu_temp_c=58.0,
     vram_used_gb=6.2, vram_total_gb=20.0,
+    net_down_bytes_per_sec=7300.0, net_up_bytes_per_sec=3700.0,
     ts=1000.0,
 )
 
+# The widest pair the panel can be asked to draw: 999.9 MB/s in both
+# directions. It is in the hot panel on purpose, so the golden is also the
+# proof that the widest string fits.
 HOT = Snapshot(
-    cpu_pct=97.0, cpu_mhz=4200.0, cpu_max_mhz=4500.0,
+    cpu_pct=97.0, cpu_live_mhz=4350.0, cpu_nominal_mhz=4501.0,
     ram_used_gb=29.4, ram_total_gb=32.0,
     gpu_pct=97.0, gpu_temp_c=84.0,
     vram_used_gb=18.1, vram_total_gb=20.0,
+    net_down_bytes_per_sec=999_900_000.0, net_up_bytes_per_sec=999_900_000.0,
     ts=1000.0,
 )
 
@@ -160,6 +163,29 @@ RAMPS = {
     "gpu_pct": [0.55 + 0.10 * ((i * 3) % 7) / 7 for i in range(40)],
     "vram": [0.30, 0.31, 0.31, 0.30, 0.32],
 }
+
+
+def without_network(snapshot):
+    return Snapshot(
+        **{name: getattr(snapshot, name)
+           for name in ("cpu_pct", "cpu_live_mhz", "cpu_nominal_mhz",
+                        "ram_used_gb", "ram_total_gb", "gpu_pct", "gpu_temp_c",
+                        "vram_used_gb", "vram_total_gb", "ts")}
+    )
+
+
+def drawn_texts(monkeypatch, snapshot, values_by_key=None):
+    """Every (text, colour) paint() hands to _draw_text, with the real draw."""
+    seen = []
+    real = painter._draw_text
+
+    def spy(canvas_painter, text, rect, font, color, **kwargs):
+        seen.append((text, color.rgba()))
+        return real(canvas_painter, text, rect, font, color, **kwargs)
+
+    monkeypatch.setattr(painter, "_draw_text", spy)
+    render(snapshot, values_by_key)
+    return seen
 
 
 def test_shadow_bleeds_into_the_margin_outside_the_panel():
@@ -261,8 +287,7 @@ def test_paint_restores_the_painter_it_was_given():
         caller_painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
         before = painter_state(caller_painter)
 
-        paint(caller_painter, CALM, build_histories(RAMPS), theme.DEFAULT_ALPHA,
-              now=CALM.ts + 2.0)
+        paint(caller_painter, CALM, build_histories(RAMPS), theme.DEFAULT_ALPHA)
 
         after = painter_state(caller_painter)
     finally:
@@ -286,10 +311,10 @@ def test_a_lost_restore_would_accumulate_the_bleed_translate(monkeypatch):
     caller_painter = QPainter(image)
     try:
         origin = QTransform()
-        paint(caller_painter, CALM, {}, 1.0, now=CALM.ts + 2.0)
+        paint(caller_painter, CALM, {}, 1.0)
         first = caller_painter.transform()
         assert first == origin, "the first tick already drifted; restore() is broken now"
-        paint(caller_painter, CALM, {}, 1.0, now=CALM.ts + 2.0)
+        paint(caller_painter, CALM, {}, 1.0)
         second = caller_painter.transform()
     finally:
         caller_painter.end()
@@ -422,15 +447,17 @@ def test_a_snapshot_without_a_gpu_temperature_renders_a_dash():
     the auxiliary returned an empty string.
     """
     no_temp = SimpleNamespace(
-        cpu_pct=34.0, cpu_mhz=4500.0, cpu_max_mhz=4500.0,
+        cpu_pct=34.0, cpu_live_mhz=4460.0, cpu_nominal_mhz=4501.0,
         ram_used_gb=11.4, ram_total_gb=32.0, gpu_pct=61.0,
-        vram_used_gb=6.2, vram_total_gb=20.0, ts=1000.0,
+        vram_used_gb=6.2, vram_total_gb=20.0,
+        net_down_bytes_per_sec=7300.0, net_up_bytes_per_sec=3700.0, ts=1000.0,
     )
     image = render(no_temp, RAMPS)
     explicit_none = Snapshot(
-        cpu_pct=34.0, cpu_mhz=4500.0, cpu_max_mhz=4500.0,
+        cpu_pct=34.0, cpu_live_mhz=4460.0, cpu_nominal_mhz=4501.0,
         ram_used_gb=11.4, ram_total_gb=32.0, gpu_pct=61.0, gpu_temp_c=None,
-        vram_used_gb=6.2, vram_total_gb=20.0, ts=1000.0,
+        vram_used_gb=6.2, vram_total_gb=20.0,
+        net_down_bytes_per_sec=7300.0, net_up_bytes_per_sec=3700.0, ts=1000.0,
     )
     assert max_channel_delta(image, render(explicit_none, RAMPS)) == 0, (
         "a missing gpu_temp_c rendered differently from an explicit None"
@@ -439,6 +466,273 @@ def test_a_snapshot_without_a_gpu_temperature_renders_a_dash():
         "a missing gpu_temp_c renders the same as a real temperature: the GPU "
         "auxiliary is not showing a dash"
     )
+
+
+# --- the derived CPU clock -------------------------------------------------
+
+
+def frequency(live, nominal):
+    return SimpleNamespace(cpu_live_mhz=live, cpu_nominal_mhz=nominal)
+
+
+@pytest.mark.parametrize(
+    ("live", "nominal", "expected"),
+    [
+        # Two decimals, not one: the derived figure only moves in the
+        # hundredths of a GHz (99.0% idle, 99.5% loaded on this machine), so
+        # 4460 and 4501 both render as "4.5" at one place and the reading
+        # looks frozen even though it is alive.
+        (4460.0, 4501.0, "4.46 / 4.50 GHz"),
+        (4464.0, 4501.0, "4.46 / 4.50 GHz"),
+        (4350.0, 4501.0, "4.35 / 4.50 GHz"),
+        # A nominal on its own is a reference, not a clock, so it cannot stand
+        # in for the derived one.
+        (None, 4501.0, "--"),
+        (None, None, "--"),
+        # With no reference to compare against there is still a live clock.
+        (4460.0, None, "4.46 GHz"),
+    ],
+)
+def test_the_frequency_formatter_shows_the_derived_clock_to_two_places(live, nominal, expected):
+    assert painter._format_frequency(frequency(live, nominal)) == expected
+
+
+def test_an_unmeasured_live_clock_renders_a_dash_and_never_the_nominal():
+    """The bug this task exists for, asserted on the pixels.
+
+    psutil's `current` on Windows is the nominal clock: 4501.0 on three
+    consecutive calls, at idle, under a 12-thread load and after it. A row that
+    printed the nominal in the live position therefore showed a number that
+    looked measured and was in fact a constant. Two things are checked, and both
+    matter: a snapshot carrying only a nominal must render exactly like one
+    carrying no clock at all (so the nominal is not being borrowed), and it must
+    render *differently* from a snapshot with a derived clock, which is what
+    pins the dash itself rather than an empty string.
+    """
+    nominal_only = Snapshot(**{
+        **{name: getattr(CALM, name) for name in ("cpu_pct", "ram_used_gb", "ram_total_gb",
+                                                  "gpu_pct", "gpu_temp_c", "vram_used_gb",
+                                                  "vram_total_gb", "ts")},
+        "cpu_live_mhz": None, "cpu_nominal_mhz": 4501.0,
+    })
+    no_clock_at_all = Snapshot(**{
+        **{name: getattr(CALM, name) for name in ("cpu_pct", "ram_used_gb", "ram_total_gb",
+                                                  "gpu_pct", "gpu_temp_c", "vram_used_gb",
+                                                  "vram_total_gb", "ts")},
+    })
+    assert max_channel_delta(render(nominal_only, RAMPS),
+                             render(no_clock_at_all, RAMPS)) == 0, (
+        "a snapshot with a nominal clock but no derived one rendered "
+        "differently from one with no clock at all: the nominal is being "
+        "printed as though it were live"
+    )
+    assert max_channel_delta(render(nominal_only, RAMPS), render(CALM, RAMPS)) > 60, (
+        "an unmeasured live clock renders the same as a measured one: the CPU "
+        "auxiliary is not showing a dash"
+    )
+
+
+def test_the_cpu_row_shows_the_derived_clock_beside_the_percentage(monkeypatch):
+    """Both halves have to be on screen, or the derivation is invisible."""
+    texts = [text for text, _ in drawn_texts(monkeypatch, CALM, RAMPS)]
+    assert "34%" in texts
+    assert "4.46 / 4.50 GHz" in texts
+
+
+# --- the header ------------------------------------------------------------
+
+
+def test_the_header_no_longer_shows_the_system_label_or_the_sample_age(monkeypatch):
+    """Both were asked for as the space the throughput now occupies."""
+    texts = [text for text, _ in drawn_texts(monkeypatch, CALM, RAMPS)]
+    assert "SYSTEM" not in texts, "the header still draws the SYSTEM label"
+    stale = [t for t in texts if t.endswith("ago")]
+    assert not stale, f"the header still draws the sample age: {stale}"
+    # The two direction labels live in one drawText call, so neither is a whole
+    # string of its own: this says the check above is looking at real output.
+    assert "DN 7.3 KB/s  UP 3.7 KB/s" in texts
+
+
+def test_the_header_shows_both_directions_of_throughput(monkeypatch):
+    texts = [text for text, _ in drawn_texts(monkeypatch, CALM, RAMPS)]
+    (header,) = [t for t in texts if "DN" in t or "UP" in t]
+    assert "DN 7.3 KB/s" in header
+    assert "UP 3.7 KB/s" in header
+    # Download before upload, so the header and the CSV agree on which is
+    # which without a legend: the same order NET_KEYS declares.
+    assert header.index("DN 7.3") < header.index("UP 3.7")
+    # And it reaches the pixels rather than merely being formatted.
+    assert max_channel_delta(render(CALM, RAMPS),
+                             render(without_network(CALM), RAMPS)) > 60
+
+
+def test_an_unmeasured_rate_renders_a_dash_in_both_directions(monkeypatch):
+    texts = [text for text, _ in drawn_texts(monkeypatch, EMPTY, {})]
+    (header,) = [t for t in texts if "DN" in t or "UP" in t]
+    # Not "0 B/s": the first tick has no predecessor, which is not the same
+    # claim as a link that moved nothing.
+    assert header.count("--") == 2, header
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, "--"),
+        (0.0, "0 B/s"),
+        (7.4, "7 B/s"),
+        (512.6, "513 B/s"),
+        (999.4, "999 B/s"),
+        # The unit switches on the unrounded magnitude, so the half-unit below a
+        # boundary rounds up into the next unit's own number. 999.6 bytes are
+        # 1000 bytes, not a kilobyte: re-scaling it would be filing the value
+        # under a unit ten times too coarse for the width it was just given.
+        (999.6, "1000 B/s"),
+        (7300.0, "7.3 KB/s"),
+        (999_949.0, "999.9 KB/s"),
+        (999_999.0, "1000.0 KB/s"),
+        (1_000_000.0, "1.0 MB/s"),
+        (1048576.0, "1.0 MB/s"),
+        (1_250_000_000.0, "1250.0 MB/s"),
+        (999_900_000.0, "999.9 MB/s"),
+    ],
+)
+def test_the_rate_formatter_picks_the_unit_from_the_magnitude(value, expected):
+    # Decimal units, unlike the binary GB the memory rows use. Either way the
+    # unit switches where the figure resets to 1.0 -- 999.9 KB/s then 1.0 MB/s
+    # -- which is what every network tool on the machine does, and it keeps
+    # "1024.0 KB/s" from ever being printed. Whole bytes below a kilobyte: a
+    # two-second delta that small moves in ones, so a decimal place claims a
+    # resolution the counter does not have.
+    assert painter._format_rate(value) == expected
+
+
+@pytest.mark.parametrize(
+    "rate", [999_900_000.0, 1_250_000_000.0],
+    ids=["999.9 MB/s", "1250.0 MB/s"],
+)
+def test_the_longest_header_string_stays_clear_of_the_dot_and_inside_the_header(monkeypatch, rate):
+    """Measured, not asserted from a metrics calculation.
+
+    No glyph coordinates are hardcoded and no font is assumed. The control is a
+    render with *no* header text at all -- not one with different text, whose
+    leading "DN " would have rasterised identically and hidden every pixel of
+    the string's left edge. So the differing pixels are the whole throughput
+    string and are measured wherever it rasterised. Qt clips nothing here, so a
+    string that overran the panel would show up outside it.
+
+    Both figures are wider than the usual reading: 999.9 MB/s is the example in
+    the brief, and 1250.0 MB/s is what a saturated 10 GbE link reports, which is
+    the widest pair a machine of this class can actually produce.
+    """
+    widest = Snapshot(**{
+        **{name: getattr(CALM, name) for name in ("cpu_pct", "cpu_live_mhz",
+             "cpu_nominal_mhz", "ram_used_gb", "ram_total_gb", "gpu_pct",
+             "gpu_temp_c", "vram_used_gb", "vram_total_gb", "ts")},
+        "net_down_bytes_per_sec": rate,
+        "net_up_bytes_per_sec": rate,
+    })
+    with_text = render(widest, RAMPS)
+    monkeypatch.setattr(painter, "_format_net", lambda snapshot: "")
+    without_text = render(CALM, RAMPS)
+    monkeypatch.undo()
+
+    pixels = differing_pixels(with_text, without_text)
+    assert pixels, "the throughput reached no pixels, so this test proves nothing"
+
+    header = theme.header_rect()
+    dot_right = theme.header_dot_x() + theme.DOT_R
+    xs = []
+    for canvas_x, canvas_y in sorted(pixels):
+        x, y = canvas_x - theme.BLEED, canvas_y - theme.BLEED
+        xs.append(x)
+        assert header.top() <= y <= header.bottom(), (
+            f"the throughput was drawn at y={y}, outside the header band "
+            f"{header.top()}..{header.bottom()}"
+        )
+        assert x > dot_right, (
+            f"the throughput starts at x={x}, on top of the status dot which "
+            f"ends at {dot_right}"
+        )
+        assert x <= header.right(), (
+            f"the throughput reaches x={x}, past the header's right edge at "
+            f"{header.right()} and the panel's padding"
+        )
+    # Both bounds: it starts on the edge every other string in the panel starts
+    # on, so the dot keeps its companion and the header and the row labels stay
+    # on one alignment -- and it does not start so far right that the alignment
+    # is lost altogether. A glyph's leading is 1-2 px past the pen position.
+    start = min(xs)
+    assert theme.header_text_x() - 2 <= start <= theme.header_text_x() + 2, (
+        f"the throughput starts at x={start}, not on the aligned text edge at "
+        f"{theme.header_text_x()}: the header and the row labels no longer line up"
+    )
+
+
+def test_throughput_is_never_coloured_by_magnitude(monkeypatch):
+    """Network speed is not a health metric, so it gets no alarm colour.
+
+    The alarm channel is spent on rows that are actually wrong. Painting a
+    999.9 MB/s download in the critical red would say the machine is in
+    trouble when it is doing exactly what it was asked to do.
+    """
+    def net_colour(snapshot):
+        for text, rgba in drawn_texts(monkeypatch, snapshot, RAMPS):
+            if "DN" in text:
+                return rgba
+        raise AssertionError("the throughput was never drawn")
+
+    quiet = net_colour(CALM)                                   # 7.3 KB/s
+    loud = net_colour(HOT)                                     # 999.9 MB/s, and hot rows
+    alarms = {theme.state_color(state).rgba()
+              for state in (theme.WARN, theme.CRITICAL, theme.NORMAL)}
+    assert quiet not in alarms, (
+        "the throughput is painted in a state colour, which spends the alarm "
+        "channel on a metric that is not wrong"
+    )
+    assert quiet == loud, (
+        "the throughput changed colour with its magnitude: a quiet link and a "
+        "saturated one are not a health difference"
+    )
+
+
+def test_the_status_dot_survives_the_header_change_and_still_reports_the_worst_state():
+    """The header lost its label and its age; the dot is the alarm and stays.
+
+    Rendered at alpha 1.0 so the panel fill behind the dot is opaque, which is
+    what lets the pixel read back as the pure state colour instead of a blend
+    with a translucent fill.
+    """
+    x = int(theme.BLEED + theme.header_dot_x())
+    y = int(theme.BLEED + theme.header_rect().center().y())
+    calm = render(CALM, RAMPS, alpha=1.0).pixelColor(x, y)
+    hot = render(HOT, RAMPS, alpha=1.0).pixelColor(x, y)
+    empty = render(EMPTY, {}, alpha=1.0).pixelColor(x, y)
+
+    assert calm.name() == theme.CALM.name(), (
+        f"the dot is {calm.name()} on a calm panel, not {theme.CALM.name()}"
+    )
+    assert hot.name() == theme.CRITICAL_COLOR.name(), (
+        f"the dot is {hot.name()} on a hot panel, not "
+        f"{theme.CRITICAL_COLOR.name()}: the dot no longer reports the worst state"
+    )
+    # Nothing measured at all is the neutral dot, not a calm blue one: a panel
+    # with no readings has nothing to be calm about.
+    assert empty.name() == theme.NEUTRAL.name()
+
+
+def test_throughput_alone_does_not_light_the_status_dot(monkeypatch):
+    net_only = Snapshot(net_down_bytes_per_sec=999_900_000.0,
+                        net_up_bytes_per_sec=999_900_000.0, ts=1000.0)
+    texts = [text for text, _ in drawn_texts(monkeypatch, net_only, {})]
+    (header,) = [t for t in texts if "DN" in t or "UP" in t]
+    assert "999.9 MB/s" in header
+    # has_any_data() chooses between the neutral dot and a state colour, so
+    # counting the throughput here would paint a calm blue dot on a panel whose
+    # every row reads "--": a healthy-looking alarm light over nothing.
+    assert theme.has_any_data(net_only) is False
+    x = int(theme.BLEED + theme.header_dot_x())
+    y = int(theme.BLEED + theme.header_rect().center().y())
+    assert render(net_only, {}, alpha=1.0).pixelColor(x, y).name() == theme.NEUTRAL.name()
 
 
 def test_single_sample_does_not_break_rendering():

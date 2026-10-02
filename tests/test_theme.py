@@ -141,17 +141,29 @@ def test_row_text_inset_is_a_theme_constant_and_sits_inside_the_padding():
     assert theme.ROW_TEXT_INSET + theme.ROW_TEXT_INSET < theme.WIDTH - 2 * theme.PAD_X
 
 
-def test_the_header_dot_fits_to_the_left_of_the_aligned_title():
-    """The title lines up with the row labels, so the dot has to squeeze in.
+def test_the_header_dot_fits_to_the_left_of_the_aligned_text():
+    """The header text lines up with the row labels, so the dot has to squeeze in.
 
-    Placing the dot first and the title after it left the two left edges 6 px
-    apart, with SYSTEM starting further right than the CPU/RAM/GPU/VRAM labels
-    beneath it. The dot now hangs off the title's left edge by a fixed gap.
+    Placing the dot first and the text after it left the two left edges 6 px
+    apart, with the header starting further right than the CPU/RAM/GPU/VRAM
+    labels beneath it. The dot now hangs off the text's left edge by a fixed gap,
+    and both edges are stated once in theme so the renderer and its tests cannot
+    disagree about where they are.
     """
-    title_x = theme.PAD_X + theme.ROW_TEXT_INSET
-    dot_left = title_x - theme.DOT_GAP - 2 * theme.DOT_R
-    assert dot_left >= theme.PAD_X - theme.DOT_R, "the dot hangs outside the panel padding"
+    assert theme.header_text_x() == theme.PAD_X + theme.ROW_TEXT_INSET
+    # The gap is a gap plus the dot's own diameter, so it is the *edges* that
+    # are separated by DOT_GAP, not the centre and the edge.
+    assert theme.header_text_x() - theme.header_dot_x() == theme.DOT_GAP + 2 * theme.DOT_R
+    assert theme.header_dot_x() - theme.DOT_R > theme.panel_rect().left(), (
+        "the dot hangs off the panel itself"
+    )
     assert theme.DOT_GAP > 0
+
+
+def test_the_header_text_edge_is_the_same_edge_the_row_labels_start_at():
+    """One alignment rule for every string in the panel, not two."""
+    first_label_left = theme.metric_rects()[0][1].left() + theme.ROW_TEXT_INSET
+    assert theme.header_text_x() == first_label_left
 
 
 def test_row_value_reads_a_pct_row():
@@ -201,3 +213,23 @@ def test_has_any_data_is_false_for_an_entirely_empty_snapshot():
 
 def test_has_any_data_is_true_for_a_temperature_alone():
     assert theme.has_any_data(snapshot(gpu_temp_c=45.0)) is True
+
+
+def test_throughput_alone_is_not_data_for_the_status_dot():
+    # The dot is the alarm, and it is lit from has_any_data(). A link moving
+    # 1 GB/s is not the machine in trouble, so counting throughput would paint a
+    # calm blue dot on a panel whose every row reads "--" -- an alarm light
+    # with nothing behind it.
+    assert theme.has_any_data(snapshot(
+        net_down_bytes_per_sec=999_900_000.0, net_up_bytes_per_sec=999_900_000.0,
+    )) is False
+
+
+def test_throughput_never_reaches_a_row_state_or_the_worst_state():
+    # Same reason, one level down: the rows colour themselves from their own
+    # metrics, and there is no path by which a network rate could escalate one.
+    specs = [spec for spec, _ in theme.metric_rects()]
+    states = [theme.metric_state(spec, snapshot(
+        cpu_pct=1.0, net_down_bytes_per_sec=1e12, net_up_bytes_per_sec=1e12,
+    )) for spec in specs]
+    assert set(states) == {theme.NORMAL}

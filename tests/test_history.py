@@ -6,6 +6,19 @@ import pytest
 from PyQt6.QtCore import QPointF
 
 from history import History, resample
+from metrics import Snapshot
+
+
+def _row(*values):
+    """A CSV row with its empty tail built from the column count.
+
+    Written out -- _row(3, 9) -- these rows have to be edited by hand every
+    time a metric joins the dataclass, which is how a row assertion quietly
+    stops being about anything.
+    """
+    columns = len(Snapshot.CSV_COLUMNS)
+    assert len(values) <= columns, "more values than there are columns"
+    return ",".join([str(value) for value in values] + [""] * (columns - len(values)))
 
 
 def test_history_respects_maxlen():
@@ -178,7 +191,6 @@ def test_history_log_rotates_a_stale_header_instead_of_mixing_columns(tmp_path, 
     import logging
 
     from history import HistoryLog
-    from metrics import Snapshot
 
     path = tmp_path / "history.log"
     _write_trace(path, "t,cpu,gpu,temp", ["0,1,2,3", "1,4,5,6"])
@@ -192,7 +204,7 @@ def test_history_log_rotates_a_stale_header_instead_of_mixing_columns(tmp_path, 
     assert kept.read_text(encoding="utf-8") == "t,cpu,gpu,temp\n0,1,2,3\n1,4,5,6\n"
     header, row = path.read_text(encoding="utf-8").strip().splitlines()
     assert header == ",".join(Snapshot(cpu_pct=7.0, ts=2.0).as_dict().keys())
-    assert row == "2,7,,,,,,,,"
+    assert row == _row(2, 7)
     assert any("history.log.1" in record.message for record in caplog.records)
 
 
@@ -200,18 +212,17 @@ def test_history_log_keeps_a_matching_header_and_only_appends_a_row(tmp_path):
     # The rotation must not fire on a trace this build could have written
     # itself, or a normal restart would strand a fresh file every time.
     from history import HistoryLog
-    from metrics import Snapshot
 
     path = tmp_path / "history.log"
     header = ",".join(Snapshot().as_dict().keys())
-    _write_trace(path, header, ["1,2,,,,,,,,"])
+    _write_trace(path, header, [_row(1, 2)])
 
     log = HistoryLog(path)
     log.enable()
     log.write(Snapshot(cpu_pct=9.0, ts=3.0))
 
     lines = path.read_text(encoding="utf-8").strip().splitlines()
-    assert lines == [header, "1,2,,,,,,,,", "3,9,,,,,,,,"]
+    assert lines == [header, _row(1, 2), _row(3, 9)]
     assert not (tmp_path / "history.log.1").exists()
 
 
@@ -219,7 +230,6 @@ def test_history_log_rotation_takes_the_next_free_suffix(tmp_path):
     # Rotating must never overwrite a trace that is already there: the whole
     # point of keeping the stale file is that it is somebody's data.
     from history import HistoryLog
-    from metrics import Snapshot
 
     path = tmp_path / "history.log"
     _write_trace(path, "a,b", ["1,2"])
@@ -239,7 +249,6 @@ def test_history_log_refuses_to_write_when_a_stale_trace_cannot_be_rotated(tmp_p
     # rows into a file whose existing rows answer to different columns, and
     # nothing downstream can tell which is which afterwards.
     from history import HistoryLog
-    from metrics import Snapshot
 
     stale = "t,cpu,gpu,temp\n0,1,2,3\n"
     path = tmp_path / "history.log"
@@ -266,7 +275,6 @@ def test_history_log_treats_a_deleted_file_as_a_new_trace(tmp_path, caplog):
     # file to rotate, so the log must not claim otherwise: the append recreates
     # it with a correct header and nothing is reported as unreadable.
     from history import HistoryLog
-    from metrics import Snapshot
 
     path = tmp_path / "history.log"
     log = HistoryLog(path)
@@ -278,7 +286,7 @@ def test_history_log_treats_a_deleted_file_as_a_new_trace(tmp_path, caplog):
 
     header, row = path.read_text(encoding="utf-8").strip().splitlines()
     assert header == ",".join(Snapshot(cpu_pct=7.0, ts=2.0).as_dict().keys())
-    assert row == "2,7,,,,,,,,"
+    assert row == _row(2, 7)
     assert not [r for r in caplog.records if "rotat" in r.getMessage()]
     assert not [r for r in caplog.records if "unreadable" in r.getMessage()]
 
@@ -290,7 +298,6 @@ def test_history_log_rechecks_the_header_after_being_switched_off(tmp_path, monk
     # the first attempt at a rotation is made to fail here, so the retry has to
     # notice the foreign header again and rotate for real.
     from history import HistoryLog
-    from metrics import Snapshot
 
     stale = "t,cpu,gpu,temp\n0,1,2,3\n"
     path = tmp_path / "history.log"
@@ -322,7 +329,7 @@ def test_history_log_rechecks_the_header_after_being_switched_off(tmp_path, monk
     assert (tmp_path / "history.log.1").read_text(encoding="utf-8") == stale
     header, row = path.read_text(encoding="utf-8").strip().splitlines()
     assert header == ",".join(Snapshot(cpu_pct=8.0, ts=3.0).as_dict().keys())
-    assert row == "3,8,,,,,,,,"
+    assert row == _row(3, 8)
 
 
 def test_history_log_rechecks_the_header_after_an_explicit_disable(tmp_path):
@@ -330,7 +337,6 @@ def test_history_log_rechecks_the_header_after_an_explicit_disable(tmp_path):
     # runs again and finds this build's own header, so nothing is rotated and
     # the trace simply continues.
     from history import HistoryLog
-    from metrics import Snapshot
 
     path = tmp_path / "history.log"
     _write_trace(path, "t,cpu,gpu,temp", ["0,1,2,3"])
@@ -343,7 +349,7 @@ def test_history_log_rechecks_the_header_after_an_explicit_disable(tmp_path):
     log.write(Snapshot(cpu_pct=8.0, ts=3.0))
 
     lines = path.read_text(encoding="utf-8").strip().splitlines()
-    assert lines[1:] == ["2,7,,,,,,,,", "3,8,,,,,,,,"]
+    assert lines[1:] == [_row(2, 7), _row(3, 8)]
     assert not (tmp_path / "history.log.2").exists()
 
 
@@ -354,7 +360,6 @@ def test_history_log_rechecks_when_adopting_the_header_did_not_finish(tmp_path, 
     # on disk. An unexpected error still escapes write() -- that is out of
     # scope here -- but it must not be cached as a completed check.
     from history import HistoryLog
-    from metrics import Snapshot
 
     stale = "t,cpu,gpu,temp\n0,1,2,3\n"
     path = tmp_path / "history.log"
@@ -381,7 +386,7 @@ def test_history_log_rechecks_when_adopting_the_header_did_not_finish(tmp_path, 
     assert (tmp_path / "history.log.1").read_text(encoding="utf-8") == stale
     header, row = path.read_text(encoding="utf-8").strip().splitlines()
     assert header == ",".join(Snapshot(cpu_pct=8.0, ts=3.0).as_dict().keys())
-    assert row == "3,8,,,,,,,,"
+    assert row == _row(3, 8)
 
 
 def test_history_log_rotates_a_trace_it_cannot_decode(tmp_path):
@@ -391,7 +396,6 @@ def test_history_log_rotates_a_trace_it_cannot_decode(tmp_path):
     # the sampling tick. Garbled bytes must degrade into the rotate branch:
     # the trace is kept, never appended to.
     from history import HistoryLog
-    from metrics import Snapshot
 
     path = tmp_path / "history.log"
     saved = "ts,cpu_pct\r\n1,2\r\n".encode("utf-16")
@@ -404,7 +408,7 @@ def test_history_log_rotates_a_trace_it_cannot_decode(tmp_path):
     assert (tmp_path / "history.log.1").read_bytes() == saved
     header, row = path.read_text(encoding="utf-8").strip().splitlines()
     assert header == ",".join(Snapshot(cpu_pct=7.0, ts=2.0).as_dict().keys())
-    assert row == "2,7,,,,,,,,"
+    assert row == _row(2, 7)
 
 
 # --- two threads, one log -------------------------------------------------
@@ -523,7 +527,6 @@ def test_no_row_is_appended_after_disable_has_returned(tmp_path):
     returns, and the writer appends anyway -- one row past the point where the
     user believes the trace stopped, which is the whole reason disable() exists.
     """
-    from metrics import Snapshot
 
     log, hook = hooked_log(tmp_path)
     failures = []
@@ -549,7 +552,10 @@ def test_no_row_is_appended_after_disable_has_returned(tmp_path):
     log.write(Snapshot(cpu_pct=9.0, ts=9.0))
     assert log.enabled is False
     lines = (tmp_path / "history.log").read_text(encoding="utf-8").strip().splitlines()
-    assert lines == [",".join(row.as_dict().keys()), "1,1,,,,,,,,"]
+    # The blank tail is built from the column count rather than written out, so
+    # adding a column does not turn this into a test that has to be edited.
+    blank = ",".join([""] * (len(Snapshot.CSV_COLUMNS) - 2))
+    assert lines == [",".join(row.as_dict().keys()), f"1,1,{blank}"]
 
 
 def test_the_header_is_written_once_when_two_writers_overlap(tmp_path):
@@ -560,7 +566,6 @@ def test_the_header_is_written_once_when_two_writers_overlap(tmp_path):
     belongs to the first -- the schema mixing that _adopt_existing_header()
     exists to prevent, arriving from a different direction.
     """
-    from metrics import Snapshot
 
     log, hook = hooked_log(tmp_path, stop_at="after_header")
     failures = []
@@ -587,4 +592,7 @@ def test_the_header_is_written_once_when_two_writers_overlap(tmp_path):
     header = ",".join(Snapshot(cpu_pct=1.0, ts=1.0).as_dict().keys())
     lines = (tmp_path / "history.log").read_text(encoding="utf-8").strip().splitlines()
     assert lines.count(header) == 1, f"the header was written {lines.count(header)} times"
-    assert lines == [header, "1,1,,,,,,,,", "2,2,,,,,,,,"]
+    # Built from the column count: a snapshot gains fields over time and these
+    # rows would otherwise have to be edited every time one is added.
+    blank = ",".join([""] * (len(Snapshot.CSV_COLUMNS) - 2))
+    assert lines == [header, f"1,1,{blank}", f"2,2,{blank}"]

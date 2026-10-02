@@ -116,7 +116,20 @@ class HistoryLog:
         return True
 
     def disable(self) -> None:
+        self._switch_off()
+
+    def _switch_off(self) -> None:
+        """Stop writing, and forget what was decided about the file.
+
+        The verdict on the header belongs to the file, not to this object, so
+        it has to be forgotten as well. Leaving it behind let the next
+        enable() -- which is what the tray menu does -- skip the check and
+        append this build's columns to a trace whose header belonged to another
+        build, which is the exact schema mixing the check exists to prevent.
+        """
         self._enabled = False
+        self._has_header = False
+        self._header_checked = False
 
     def write(self, snapshot) -> None:
         if not self._enabled:
@@ -124,10 +137,13 @@ class HistoryLog:
         values = snapshot.as_dict()
         try:
             if not self._header_checked:
-                self._header_checked = True
                 if not self._adopt_existing_header(values):
-                    self._enabled = False
+                    self._switch_off()
                     return
+                # Set only now that the check has run to completion: marking it
+                # done first left it marked when adopting raised part-way
+                # through, and the retry after a re-enable skipped the check.
+                self._header_checked = True
             with self._path.open("a", encoding="utf-8") as handle:
                 # Both strings come from one dict, so they agree within a
                 # single write. Across runs the header is checked once, on the
@@ -139,7 +155,7 @@ class HistoryLog:
                 handle.write(",".join(_csv(v) for v in values.values()) + "\n")
         except OSError as exc:
             logger.warning("history log write failed, switching off: %s", exc)
-            self._enabled = False
+            self._switch_off()
 
     def _adopt_existing_header(self, values: dict[str, float | None]) -> bool:
         """Decide once whether a trace written by an earlier run can be extended.
@@ -160,7 +176,12 @@ class HistoryLog:
             return True  # nothing there yet; the append below starts a new trace
         expected = ",".join(values.keys())
         try:
-            with self._path.open("r", encoding="utf-8") as handle:
+            # errors="replace" because a trace saved as UTF-16 or written as
+            # cp1251 is not UTF-8, and a decode failure is a ValueError rather
+            # than an OSError -- it used to escape write() into the sampling
+            # tick. Garbled bytes cannot match an ASCII header, so they take
+            # the rotate branch: the file is kept, never appended to.
+            with self._path.open("r", encoding="utf-8", errors="replace") as handle:
                 first = handle.readline().strip()
         except OSError as exc:
             logger.warning("history log unreadable, rotating it aside: %s", exc)

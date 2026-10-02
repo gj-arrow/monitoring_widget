@@ -70,6 +70,13 @@ class FakeNvml:
         return FakeMemory(2 * GB, 8 * GB)
 
 
+class BrokenGpu:
+    """A GPU probe whose read fails the way a vanishing driver does."""
+
+    def read(self):
+        raise RuntimeError("the driver went away")
+
+
 class FakeGpu:
     def __init__(self, values):
         self.values = values
@@ -249,9 +256,29 @@ def test_sample_isolates_one_failing_source(failing):
     assert snap.ts > 0.0
 
 
+def test_sample_isolates_a_failing_gpu_read():
+    # The GPU is the last source sampled and the only one that can die with the
+    # driver, so nothing required the CPU and RAM readings to survive its
+    # failure: merging the ram and gpu guards left every test in this file
+    # green while one missing driver blanked the CPU and RAM rows too.
+    probe = SystemProbe(
+        cpu_pct=lambda: 12.5,
+        cpu_freq=lambda: SimpleNamespace(current=3600.0, max=4500.0),
+        ram=lambda: SimpleNamespace(used=11.4 * GB, total=32 * GB),
+        gpu=BrokenGpu(),
+    )
+    snap = probe.sample()
+    assert snap.cpu_pct == 12.5
+    assert snap.cpu_mhz == 3600.0
+    assert snap.cpu_max_mhz == 4500.0
+    assert snap.ram_used_gb == 11.4
+    assert snap.ram_total_gb == 32.0
+    assert snap.gpu_pct is None
+    assert snap.ts > 0.0
+
+
 @pytest.mark.parametrize(
-    "failing,field,expected",
-    [
+    "failing,field,expected",    [
         ("util", "gpu_pct",
          {"gpu_pct": None, "gpu_temp_c": 61.0, "vram_used_gb": 2.0, "vram_total_gb": 8.0}),
         ("temp", "gpu_temp_c",
@@ -288,7 +315,9 @@ def test_real_probe_runs_on_this_machine():
     if gpu.available:
         assert snap.gpu_pct is not None
         assert snap.gpu_temp_c is not None
-        assert snap.vram_used_gb and snap.vram_used_gb > 0
+        # VRAM in use is a real number, but it is legitimately 0 on an idle
+        # card with no display attached, so it must not be asserted non-zero.
+        assert snap.vram_used_gb is not None
         assert snap.vram_total_gb and snap.vram_total_gb > 0
 
 

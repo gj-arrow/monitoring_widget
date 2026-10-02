@@ -1,6 +1,7 @@
 import logging
 from pathlib import Path
 
+import pytest
 from PyQt6.QtCore import QPointF
 
 from history import History, resample
@@ -279,3 +280,127 @@ def test_history_log_treats_a_deleted_file_as_a_new_trace(tmp_path, caplog):
     assert row == "2,7,,,,,,,,"
     assert not [r for r in caplog.records if "rotat" in r.getMessage()]
     assert not [r for r in caplog.records if "unreadable" in r.getMessage()]
+
+
+def test_history_log_rechecks_the_header_after_being_switched_off(tmp_path, monkeypatch):
+    # Switching off left the header-check flags as they were, so the next
+    # enable() -- which is exactly what the tray menu does -- skipped the check
+    # and appended this build's ten columns straight into the stale file. Only
+    # the first attempt at a rotation is made to fail here, so the retry has to
+    # notice the foreign header again and rotate for real.
+    from history import HistoryLog
+    from metrics import Snapshot
+
+    stale = "t,cpu,gpu,temp\n0,1,2,3\n"
+    path = tmp_path / "history.log"
+    path.write_text(stale, encoding="utf-8")
+
+    real_replace = Path.replace
+    attempts = []
+
+    def flaky_replace(self, target):
+        attempts.append(target)
+        if len(attempts) == 1:
+            raise OSError("the file is open in another program")
+        return real_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", flaky_replace)
+
+    log = HistoryLog(path)
+    log.enable()
+    log.write(Snapshot(cpu_pct=7.0, ts=2.0))
+    assert log.enabled is False
+    assert path.read_text(encoding="utf-8") == stale
+
+    assert log.enable() is True
+    log.write(Snapshot(cpu_pct=8.0, ts=3.0))
+
+    assert len(attempts) == 2
+    assert log.enabled is True
+    # The stale trace is kept whole and unappended, in its rotated file.
+    assert (tmp_path / "history.log.1").read_text(encoding="utf-8") == stale
+    header, row = path.read_text(encoding="utf-8").strip().splitlines()
+    assert header == ",".join(Snapshot(cpu_pct=8.0, ts=3.0).as_dict().keys())
+    assert row == "3,8,,,,,,,,"
+
+
+def test_history_log_rechecks_the_header_after_an_explicit_disable(tmp_path):
+    # The mirror of the test above: after a normal disable/enable the check
+    # runs again and finds this build's own header, so nothing is rotated and
+    # the trace simply continues.
+    from history import HistoryLog
+    from metrics import Snapshot
+
+    path = tmp_path / "history.log"
+    _write_trace(path, "t,cpu,gpu,temp", ["0,1,2,3"])
+
+    log = HistoryLog(path)
+    log.enable()
+    log.write(Snapshot(cpu_pct=7.0, ts=2.0))
+    log.disable()
+    log.enable()
+    log.write(Snapshot(cpu_pct=8.0, ts=3.0))
+
+    lines = path.read_text(encoding="utf-8").strip().splitlines()
+    assert lines[1:] == ["2,7,,,,,,,,", "3,8,,,,,,,,"]
+    assert not (tmp_path / "history.log.2").exists()
+
+
+def test_history_log_rechecks_when_adopting_the_header_did_not_finish(tmp_path, monkeypatch):
+    # The check flag used to be set before the check ran, so an error part-way
+    # through adopting it left the log believing the file had been vetted: the
+    # retry after a re-enable skipped the check and appended to whatever was
+    # on disk. An unexpected error still escapes write() -- that is out of
+    # scope here -- but it must not be cached as a completed check.
+    from history import HistoryLog
+    from metrics import Snapshot
+
+    stale = "t,cpu,gpu,temp\n0,1,2,3\n"
+    path = tmp_path / "history.log"
+    path.write_text(stale, encoding="utf-8")
+
+    real_exists = Path.exists
+    broken = {"now": True}
+
+    def flaky_exists(self):
+        if broken["now"]:
+            broken["now"] = False
+            raise RuntimeError("the filesystem is having a moment")
+        return real_exists(self)
+
+    monkeypatch.setattr(Path, "exists", flaky_exists)
+
+    log = HistoryLog(path)
+    log.enable()
+    with pytest.raises(RuntimeError):
+        log.write(Snapshot(cpu_pct=7.0, ts=2.0))
+
+    log.write(Snapshot(cpu_pct=8.0, ts=3.0))
+
+    assert (tmp_path / "history.log.1").read_text(encoding="utf-8") == stale
+    header, row = path.read_text(encoding="utf-8").strip().splitlines()
+    assert header == ",".join(Snapshot(cpu_pct=8.0, ts=3.0).as_dict().keys())
+    assert row == "3,8,,,,,,,,"
+
+
+def test_history_log_rotates_a_trace_it_cannot_decode(tmp_path):
+    # A log saved by Excel as UTF-16, or written as cp1251 by a build on a
+    # Russian-locale machine, is not UTF-8. A decode failure is a ValueError
+    # rather than an OSError, so it used to escape write() whole and land in
+    # the sampling tick. Garbled bytes must degrade into the rotate branch:
+    # the trace is kept, never appended to.
+    from history import HistoryLog
+    from metrics import Snapshot
+
+    path = tmp_path / "history.log"
+    saved = "ts,cpu_pct\r\n1,2\r\n".encode("utf-16")
+    path.write_bytes(saved)
+
+    log = HistoryLog(path)
+    log.enable()
+    log.write(Snapshot(cpu_pct=7.0, ts=2.0))
+
+    assert (tmp_path / "history.log.1").read_bytes() == saved
+    header, row = path.read_text(encoding="utf-8").strip().splitlines()
+    assert header == ",".join(Snapshot(cpu_pct=7.0, ts=2.0).as_dict().keys())
+    assert row == "2,7,,,,,,,,"

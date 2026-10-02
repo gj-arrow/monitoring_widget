@@ -610,7 +610,14 @@ def test_an_unmeasured_rate_renders_a_dash_in_both_directions(monkeypatch):
         (999_999_999_999.0, "1000000.0 MB/s"),
         (1e12, ">= 1000.0 TB/s"),
         (1e300, ">= 1000.0 TB/s"),
-        (-1e300, ">= 1000.0 TB/s"),
+        # The arm is on the magnitude with the sign carried into the string, so
+        # each side gets a statement true of it. Saturating a negative as
+        # ">= 1000.0 TB/s" would be false of it; testing the signed value alone
+        # would look more honest and would not be, since it bounds only the
+        # positive side and hands -1e300 back to the megabyte branch as that same
+        # 302-character string.
+        (-1e300, "<= -1000.0 TB/s"),
+        (-1e12, "<= -1000.0 TB/s"),
     ],
 )
 def test_the_rate_formatter_picks_the_unit_from_the_magnitude(value, expected):
@@ -640,7 +647,8 @@ def test_the_widest_rate_string_the_header_must_fit_is_bounded():
 
     available = theme.header_rect().right() - theme.header_text_x()
     for value, expected in ((999_999_999_999.0, "DN 1000000.0 MB/s  UP 1000000.0 MB/s"),
-                            (1e300, "DN >= 1000.0 TB/s  UP >= 1000.0 TB/s")):
+                            (1e300, "DN >= 1000.0 TB/s  UP >= 1000.0 TB/s"),
+                            (-1e300, "DN <= -1000.0 TB/s  UP <= -1000.0 TB/s")):
         metrics_width, widest = width(value)
         assert widest == expected
         assert metrics_width <= available, (

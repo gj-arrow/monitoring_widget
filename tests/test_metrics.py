@@ -950,6 +950,117 @@ def test_a_new_adapter_publishes_its_lifetime_as_this_interval():
     assert values == {"net_down_bytes_per_sec": None, "net_up_bytes_per_sec": None}, values
 
 
+def test_an_adapter_appearing_on_a_non_advancing_tick_still_drops_the_average():
+    """The third path to the same artefact.
+
+    The churn comparison sat *below* the `elapsed <= 0` guard, so an adapter that
+    arrived on a tick where the wall clock had not advanced was never noticed as
+    a churn at all: the tick returned as an ordinary unmeasurable one, the
+    average survived it, and the next tick read 202000 against a true 20000 --
+    byte for byte the artefact wave 3 removed, reached through the branch that
+    was supposed to be the guard's partner.
+
+    A clock stepping backwards is not exotic: time.time() is not monotonic, an
+    NTP correction does it, and two reads close enough together land on the same
+    tick of the system clock.
+    """
+    giga = 1024 ** 3
+    clock = FakeClock(100.0)
+    adapters = {"Ethernet": (0, 0)}
+
+    def io(pernic=True):
+        return {n: SimpleNamespace(bytes_recv=r, bytes_sent=s)
+                for n, (r, s) in adapters.items()}
+
+    probe = NetProbe(io_counters=io, now=clock)
+    probe.read()
+    clock.advance(2.0)
+    adapters["Ethernet"] = (600_000, 600_000)
+    assert probe.read() == {"net_down_bytes_per_sec": 300_000.0,
+                            "net_up_bytes_per_sec": 300_000.0}
+
+    adapters["Ethernet"] = (620_000, 620_000)
+    adapters["VPN Adapter"] = (9 * giga, 3 * giga)
+    clock.advance(-1.0)                      # the clock steps back on the churn tick
+    assert probe.read() == {"net_down_bytes_per_sec": None, "net_up_bytes_per_sec": None}
+
+    clock.advance(2.0)
+    adapters["Ethernet"] = (640_000, 640_000)
+    adapters["VPN Adapter"] = (9 * giga + 20_000, 3 * giga + 20_000)
+    # 40000 bytes over 2 s. Not 202000, which is 0.35*20000 + 0.65*300000.
+    assert probe.read() == {"net_down_bytes_per_sec": 20_000.0,
+                            "net_up_bytes_per_sec": 20_000.0}
+
+
+def test_an_adapter_vanishing_on_a_non_advancing_tick_still_reports_no_number():
+    # Same ordering bug, worse consequence. The departed adapter's final
+    # interval is a term missing from the sum -- the argument the code comment
+    # gives for settling on set *equality* -- and skipping the comparison let it
+    # be dropped in silence. 390000 here against a true 620000, with no dash on
+    # the tick that dropped it.
+    clock = FakeClock(100.0)
+    adapters = {"Ethernet": (0, 0), "VPN Adapter": (0, 0)}
+
+    def io(pernic=True):
+        return {n: SimpleNamespace(bytes_recv=r, bytes_sent=s)
+                for n, (r, s) in adapters.items()}
+
+    probe = NetProbe(io_counters=io, now=clock)
+    probe.read()
+    clock.advance(2.0)
+    adapters["Ethernet"] = (600_000, 600_000)
+    adapters["VPN Adapter"] = (600_000, 600_000)
+    assert probe.read() == {"net_down_bytes_per_sec": 600_000.0,
+                            "net_up_bytes_per_sec": 600_000.0}
+
+    adapters["Ethernet"] = (1_240_000, 1_240_000)   # both moved 620000
+    del adapters["VPN Adapter"]
+    clock.advance(-1.0)
+    assert probe.read() == {"net_down_bytes_per_sec": None, "net_up_bytes_per_sec": None}
+
+    clock.advance(2.0)
+    adapters["Ethernet"] = (1_260_000, 1_260_000)   # a further 20000 on Ethernet alone
+    # 20000 bytes over 2 s. 620000 was moved over the interrupted interval and
+    # 600000 of it is now unreachable, so 390000 of it went missing in silence.
+    assert probe.read()["net_down_bytes_per_sec"] == 10_000.0, (
+        "the vanished adapter's final interval was dropped from the sum without "
+        "the tick saying so"
+    )
+
+
+def test_a_non_advancing_tick_with_no_churn_keeps_the_average():
+    """The over-correction guard, and it is the same arithmetic as the two above.
+
+    Nothing discontinuous happened on this tick, so the average is still a valid
+    description of the link and must survive: the next measured tick blends with
+    it, 0.35*20000 + 0.65*300000 = 202000. That is the *correct* figure here and
+    the artefact on the churn tick, and the only thing that distinguishes them is
+    whether the adapter set changed -- so hoisting the comparison must not have
+    swept the elapsed guard's own case up with it.
+    """
+    clock = FakeClock(100.0)
+    adapters = {"Ethernet": (0, 0)}
+
+    def io(pernic=True):
+        return {n: SimpleNamespace(bytes_recv=r, bytes_sent=s)
+                for n, (r, s) in adapters.items()}
+
+    probe = NetProbe(io_counters=io, now=clock)
+    probe.read()
+    clock.advance(2.0)
+    adapters["Ethernet"] = (600_000, 600_000)
+    assert probe.read()["net_down_bytes_per_sec"] == 300_000.0
+
+    clock.advance(-1.0)                      # no churn, only a backwards clock
+    assert probe.read() == {"net_down_bytes_per_sec": None, "net_up_bytes_per_sec": None}
+
+    clock.advance(2.0)
+    adapters["Ethernet"] = (640_000, 640_000)
+    assert probe.read()["net_down_bytes_per_sec"] == 202_000.0, (
+        "the average was dropped on a tick where nothing discontinuous happened"
+    )
+
+
 def test_adapter_churn_drops_the_average_built_before_it():
     # A 300 KB/s average is established, then a VPN adapter appears. The churn
     # tick is unmeasured, but the *next* tick's true traffic is 20 KB/s and the

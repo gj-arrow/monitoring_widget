@@ -148,14 +148,19 @@ def _format_rate(value: float | None) -> str:
     not *invalid* -- it is unrenderable, and "at least" is the honest monotone
     statement about a number known to be huge with no bound to quote it against.
     1e12 rendered a 302-character string, overrunning the header by more than its
-    own width. The arm is on the magnitude, so a negative input saturates too:
-    the probe cannot produce one, and `>=` is what the string already claims.
+    own width. The arm is on the magnitude, with the sign carried into the string, so
+    each side gets a statement that is true of it: `>= 1000.0 TB/s` above and
+    `<= -1000.0 TB/s` below. Testing the signed value alone would look more
+    honest and would not be -- it bounds only the positive side and hands the
+    negative one straight back to the megabyte branch, where -1e300 is that same
+    302-character string. The probe cannot produce a negative rate at all
+    (`moved < 0` is caught upstream), so nothing real is lost either way.
     """
     if value is None:
         return "--"
     magnitude = abs(value)
     if magnitude >= _TB:
-        return ">= 1000.0 TB/s"
+        return ">= 1000.0 TB/s" if value > 0 else "<= -1000.0 TB/s"
     if magnitude >= _MB:
         return f"{value / _MB:.1f} MB/s"
     if magnitude >= _KB:

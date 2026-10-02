@@ -532,9 +532,16 @@ class NetProbe:
         if previous is None:
             return out
         elapsed = moment - previous[0]
-        if elapsed <= 0.0:
-            return out  # a rate is bytes over seconds; with no seconds, no rate
         if names != previous[1]:
+            # FIRST, before the elapsed guard below. That ordering is the whole
+            # point: the guard returns for a tick where no time passed, and a
+            # churn that lands on such a tick is still a churn. With the
+            # comparison underneath, an adapter arriving on a backwards clock
+            # was never noticed as one -- the tick returned as an ordinary
+            # unmeasurable one, the average survived it, and the next tick read
+            # 202000 against a true 20000: the same artefact the counter-reset
+            # branch was fixed for, reached through its supposed partner.
+            #
             # The adapter set changed, so the sum no longer has a term for every
             # interface and this interval cannot be differenced. An adapter that
             # appears brings cumulative counters with it, and summing those in
@@ -570,6 +577,12 @@ class NetProbe:
             for key in NET_KEYS:
                 self._averaged[key] = None
             return out
+        if elapsed <= 0.0:
+            # Nothing discontinuous happened on this tick, so the average is
+            # still a true description of the link and stays. This is the guard's
+            # own case, and it is why the churn comparison is above it rather
+            # than merged into it.
+            return out  # a rate is bytes over seconds; with no seconds, no rate
 
         for index, key in enumerate(NET_KEYS, start=2):
             moved = now[index] - previous[index]

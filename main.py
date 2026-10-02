@@ -58,6 +58,23 @@ HISTORY_REFUSED = "Could not open metrics_history.log."
 
 ALPHA_STEPS = (("35%", 0.35), ("50%", 0.50), ("65%", 0.65), ("80%", 0.80), ("100%", 1.00))
 
+# How close an alpha has to be to count as one of the labels above. The wheel
+# moves in theme.WHEEL_ALPHA_STEPs and the labels are further apart than that,
+# so this is never a question of exact equality.
+ALPHA_EPSILON = 0.001
+
+
+def alpha_label(value: float) -> str:
+    return f"{round(value * 100)}%"
+
+
+def labelled_alpha(alpha: float) -> float | None:
+    """The labelled step this alpha is, or None when it sits between two."""
+    for _, value in ALPHA_STEPS:
+        if abs(alpha - value) < ALPHA_EPSILON:
+            return value
+    return None
+
 
 def log_path() -> Path:
     """Beside settings.json, which is beside the executable when frozen.
@@ -99,13 +116,19 @@ class Collector(QThread):
     queued would let the sampler fall behind and catch up as fast as the CPU
     allows; 25 pokes during one in-flight sample buy exactly one extra
     reading, which is what the boolean flag below is for.
+
+    `on_sampled` is handed each Snapshot here, on this thread, rather than
+    through the `sampled` signal. That signal is queued, so its slots run on
+    the GUI thread -- which is fine for painting a panel and wrong for
+    appending a CSV row on every tick.
     """
 
     sampled = pyqtSignal(object)
 
-    def __init__(self, probe, parent=None) -> None:
+    def __init__(self, probe, on_sampled=None, parent=None) -> None:
         super().__init__(parent)
         self._probe = probe
+        self._on_sampled = on_sampled
         self._mutex = QMutex()
         self._wake = QWaitCondition()
         self._pending = False
@@ -116,6 +139,16 @@ class Collector(QThread):
             self._pending = True
             self._wake.wakeAll()
 
+    def _publish(self, snapshot) -> None:
+        """Hand the sample to the GUI thread, and write the trace from here.
+
+        The emit first: it only posts an event, so the panel starts repainting
+        while the file is being appended to.
+        """
+        self.sampled.emit(snapshot)
+        if self._on_sampled is not None:
+            self._on_sampled(snapshot)
+
     def run(self) -> None:
         while not self.isInterruptionRequested():
             # Cleared before the sample rather than after it: a sample takes
@@ -125,7 +158,7 @@ class Collector(QThread):
             # waiting on is dropped, and it is dropped here, mid-sample.
             with QMutexLocker(self._mutex):
                 self._pending = False
-            self.sampled.emit(self._probe.sample())
+            self._publish(self._probe.sample())
             with QMutexLocker(self._mutex):
                 # The three ways out of a wait: poked, the tick expiring, and
                 # an interruption. The last one is checked here as well as at
@@ -149,6 +182,27 @@ def stop_collector(collector: Collector, timeout_ms: int = SHUTDOWN_WAIT_MS) -> 
     return collector.wait(timeout_ms)
 
 
+def _dwm_set_window_attribute():
+    """DwmSetWindowAttribute with its prototype declared.
+
+    ctypes guesses no argument types at all, and this call works only because
+    wintypes.HWND happens to subclass c_void_p. A handle handed to an
+    undeclared prototype is a number the marshaller has to guess the width of,
+    and on 64-bit Windows a wrong guess truncates it and fails for a reason
+    nobody reading the code can find. The function object is process-wide, so
+    the declaration is done once, here.
+    """
+    setter = ctypes.windll.dwmapi.DwmSetWindowAttribute
+    setter.argtypes = [
+        wintypes.HWND,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    ]
+    setter.restype = ctypes.c_long  # an HRESULT, and S_OK is 0
+    return setter
+
+
 def enable_acrylic(hwnd: int) -> bool:
     """Ask DWM for real backdrop blur. False when the OS refuses.
 
@@ -159,7 +213,7 @@ def enable_acrylic(hwnd: int) -> bool:
         return False
     try:
         value = ctypes.c_int(DWMSBT_TRANSIENTWINDOW)
-        result = ctypes.windll.dwmapi.DwmSetWindowAttribute(
+        result = _dwm_set_window_attribute()(
             wintypes.HWND(hwnd),
             ctypes.c_uint(DWMWA_SYSTEMBACKDROP_TYPE),
             ctypes.byref(value),
@@ -204,9 +258,8 @@ class MonitorApp:
         # running aborts the process, and a widget must not be able to do that
         # by being collected. Nothing here can collect it -- this object holds
         # it and shutdown() joins it first.
-        self.collector = Collector(SystemProbe())
+        self.collector = self._make_collector()
         self.collector.sampled.connect(self.panel.apply_snapshot)
-        self.collector.sampled.connect(self._record_history)
 
         self.panel.menu_requested.connect(self._show_menu_at)
         self.panel.quit_requested.connect(self.shutdown)
@@ -238,6 +291,16 @@ class MonitorApp:
 
     # --- wiring -----------------------------------------------------------
 
+    def _make_collector(self) -> Collector:
+        """The sampler, with the CSV trace hanging off its worker side.
+
+        The append is a callback on the collector rather than a slot on
+        `sampled`: that signal is queued to the GUI thread, so a file write
+        every two seconds would land on the one thread this class exists to
+        keep free. Panel painting is the only thing that belongs over there.
+        """
+        return Collector(SystemProbe(), self._record_history)
+
     def _record_history(self, snapshot) -> None:
         self.history_log.write(snapshot)
 
@@ -256,7 +319,6 @@ class MonitorApp:
             self.panel.restore_default_position()
 
     def _show_menu_at(self, global_pos) -> None:
-        self._sync_menu()
         # The values the user is about to read are two seconds old at worst;
         # this makes the menu open on fresh ones.
         self.collector.poke()
@@ -268,10 +330,19 @@ class MonitorApp:
         A menu built once at startup keeps claiming the state it had then: the
         wheel changes the alpha without coming through here, and the acrylic
         and history toggles can be refused by the OS or by the filesystem
-        after the checkmark has already gone on.
+        after the checkmark has already gone on. Wired to the menu's
+        aboutToShow rather than called from the one place that opens it, because
+        there are two: the panel's own context menu and a right-click on the
+        tray icon, and a checkmark that is only refreshed on one of them lies
+        on the other.
         """
+        chosen = labelled_alpha(self.settings.alpha)
         for value, action in self._alpha_actions.items():
-            action.setChecked(abs(self.settings.alpha - value) < 0.001)
+            action.setChecked(value == chosen)
+        self._alpha_custom.setVisible(chosen is None)
+        self._alpha_custom.setChecked(chosen is None)
+        if chosen is None:
+            self._alpha_custom.setText(f"Custom ({alpha_label(self.settings.alpha)})")
         for name, action in self._toggle_actions.items():
             action.setChecked(bool(getattr(self.settings, name)))
 
@@ -279,6 +350,7 @@ class MonitorApp:
 
     def _build_menu(self) -> QMenu:
         menu = QMenu()
+        menu.aboutToShow.connect(self._sync_menu)
 
         reset = QAction("Reset position", menu)
         reset.triggered.connect(self.panel.restore_default_position)
@@ -288,10 +360,20 @@ class MonitorApp:
         for label, value in ALPHA_STEPS:
             action = QAction(label, opacity)
             action.setCheckable(True)
-            action.setChecked(abs(self.settings.alpha - value) < 0.001)
             action.triggered.connect(lambda _checked=False, v=value: self._set_alpha(v))
             opacity.addAction(action)
             self._alpha_actions[value] = action
+
+        # The wheel steps the alpha by theme.WHEEL_ALPHA_STEP, which is finer
+        # than the gaps between the labels, so a notch nearly always lands on
+        # one of them and not on a label. With nothing here to say otherwise,
+        # every checkmark went false and the menu read as "no opacity chosen"
+        # while the panel was showing one. This row is the honest answer to the
+        # value the wheel left behind, and it is only there when no label is.
+        custom = QAction("", opacity)
+        custom.setCheckable(True)
+        opacity.addAction(custom)
+        self._alpha_custom: QAction = custom
 
         on_top = QAction("Always on top", menu)
         on_top.setCheckable(True)
@@ -318,6 +400,8 @@ class MonitorApp:
         quit_action = QAction("Quit", menu)
         quit_action.triggered.connect(self.shutdown)
         menu.addAction(quit_action)
+        # Every checkmark, including the opacity rows, is decided in one place.
+        self._sync_menu()
         return menu
 
     def _set_alpha(self, value: float) -> None:

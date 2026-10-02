@@ -112,14 +112,17 @@ class FakeWmiConnection:
     with Win32_Processor.ProcessorFrequency.
     """
 
-    def __init__(self, processors=(), perf=(), absent=("ProcessorFrequency",)):
+    def __init__(self, processors=(), perf=(), absent=("ProcessorFrequency",), fail=False):
         self._processors = processors
         self._perf = perf
         self._absent = absent
+        self.fail = fail
         self.queries = []
 
     def query(self, wql):
         self.queries.append(wql)
+        if self.fail:
+            raise RuntimeError("the WMI service has stopped")
         for name in self._absent:
             if name in wql:
                 raise RuntimeError(f"invalid query: {name} is not a property")
@@ -727,6 +730,184 @@ def test_the_network_probe_samples_the_counters_once_per_read():
     assert counters.calls == 2
 
 
+def test_aggregate_rows_are_not_a_substitute_for_the_logical_processors():
+    """`_Total` is a summary of the per-processor rows, not a processor.
+
+    When it is the only row that comes back it reads 100 -- exactly nominal --
+    and publishing it as the live clock reproduces, byte for byte, the frozen
+    psutil constant this whole probe exists to remove. That branch had no test:
+    the one test with an empty perf list produces `[] or []`, which never
+    reaches it.
+    """
+    for name in ("_Total", "0,_Total"):
+        probe = clock_probe(
+            perf=[SimpleNamespace(Name=name, PercentProcessorPerformance=100)],
+            processors=[SimpleNamespace(MaxClockSpeed=4501)],
+        )
+        assert probe.read() == {"cpu_nominal_mhz": 4501.0, "cpu_live_mhz": None}, name
+
+
+def test_a_genuine_hundred_percent_average_is_still_allowed_to_equal_the_nominal():
+    """The counterpart to the aggregate test, and the reason it is not a lookup.
+
+    live == nominal is not by itself the bug: on a boosted part the mean over
+    the logical processors really does land on 100.0, and then the derived clock
+    and the reference agree. What made the old code wrong was arriving there from
+    an aggregate row. Measured on this machine, a sample under load does produce
+    exactly 100.0 across the twelve per-processor rows, so a test that forbade
+    the equality outright would be forbidding a real reading.
+    """
+    perf = perf_rows(*([99.0] * 8 + [102.0] * 4))
+    assert sum(float(r.PercentProcessorPerformance) for r in perf) / len(perf) == 100.0
+    probe = clock_probe(perf=perf, processors=[SimpleNamespace(MaxClockSpeed=4501)])
+    assert probe.read() == {"cpu_nominal_mhz": 4501.0, "cpu_live_mhz": 4501.0}
+
+
+def test_an_aggregate_at_a_plausible_ratio_is_still_not_a_processor():
+    """The rejection is about *which rows* answered, not about the value.
+
+    A turbo-looking 99 on `_Total` is no more a measurement of any individual
+    processor than 100 is. If the band were the only guard, this one would slip
+    through and look like a live reading.
+    """
+    probe = clock_probe(
+        perf=[SimpleNamespace(Name="_Total", PercentProcessorPerformance=99)],
+        processors=[SimpleNamespace(MaxClockSpeed=4501)],
+    )
+    assert probe.read()["cpu_live_mhz"] is None
+
+
+@pytest.mark.parametrize(
+    "ratio",
+    [0, 0.0, -1, -42, float("inf"), float("-inf"), float("nan"), 201, 255, 4501],
+)
+def test_a_ratio_outside_the_plausible_band_is_not_a_measurement(ratio):
+    # The module's own docstring promises nothing here invents a number, and a
+    # counter with no range check does: 0 renders 0.00 GHz, -42 renders
+    # -1.89 GHz, inf renders inf, and 255 renders 11.48 GHz on a 4.5 GHz part.
+    # All four were measured on this code before the band existed.
+    probe = clock_probe(perf=perf_rows(ratio),
+                        processors=[SimpleNamespace(MaxClockSpeed=4501)])
+    assert probe.read() == {"cpu_nominal_mhz": 4501.0, "cpu_live_mhz": None}, ratio
+
+
+@pytest.mark.parametrize("ratio", [1.0, 99.0, 100.0, 118.0, 155.0, 200.0])
+def test_a_plausible_ratio_is_still_derived(ratio):
+    # The band has to leave room for genuine boost, not just for the 99-100 this
+    # machine idles at. 155% is below what real silicon reaches: the widest turbo
+    # ratio on any shipping part is a ~3.7 GHz Xeon over a 2.4 GHz base, about
+    # 154%. A ceiling at 200 clears that with room and still rejects garbage,
+    # since nothing clocks a CPU at twice nominal.
+    probe = clock_probe(perf=perf_rows(ratio),
+                        processors=[SimpleNamespace(MaxClockSpeed=4500)])
+    assert probe.read()["cpu_live_mhz"] == round(4500 * ratio / 100.0, 1), ratio
+
+
+@pytest.mark.parametrize("speed", [0, -4501, -0.5, float("nan"), float("inf")])
+def test_a_nominal_that_is_not_a_positive_finite_speed_is_dropped(speed):
+    # `if speed:` is a truthiness test, and a negative, NaN or infinite ceiling
+    # is perfectly truthy. A negative nominal is worse than none at all: it
+    # multiplies straight into a negative clock on the panel.
+    probe = CpuClockProbe(
+        wmi=FakeWmi(FakeWmiConnection(processors=[SimpleNamespace(MaxClockSpeed=speed)],
+                                      perf=perf_rows(99.0))),
+        nominal_max=lambda: None,
+    )
+    assert probe.read() == {"cpu_nominal_mhz": None, "cpu_live_mhz": None}, speed
+
+
+@pytest.mark.parametrize("speed", [0, -4501, float("nan"), float("inf")])
+def test_a_secondary_nominal_that_is_not_a_positive_finite_speed_is_dropped(speed):
+    # The psutil fallback is a source like any other and gets the same check.
+    # Trusting one path and not the other is how -4501 gets onto the panel.
+    probe = clock_probe(perf=perf_rows(99.0), processors=[], nominal=speed)
+    assert probe.read() == {"cpu_nominal_mhz": None, "cpu_live_mhz": None}, speed
+
+
+def test_the_nominal_clock_is_read_once_for_the_life_of_the_process():
+    # 6.9 ms a tick, for a value that cannot change while the process runs: the
+    # CPU's ceiling is a property of the installed part, not a reading. The
+    # performance counter is still read every tick, so the derived clock keeps
+    # moving -- only the reference stops being re-asked.
+    connection = FakeWmiConnection(processors=[SimpleNamespace(MaxClockSpeed=4501)],
+                                   perf=perf_rows(99.0))
+    probe = CpuClockProbe(wmi=FakeWmi(connection), nominal_max=lambda: None)
+    values = [probe.read() for _ in range(5)]
+    assert all(v["cpu_live_mhz"] == 4456.0 for v in values)
+    assert sum("Win32_Processor" in q for q in connection.queries) == 1, connection.queries
+    assert sum("PercentProcessorPerformance" in q for q in connection.queries) == 5
+
+
+def test_the_nominal_clock_is_still_retried_while_it_is_unknown():
+    # Caching must not cache a *failure*. A provider that was not ready at
+    # startup -- or a WMI service that comes back mid-session -- gets asked
+    # again, or the row reads -- for the rest of the session.
+    connection = FakeWmiConnection(processors=[], perf=perf_rows(99.0))
+    wmi = FakeWmi(connection)
+    probe = CpuClockProbe(wmi=wmi, nominal_max=lambda: None)
+    assert probe.read() == {"cpu_nominal_mhz": None, "cpu_live_mhz": None}
+    connection._processors = [SimpleNamespace(MaxClockSpeed=4501)]
+    assert probe.read()["cpu_live_mhz"] == 4456.0
+
+
+def test_the_cpu_clock_probe_reconnects_once_when_the_cached_handle_goes_stale():
+    # A WMI service that restarts mid-session leaves the cached connection
+    # unusable and every later query failing. Without a reconnect the nominal
+    # falls back to psutil and the derived clock reads -- for the rest of the
+    # session, however many ticks go by.
+    connection = FakeWmiConnection(processors=[SimpleNamespace(MaxClockSpeed=4501)],
+                                   perf=perf_rows(99.0))
+    wmi = FakeWmi(connection)
+    probe = CpuClockProbe(wmi=wmi, nominal_max=lambda: None)
+    assert probe.read()["cpu_live_mhz"] == 4456.0
+
+    connection.fail = True                      # the service goes away
+    assert probe.read()["cpu_live_mhz"] is None, (
+        "a stale handle still produced a derived clock"
+    )
+
+    replacement = FakeWmiConnection(processors=[SimpleNamespace(MaxClockSpeed=4501)],
+                                    perf=perf_rows(99.0))
+    connection.fail = False                     # and comes back on a new handle
+    wmi._connection = replacement
+    assert probe.read()["cpu_live_mhz"] == 4456.0
+    assert wmi.connects == 2
+
+
+def test_a_dead_wmi_service_is_not_reconnected_to_once_per_query():
+    # Three queries go into a read. A service that is genuinely down should be
+    # failed fast, not re-connected to three times a tick for nothing: the
+    # reconnect is paid once per read, however many of its queries then fail.
+    wmi = FakeWmi(fail_connect=True)
+    probe = CpuClockProbe(wmi=wmi, nominal_max=lambda: None)
+    probe.read()
+    first = wmi.connects
+    probe.read()
+    assert wmi.connects == first + 1, (
+        f"connect attempts went {first} -> {wmi.connects} for one read"
+    )
+
+
+def test_a_counter_reset_reseeds_the_average_instead_of_decaying_it():
+    # 300 KB/s, then the link dies and the adapter's counters restart. An EMA
+    # decays from its peak -- measured here as 300 -> 195 -> 127 -> 82 -> 54 ->
+    # 35 -> 23 KB/s, six ticks of throughput nobody sent after the link has
+    # gone. The counters restarted, so the bytes since the last sample are
+    # unknown rather than zero, and the honest thing to do with a dead average
+    # is replace it instead of averaging it away.
+    probe = net_probe([[("Ethernet", 600_000, 600_000)],
+                       [("Ethernet", 1_200_000, 1_200_000)],
+                       [("Ethernet", 0, 0)],
+                       [("Ethernet", 0, 0)]])
+    probe.read()
+    probe._now.advance(2.0)
+    assert probe.read()["net_down_bytes_per_sec"] == 300_000.0
+    probe._now.advance(2.0)
+    assert probe.read()["net_down_bytes_per_sec"] == 0.0
+    probe._now.advance(2.0)
+    assert probe.read()["net_down_bytes_per_sec"] == 0.0
+
+
 def test_real_net_probe_reads_this_machine():
     # No assertion on the value: an idle machine legitimately transfers nothing.
     # What is asserted is that the plumbing works against the real driver, and
@@ -789,9 +970,13 @@ def test_history_log_writes_a_header_once(tmp_path):
     assert lines[0].split(",")[0] == "ts"
     # Built from the column count rather than written out, so adding a column
     # does not turn this into a test that has to be edited to keep passing.
+    from history import _csv
+
+    # Cells through the writer's own formatter, tail from the column count, so
+    # neither has to be edited when a metric joins the dataclass.
     blank = ",".join([""] * (len(Snapshot.CSV_COLUMNS) - 2))
-    assert lines[1] == f"1,10,{blank}"
-    assert lines[2] == f"3,30,{blank}"
+    assert lines[1] == f"{_csv(1.0)},{_csv(10.0)},{blank}"
+    assert lines[2] == f"{_csv(3.0)},{_csv(30.0)},{blank}"
 
 
 def test_history_log_header_matches_the_row_width(tmp_path):
@@ -855,7 +1040,7 @@ def test_every_csv_column_holds_the_value_that_names_it(tmp_path):
     assert len(columns) == len(Snapshot.CSV_COLUMNS)
     for name, value in filled.items():
         index = Snapshot.CSV_COLUMNS.index(name)
-        assert columns[index] == f"{value:g}", (
+        assert columns[index] == repr(value), (
             f"column {index} holds {columns[index]!r} but declares {name!r}: "
             "the row and the header disagree about the order"
         )

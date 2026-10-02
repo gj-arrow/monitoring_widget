@@ -12,13 +12,19 @@ from metrics import Snapshot
 def _row(*values):
     """A CSV row with its empty tail built from the column count.
 
-    Written out -- _row(3, 9) -- these rows have to be edited by hand every
+    Written out -- "3,9,,,,,,,," -- these rows have to be edited by hand every
     time a metric joins the dataclass, which is how a row assertion quietly
-    stops being about anything.
+    stops being about anything. The cells go through history._csv, the formatter
+    the writer itself uses, so the helper cannot drift from it and leave these
+    tests asserting a spelling nothing produces. What _csv *does* is pinned
+    separately by test_a_trace_value_round_trips_through_repr.
     """
+    from history import _csv
+
     columns = len(Snapshot.CSV_COLUMNS)
     assert len(values) <= columns, "more values than there are columns"
-    return ",".join([str(value) for value in values] + [""] * (columns - len(values)))
+    return ",".join([_csv(value) for value in values] + [""] * (columns - len(values)))
+
 
 
 def test_history_respects_maxlen():
@@ -204,7 +210,7 @@ def test_history_log_rotates_a_stale_header_instead_of_mixing_columns(tmp_path, 
     assert kept.read_text(encoding="utf-8") == "t,cpu,gpu,temp\n0,1,2,3\n1,4,5,6\n"
     header, row = path.read_text(encoding="utf-8").strip().splitlines()
     assert header == ",".join(Snapshot(cpu_pct=7.0, ts=2.0).as_dict().keys())
-    assert row == _row(2, 7)
+    assert row == _row(2.0, 7.0)
     assert any("history.log.1" in record.message for record in caplog.records)
 
 
@@ -215,14 +221,14 @@ def test_history_log_keeps_a_matching_header_and_only_appends_a_row(tmp_path):
 
     path = tmp_path / "history.log"
     header = ",".join(Snapshot().as_dict().keys())
-    _write_trace(path, header, [_row(1, 2)])
+    _write_trace(path, header, [_row(1.0, 2.0)])
 
     log = HistoryLog(path)
     log.enable()
     log.write(Snapshot(cpu_pct=9.0, ts=3.0))
 
     lines = path.read_text(encoding="utf-8").strip().splitlines()
-    assert lines == [header, _row(1, 2), _row(3, 9)]
+    assert lines == [header, _row(1.0, 2.0), _row(3.0, 9.0)]
     assert not (tmp_path / "history.log.1").exists()
 
 
@@ -286,7 +292,7 @@ def test_history_log_treats_a_deleted_file_as_a_new_trace(tmp_path, caplog):
 
     header, row = path.read_text(encoding="utf-8").strip().splitlines()
     assert header == ",".join(Snapshot(cpu_pct=7.0, ts=2.0).as_dict().keys())
-    assert row == _row(2, 7)
+    assert row == _row(2.0, 7.0)
     assert not [r for r in caplog.records if "rotat" in r.getMessage()]
     assert not [r for r in caplog.records if "unreadable" in r.getMessage()]
 
@@ -329,7 +335,7 @@ def test_history_log_rechecks_the_header_after_being_switched_off(tmp_path, monk
     assert (tmp_path / "history.log.1").read_text(encoding="utf-8") == stale
     header, row = path.read_text(encoding="utf-8").strip().splitlines()
     assert header == ",".join(Snapshot(cpu_pct=8.0, ts=3.0).as_dict().keys())
-    assert row == _row(3, 8)
+    assert row == _row(3.0, 8.0)
 
 
 def test_history_log_rechecks_the_header_after_an_explicit_disable(tmp_path):
@@ -349,7 +355,7 @@ def test_history_log_rechecks_the_header_after_an_explicit_disable(tmp_path):
     log.write(Snapshot(cpu_pct=8.0, ts=3.0))
 
     lines = path.read_text(encoding="utf-8").strip().splitlines()
-    assert lines[1:] == [_row(2, 7), _row(3, 8)]
+    assert lines[1:] == [_row(2.0, 7.0), _row(3.0, 8.0)]
     assert not (tmp_path / "history.log.2").exists()
 
 
@@ -386,7 +392,7 @@ def test_history_log_rechecks_when_adopting_the_header_did_not_finish(tmp_path, 
     assert (tmp_path / "history.log.1").read_text(encoding="utf-8") == stale
     header, row = path.read_text(encoding="utf-8").strip().splitlines()
     assert header == ",".join(Snapshot(cpu_pct=8.0, ts=3.0).as_dict().keys())
-    assert row == _row(3, 8)
+    assert row == _row(3.0, 8.0)
 
 
 def test_history_log_rotates_a_trace_it_cannot_decode(tmp_path):
@@ -408,7 +414,7 @@ def test_history_log_rotates_a_trace_it_cannot_decode(tmp_path):
     assert (tmp_path / "history.log.1").read_bytes() == saved
     header, row = path.read_text(encoding="utf-8").strip().splitlines()
     assert header == ",".join(Snapshot(cpu_pct=7.0, ts=2.0).as_dict().keys())
-    assert row == _row(2, 7)
+    assert row == _row(2.0, 7.0)
 
 
 # --- two threads, one log -------------------------------------------------
@@ -520,6 +526,46 @@ def run_guarded(failures, call):
     return run
 
 
+def test_a_byte_rate_in_the_trace_is_not_written_in_scientific_notation(tmp_path):
+    # {:g} switches to exponent form at 1e6. Every column the trace carried
+    # before this task stayed under it -- RAM is divided by 1024**3 on the way in
+    # and lands at 32.0 -- and the byte rates are the first that do not: a
+    # 100 Mbit link is 12,500,000.0 B/s, which {:g} wrote as "1.25e+07".
+    # Parseable, and not what a human wants from a file whose whole point is
+    # that they can read it.
+    from history import HistoryLog
+
+    path = tmp_path / "history.log"
+    log = HistoryLog(path)
+    log.enable()
+    log.write(Snapshot(ts=1.0, cpu_pct=5.0, ram_total_gb=32.0,
+                      net_down_bytes_per_sec=123456789.0, net_up_bytes_per_sec=12500000.0))
+    header, row = path.read_text(encoding="utf-8").strip().splitlines()
+    columns = row.split(",")
+    assert "e" not in row and "E" not in row, f"scientific notation in the trace: {row}"
+    assert columns[Snapshot.CSV_COLUMNS.index("net_down_bytes_per_sec")] == "123456789.0"
+    assert columns[Snapshot.CSV_COLUMNS.index("net_up_bytes_per_sec")] == "12500000.0"
+    # The other columns keep the shape they always had: repr is the same
+    # shortest round-tripping spelling everywhere, not a per-column rule.
+    assert columns[Snapshot.CSV_COLUMNS.index("ram_total_gb")] == "32.0"
+    assert columns[0] == "1.0" and columns[1] == "5.0"
+    assert header.split(",") == list(Snapshot.CSV_COLUMNS)
+
+
+@pytest.mark.parametrize(
+    "value", [0.0, 1.0, 5.5, 32.0, 61.25, 999.9, 1e6 - 1, 1e6, 1.0e12, 0.1 + 0.2],
+)
+def test_a_trace_value_round_trips_through_repr(value):
+    # repr is the shortest spelling that parses back to the same float, so the
+    # trace keeps every digit instead of {:g}'s six significant figures -- which
+    # is the other half of why {:g} was the wrong formatter here.
+    from history import _csv
+
+    assert float(_csv(value)) == value
+    assert _csv(value) == repr(value)
+    assert "e" not in _csv(value)
+
+
 def test_no_row_is_appended_after_disable_has_returned(tmp_path):
     """A row must not land in a trace that has already been switched off.
 
@@ -552,10 +598,7 @@ def test_no_row_is_appended_after_disable_has_returned(tmp_path):
     log.write(Snapshot(cpu_pct=9.0, ts=9.0))
     assert log.enabled is False
     lines = (tmp_path / "history.log").read_text(encoding="utf-8").strip().splitlines()
-    # The blank tail is built from the column count rather than written out, so
-    # adding a column does not turn this into a test that has to be edited.
-    blank = ",".join([""] * (len(Snapshot.CSV_COLUMNS) - 2))
-    assert lines == [",".join(row.as_dict().keys()), f"1,1,{blank}"]
+    assert lines == [",".join(row.as_dict().keys()), _row(1.0, 1.0)]
 
 
 def test_the_header_is_written_once_when_two_writers_overlap(tmp_path):
@@ -592,7 +635,4 @@ def test_the_header_is_written_once_when_two_writers_overlap(tmp_path):
     header = ",".join(Snapshot(cpu_pct=1.0, ts=1.0).as_dict().keys())
     lines = (tmp_path / "history.log").read_text(encoding="utf-8").strip().splitlines()
     assert lines.count(header) == 1, f"the header was written {lines.count(header)} times"
-    # Built from the column count: a snapshot gains fields over time and these
-    # rows would otherwise have to be edited every time one is added.
-    blank = ",".join([""] * (len(Snapshot.CSV_COLUMNS) - 2))
-    assert lines == [header, f"1,1,{blank}", f"2,2,{blank}"]
+    assert lines == [header, _row(1.0, 1.0), _row(2.0, 2.0)]

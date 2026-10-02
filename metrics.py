@@ -38,11 +38,11 @@ _PERF_TOTAL = "_Total"
 # Every WMI query is a projection naming the columns it reads. That is not
 # tidiness: wmi's per-class convenience wrapper pulls every property of every
 # instance, and Win32_Processor measured 1044 ms that way on this machine
-# against 6 ms projected -- half of a two-second tick spent on a hardware
-# constant. The perf-counter class is the same story, 481 ms against 353 ms.
-# A projection naming a property the repository does not have is rejected
-# outright rather than returning a row without it, which is why the ceiling is
-# projected under a name this machine actually has.
+# against 6 ms projected. The perf-counter class is the same story, 481 ms
+# against 353 ms. A projection naming a property the repository does not have is
+# rejected outright rather than returning a row without it, which is why the two
+# nominal properties are projected separately: this machine has no
+# ProcessorFrequency, so a projection naming both fails as a whole.
 _PERF_RATIO_WQL = (
     "SELECT Name, PercentProcessorPerformance FROM "
     "Win32_PerfFormattedData_Counters_ProcessorInformation"
@@ -56,6 +56,16 @@ _NOMINAL_SOURCES = (
     ("SELECT MaxClockSpeed FROM Win32_Processor", "MaxClockSpeed"),
     ("SELECT ProcessorFrequency FROM Win32_Processor", "ProcessorFrequency"),
 )
+
+# The ceiling PercentProcessorPerformance is believed to. It is a percentage of
+# the nominal clock: 100 is nominal and above it is turbo. The bound has to clear
+# every boost ratio real silicon reaches -- the widest is a ~3.7 GHz Xeon over a
+# 2.4 GHz base, about 154% -- while still rejecting values no counter could have
+# produced. Nothing clocks a CPU at twice nominal, so 200 is the honest place to
+# stop; a plausible turbo figure has to keep working, so this is a ceiling and
+# not a target. It is a ceiling only: positivity and finiteness are _speed()'s
+# job, so that one gate covers the nominal and this signal alike.
+_PERF_RATIO_MAX = 200.0
 
 # Adapters whose name is the only thing that identifies them. The loopback
 # pseudo-interface is on every Windows box and its counters move with whatever
@@ -92,11 +102,14 @@ class Snapshot:
 
 
 def _empty(keys) -> dict[str, float | None]:
+    """One None per field, the shape a source that could not be read returns.
+
+    Takes the key tuple rather than being wrapped per source: the CPU clock and
+    the network already call it that way, and a one-line _empty_gpu beside
+    them was the odd one out -- a name that had to be kept in step with
+    GPU_KEYS by hand for no gain.
+    """
     return dict.fromkeys(keys)
-
-
-def _empty_gpu() -> dict[str, float | None]:
-    return _empty(GPU_KEYS)
 
 
 def _wmi_video_controllers() -> list[Any]:
@@ -117,7 +130,7 @@ def wmi_fallback() -> dict[str, float | None]:
     percentage wearing the costume of a measurement, so it is gone: load and
     temperature come back as None and the panel shows a dash.
     """
-    out = _empty_gpu()
+    out = _empty(GPU_KEYS)
     controllers = _wmi_video_controllers()
     if not controllers:
         return out
@@ -181,7 +194,7 @@ class GpuProbe:
         if self._handle is None:
             return wmi_fallback()
         nvml, handle = self._nvml, self._handle
-        out = _empty_gpu()
+        out = _empty(GPU_KEYS)
         try:
             out["gpu_pct"] = float(nvml.nvmlDeviceGetUtilizationRates(handle).gpu)
         except Exception:
@@ -216,21 +229,63 @@ def _psutil_nominal_mhz() -> float | None:
     return float(maximum) if maximum else None
 
 
+def _speed(value: Any) -> float | None:
+    """`value` as a positive, finite number, or None if it is not one.
+
+    One gate for both readings this module derives from a counter, because a
+    truthiness test passes a negative, a NaN and an infinity -- all perfectly
+    truthy -- and each of those reaches the panel as a fabricated number. 0 is
+    included: a driver with nothing to report is not reporting a ceiling, and a
+    perf counter's zero is its not-collected-yet sentinel.
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) and number > 0.0 else None
+
+
 class CpuClockProbe:
     """Nominal clock from WMI; live clock derived from the performance counter.
 
     One WMI connection for the life of the process, the way GpuProbe holds one
     NVML handle: wmi.WMI() opens a COM connection, so building one on a
     two-second tick means reconnecting 1800 times an hour for a number that
-    changes in the hundredths of a megahertz.
+    changes in the hundredths of a megahertz. It is rebuilt on demand when a
+    query fails, so a WMI service that restarts mid-session heals instead of
+    leaving the clock dashed for the rest of it.
 
-    The cost of what is left, measured on this machine over 10 calls: 408 ms per
-    read, of which ~350 ms is the perf-counter provider itself and ~6 ms the
-    nominal projection. SystemProbe.sample() comes to 524 ms against a 2000 ms
-    tick, so this is a 26% duty cycle -- on the sampler's own thread, never the
-    GUI's. That is the price of the only real OS signal for the clock, and the
-    floor it is measured against is the provider, not this code: the
-    unprojected forms of the same two queries cost 1044 ms and 481 ms.
+    THE COST, measured over 12 calls on this machine. `SystemProbe.sample()` is
+    ~530 ms of wall time and ~140 ms of process CPU, so **7% of a core** -- not
+    the 26% an earlier version of this note claimed, which mistook latency for
+    throughput. About 70% of the wall figure is this thread *blocked* in the
+    WMI provider rather than computing; over the same 12 calls the three WmiPrvSE
+    hosts burned ~94 ms between them, which is the provider's own cost and is
+    outside this process entirely.
+
+    7% of a core on a worker thread is the price of the only real OS signal for
+    the clock, and the GUI is provably unaffected: main.py samples on a QThread
+    and the snapshot is only handed to the GUI thread afterwards.
+
+    It is also latency, not throughput, and that is the property that makes it
+    acceptable: `ts` is stamped *after* the sample has been taken, so a reading
+    that took 530 ms to arrive is labelled 530 ms old rather than being passed
+    off as fresh. A panel that rendered a stale number as a current one is the
+    bug this probe was written to fix; the cost buys an honest timestamp, not a
+    fast one.
+
+    That wall figure is not a floor, and the obvious next reader should know it.
+    `ctypes` against `pdh.dll` -- `PdhCollectQueryData` then
+    `PdhGetFormattedCounterValue` on
+    `\\Processor Information(0,0)\\% Processor Performance` -- returns the same
+    value in **~0.018 ms**, stdlib only, no new dependency: roughly 20000x less
+    latency for the same signal. It is not a drop-in replacement, and no code
+    here attempts it: a wildcard instance array returns `PDH_CSTATUS_INVALID_DATA`,
+    the single-instance form needs two collections before the first value is
+    valid, and keeping the average over all logical processors means one query
+    handle per processor -- twelve on this machine. That is about 100 lines of
+    ctypes and a re-derivation of the averaging rule. Tracked as the open
+    follow-up in .superpowers/sdd/progress.md.
     """
 
     def __init__(self, wmi: Any | None = None, nominal_max: Callable[[], float | None] | None = None) -> None:
@@ -243,6 +298,8 @@ class CpuClockProbe:
         self._wmi = wmi
         self._conn: Any | None = None
         self._nominal_max = nominal_max or _psutil_nominal_mhz
+        self._nominal: float | None = None
+        self._reconnected = False
         if wmi is not None:
             try:
                 self._conn = wmi.WMI()
@@ -251,28 +308,77 @@ class CpuClockProbe:
                 self._conn = None
 
     def _query(self, wql: str) -> list[Any]:
+        """Rows for `wql`, rebuilding the connection once if the handle has gone.
+
+        `_query_once` answers None for "this handle did not work", which is not
+        the same answer as "no rows" and is what tells the two apart here: the
+        first is worth a reconnect, the second is a measurement of nothing.
+        """
+        rows = self._query_once(wql)
+        if rows is not None:
+            return rows
+        self._reconnect()
+        rows = self._query_once(wql)
+        return rows if rows is not None else []
+
+    def _query_once(self, wql: str) -> list[Any] | None:
         if self._conn is None:
-            return []
+            return None
         try:
             return list(self._conn.query(wql))
         except Exception:
             logger.info("WMI query failed: %s", wql, exc_info=True)
-            return []
+            return None
+
+    def _reconnect(self) -> None:
+        """Replace a handle that has gone stale, at most once per read.
+
+        The connection is cached for the life of the process, and a WMI service
+        that restarts mid-session leaves the cached handle unusable: every later
+        query fails, the nominal falls back to psutil and the derived clock
+        reads -- for the rest of the session however many ticks go by. One
+        reconnect per read rather than one per query, because a service that is
+        genuinely down should be failed fast instead of being reconnected to
+        three times a tick for nothing.
+        """
+        self._conn = None
+        if self._wmi is None or self._reconnected:
+            return
+        self._reconnected = True
+        try:
+            self._conn = self._wmi.WMI()
+            logger.info("WMI connection rebuilt for the CPU clock")
+        except Exception:
+            logger.info("WMI still unavailable for the CPU clock", exc_info=True)
 
     def _nominal_mhz(self) -> float | None:
-        """The CPU's nominal clock, in MHz, from whichever source answers."""
+        """The CPU's nominal clock, in MHz, from whichever source answers.
+
+        Read once and remembered: the ceiling is a property of the installed
+        part, so re-asking it every two seconds buys nothing and costs 6.9 ms a
+        tick. A *failure* is not remembered, so a provider that was not ready at
+        startup -- or a WMI service that comes back later -- is asked again
+        rather than leaving the row dashed for the rest of the session.
+
+        A speed is only a speed if it is finite and positive. `if speed:` was a
+        truthiness test, and a negative, NaN or infinite ceiling is perfectly
+        truthy: -4501 multiplies straight into a negative clock on the panel.
+        """
+        if self._nominal is not None:
+            return self._nominal
         for wql, column in _NOMINAL_SOURCES:
             for row in self._query(wql):
-                speed = getattr(row, column, None)
-                # 0 is a driver with nothing to report, not a ceiling.
-                if speed:
-                    return float(speed)
+                speed = _speed(getattr(row, column, None))
+                if speed is not None:
+                    self._nominal = speed
+                    return speed
         try:
-            fallback = self._nominal_max()
+            fallback = _speed(self._nominal_max())
         except Exception:
             logger.warning("nominal CPU frequency failed", exc_info=True)
             return None
-        return float(fallback) if fallback else None
+        self._nominal = fallback
+        return fallback
 
     def _performance_ratio(self) -> float | None:
         """Mean PercentProcessorPerformance over the logical processors, in percent.
@@ -281,26 +387,43 @@ class CpuClockProbe:
         multiplier: 99.2 means 99.2% of nominal. It moves very little -- 99.0
         idle, 99.5 under load -- but it is real OS data, where psutil's current
         is a constant.
+
+        Only the per-processor rows are averaged. `_Total` is a summary *of*
+        them, so with no per-processor row there is nothing to average and the
+        answer is None. Averaging the summary instead would have been worse than
+        nothing: it reads 100 on an idle machine, which multiplies out to the
+        nominal exactly and reproduces, byte for byte, the frozen psutil
+        constant this probe exists to remove.
+
+        The mean is then held to a plausible band, because a formatted perf
+        counter is not a validated measurement and hands over whatever it was
+        handed. Without one this code rendered 0 as 0.00 GHz, -42 as -1.89 GHz,
+        inf as inf, and 255 as 11.48 GHz on a 4.5 GHz part -- all measured, not
+        guessed.
         """
-        rows = self._query(_PERF_RATIO_WQL)
-        logical = [row for row in rows if _PERF_TOTAL not in str(getattr(row, "Name", ""))]
+        rows = [
+            row for row in self._query(_PERF_RATIO_WQL)
+            if _PERF_TOTAL not in str(getattr(row, "Name", ""))
+        ]
         ratios = []
-        for row in logical or rows:
+        for row in rows:
             raw = getattr(row, "PercentProcessorPerformance", None)
             if raw is None:
                 continue  # one processor's counter missing is not a zero reading
-            try:
-                value = float(raw)
-            except (TypeError, ValueError):
-                continue
-            if math.isnan(value):
-                continue
-            ratios.append(value)
+            ratio = _speed(raw)
+            # _speed has already dropped anything not positive and finite -- NaN
+            # and both infinities included -- so all that is left to reject here
+            # is a positive value above any clock a CPU can run at. A row outside
+            # the bound is skipped rather than voiding the mean, so one garbled
+            # core does not cost the panel the other eleven.
+            if ratio is not None and ratio <= _PERF_RATIO_MAX:
+                ratios.append(ratio)
         if not ratios:
             return None
         return sum(ratios) / len(ratios)
 
     def read(self) -> dict[str, float | None]:
+        self._reconnected = False
         out = _empty(CPU_CLOCK_KEYS)
         nominal = self._nominal_mhz()
         out["cpu_nominal_mhz"] = nominal
@@ -359,19 +482,30 @@ class NetProbe:
             return out  # a rate is bytes over seconds; with no seconds, no rate
 
         for index, key in enumerate(NET_KEYS, start=1):
-            # A counter that went backwards means the adapter was re-enumerated,
-            # not that bytes un-transferred: zero is the conservative reading.
-            moved = max(0.0, now[index] - previous[index])
+            moved = now[index] - previous[index]
+            if moved < 0.0:
+                # The adapter was re-enumerated and its counters restarted, so
+                # the bytes since the last sample are unknown rather than zero.
+                # Averaging the unknown towards the old figure is the wrong
+                # shape of answer: an EMA decays from its peak, and this was
+                # measured decaying 300 -> 195 -> 127 -> 82 -> 54 -> 35 -> 23
+                # KB/s, six ticks of throughput nobody sent after the link died.
+                # A dead average is replaced, not averaged away.
+                out[key] = self._seed(key, 0.0)
+                continue
             out[key] = self._smooth(key, moved / elapsed)
         return out
+
+    def _seed(self, key: str, raw: float) -> float:
+        self._averaged[key] = raw
+        return raw
 
     def _smooth(self, key: str, raw: float) -> float:
         previous = self._averaged[key]
         if previous is None:
             # The first measured sample is the average. Averaging it against
             # nothing would halve the first real figure the panel ever shows.
-            self._averaged[key] = raw
-            return raw
+            return self._seed(key, raw)
         self._averaged[key] = NET_SMOOTHING * raw + (1.0 - NET_SMOOTHING) * previous
         return self._averaged[key]
 

@@ -250,4 +250,13 @@ class HistoryLog:
 
 
 def _csv(value: float | None) -> str:
-    return "" if value is None else f"{value:g}"
+    """One cell, or empty for a reading that was never taken.
+
+    repr, not {:g}. {:g} switches to exponent form at 1e6, which no column of
+    this trace managed until the byte rates arrived -- a 100 Mbit link is
+    12500000.0 B/s and was written as "1.25e+07". Parseable, and not what a
+    human wants from a file whose whole point is that they can read it. repr is
+    also the shortest spelling that parses back to the same float, so nothing
+    is rounded away the way six significant figures rounded a byte rate.
+    """
+    return "" if value is None else repr(value)

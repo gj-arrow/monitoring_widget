@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from typing import Any, Callable
 
 logger = logging.getLogger("widget.metrics")
@@ -71,8 +71,13 @@ def wmi_fallback() -> dict[str, float | None]:
     controllers = _wmi_video_controllers()
     if not controllers:
         return out
+    # AdapterRAM is a signed int32, so every card with 2 GB or more of VRAM
+    # overflows it and arrives negative -- the 12 GB card on this machine
+    # reports -1048576, which is 0xFF000000. Only a strictly positive value is
+    # a size; anything else was never measured, and dividing it anyway
+    # produced -0.0 here and -1.0 for an 8 GB card.
     adapter_ram = getattr(controllers[0], "AdapterRAM", 0) or 0
-    if adapter_ram:
+    if adapter_ram > 0:
         out["vram_total_gb"] = round(float(adapter_ram) / _GB, 1)
     return out
 
@@ -182,7 +187,8 @@ class SystemProbe:
             current = getattr(freq, "current", None)
             maximum = getattr(freq, "max", None)
             values["cpu_mhz"] = float(current) if current else None
-            # Some machines report max == 0; a ratio against it would divide by zero.
+            # psutil can report max == 0, and 0 is not a measurement of the
+            # CPU's ceiling -- it is dropped rather than passed on as a maximum.
             values["cpu_max_mhz"] = float(maximum) if maximum else None
         except Exception:
             logger.warning("cpu_freq failed", exc_info=True)

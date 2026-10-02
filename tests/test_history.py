@@ -1,3 +1,6 @@
+import logging
+from pathlib import Path
+
 from PyQt6.QtCore import QPointF
 
 from history import History, resample
@@ -226,3 +229,53 @@ def test_history_log_rotation_takes_the_next_free_suffix(tmp_path):
 
     assert (tmp_path / "history.log.1").read_text(encoding="utf-8") == "earlier,still\n9,9\n"
     assert (tmp_path / "history.log.2").read_text(encoding="utf-8") == "a,b\n1,2\n"
+
+
+def test_history_log_refuses_to_write_when_a_stale_trace_cannot_be_rotated(tmp_path, monkeypatch, caplog):
+    # Rotation is what keeps two schemas out of one file. If it fails, the only
+    # honest move left is to stop: appending would write a new header and new
+    # rows into a file whose existing rows answer to different columns, and
+    # nothing downstream can tell which is which afterwards.
+    from history import HistoryLog
+    from metrics import Snapshot
+
+    stale = "t,cpu,gpu,temp\n0,1,2,3\n"
+    path = tmp_path / "history.log"
+    path.write_text(stale, encoding="utf-8")
+
+    def locked(self, target):
+        raise OSError("the file is open in another program")
+
+    monkeypatch.setattr(Path, "replace", locked)
+
+    log = HistoryLog(path)
+    log.enable()
+    with caplog.at_level(logging.WARNING, logger="widget.history"):
+        log.write(Snapshot(cpu_pct=7.0, ts=2.0))
+
+    assert path.read_text(encoding="utf-8") == stale
+    assert log.enabled is False
+    assert not (tmp_path / "history.log.1").exists()
+    assert any("cannot be rotated" in r.getMessage() for r in caplog.records)
+
+
+def test_history_log_treats_a_deleted_file_as_a_new_trace(tmp_path, caplog):
+    # The file can vanish between enable() and the first write. That is not a
+    # file to rotate, so the log must not claim otherwise: the append recreates
+    # it with a correct header and nothing is reported as unreadable.
+    from history import HistoryLog
+    from metrics import Snapshot
+
+    path = tmp_path / "history.log"
+    log = HistoryLog(path)
+    log.enable()
+    path.unlink()
+
+    with caplog.at_level(logging.WARNING, logger="widget.history"):
+        log.write(Snapshot(cpu_pct=7.0, ts=2.0))
+
+    header, row = path.read_text(encoding="utf-8").strip().splitlines()
+    assert header == ",".join(Snapshot(cpu_pct=7.0, ts=2.0).as_dict().keys())
+    assert row == "2,7,,,,,,,,"
+    assert not [r for r in caplog.records if "rotat" in r.getMessage()]
+    assert not [r for r in caplog.records if "unreadable" in r.getMessage()]

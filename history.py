@@ -125,7 +125,9 @@ class HistoryLog:
         try:
             if not self._header_checked:
                 self._header_checked = True
-                self._adopt_existing_header(values)
+                if not self._adopt_existing_header(values):
+                    self._enabled = False
+                    return
             with self._path.open("a", encoding="utf-8") as handle:
                 # Both strings come from one dict, so they agree within a
                 # single write. Across runs the header is checked once, on the
@@ -139,7 +141,7 @@ class HistoryLog:
             logger.warning("history log write failed, switching off: %s", exc)
             self._enabled = False
 
-    def _adopt_existing_header(self, values: dict[str, float | None]) -> None:
+    def _adopt_existing_header(self, values: dict[str, float | None]) -> bool:
         """Decide once whether a trace written by an earlier run can be extended.
 
         The columns come from the snapshot, so they are only knowable here. A
@@ -148,30 +150,38 @@ class HistoryLog:
         header of another: the arity of every row would look fine while each
         column after the first was reading the wrong value. Such a file is
         rotated aside -- kept, never overwritten -- and the new trace starts
-        with a correct header. A header that cannot be read is not confirmed
-        either, and is rotated for the same reason.
+        with a correct header.
+
+        Returns False when the file must not be written to at all: it holds
+        columns this build does not write and it could not be moved aside, so
+        appending would mix the two schemas in one file for good.
         """
+        if not self._path.exists():
+            return True  # nothing there yet; the append below starts a new trace
         expected = ",".join(values.keys())
         try:
             with self._path.open("r", encoding="utf-8") as handle:
                 first = handle.readline().strip()
         except OSError as exc:
-            logger.warning("history log header unreadable, rotating: %s", exc)
+            logger.warning("history log unreadable, rotating it aside: %s", exc)
             first = None
         if first is not None and first == expected:
             self._has_header = True
-            return
+            return True
         if first == "":
-            return  # nothing there yet; the header below writes it
+            return True  # empty file: the append below writes the header
         rotated = self._free_rotation_path()
         try:
             self._path.replace(rotated)
         except OSError as exc:
-            logger.warning("history log rotation failed: %s", exc)
-            return
+            logger.warning(
+                "history log has foreign columns and cannot be rotated, switching off: %s", exc
+            )
+            return False
         logger.warning(
             "history log columns do not match this build, moved to %s", rotated
         )
+        return True
 
     def _free_rotation_path(self) -> Path:
         number = 0

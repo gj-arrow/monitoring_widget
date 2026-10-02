@@ -2,6 +2,8 @@ import logging
 from dataclasses import fields
 from types import SimpleNamespace
 
+import pytest
+
 import metrics
 from metrics import GpuProbe, Snapshot, SystemProbe, wmi_fallback
 
@@ -24,10 +26,12 @@ class FakeNvml:
 
     NVML_TEMPERATURE_GPU = 0
 
-    def __init__(self, fail_init=False, fail_name=False):
+    def __init__(self, fail_init=False, fail_name=False, fail_on=()):
+        """`fail_on` names the reads to break: "util", "temp", "mem"."""
         self.calls = {}
         self._fail_init = fail_init
         self._fail_name = fail_name
+        self._fail_on = frozenset(fail_on)
 
     def _count(self, name):
         self.calls[name] = self.calls.get(name, 0) + 1
@@ -49,14 +53,20 @@ class FakeNvml:
 
     def nvmlDeviceGetUtilizationRates(self, handle):
         self._count("util")
+        if "util" in self._fail_on:
+            raise RuntimeError("utilization is unavailable")
         return FakeUtil(42)
 
     def nvmlDeviceGetTemperature(self, handle, sensor):
         self._count("temp")
+        if "temp" in self._fail_on:
+            raise RuntimeError("temperature sensor is unavailable")
         return 61
 
     def nvmlDeviceGetMemoryInfo(self, handle):
         self._count("mem")
+        if "mem" in self._fail_on:
+            raise RuntimeError("memory info is unavailable")
         return FakeMemory(2 * GB, 8 * GB)
 
 
@@ -125,13 +135,29 @@ def test_probe_stays_available_when_only_the_device_name_lookup_fails(caplog):
 
 
 def test_wmi_fallback_does_not_invent_a_load_percentage(monkeypatch):
-    controller = SimpleNamespace(AdapterRAM=8 * GB, CurrentClockFrequency=900, MaxClockSpeed=1800)
+    # 1 GB is the largest size WMI can actually report: AdapterRAM is a signed
+    # int32, so 2 GB and up wraps negative (see the test below). The old
+    # fixture said 8 GB, a value no real machine can return, so the happy path
+    # was covered by a test that could not happen and the real one went unseen.
+    controller = SimpleNamespace(AdapterRAM=1 * GB, CurrentClockFrequency=900, MaxClockSpeed=1800)
     monkeypatch.setattr(metrics, "_wmi_video_controllers", lambda: [controller])
     result = wmi_fallback()
     assert result["gpu_pct"] is None
     assert result["gpu_temp_c"] is None
     assert result["vram_used_gb"] is None
-    assert result["vram_total_gb"] == 8.0
+    assert result["vram_total_gb"] == 1.0
+
+
+@pytest.mark.parametrize("adapter_ram", [-1048576, 0, None])
+def test_wmi_fallback_reports_a_wrapped_adapter_ram_as_unmeasured(monkeypatch, adapter_ram):
+    # -1048576 is 0xFF000000, what this machine's 12 GB RTX 3060 actually
+    # reports: the real size overflowed the signed int32 and came back
+    # negative. Dividing it produced -0.0 here and -1.0 for an 8 GB card --
+    # invented numbers wearing the costume of a measurement. A size that is not
+    # strictly positive was never measured and has to come back as None.
+    controller = SimpleNamespace(AdapterRAM=adapter_ram)
+    monkeypatch.setattr(metrics, "_wmi_video_controllers", lambda: [controller])
+    assert wmi_fallback()["vram_total_gb"] is None
 
 
 def test_wmi_fallback_handles_no_controllers(monkeypatch):
@@ -187,6 +213,63 @@ def test_sample_reports_none_when_a_source_raises():
     assert snap.ts > 0.0
 
 
+@pytest.mark.parametrize("failing", ["cpu_pct", "cpu_freq", "ram"])
+def test_sample_isolates_one_failing_source(failing):
+    # The test above breaks every source at once, so it cannot tell three
+    # separate guards from one: collapsing them into a single try would leave
+    # it green while one dead sensor blanked the whole panel. One source fails
+    # here and every other reading must survive.
+    def boom():
+        raise RuntimeError("sensor bus is on fire")
+
+    sources = {
+        "cpu_pct": lambda: 12.5,
+        "cpu_freq": lambda: SimpleNamespace(current=3600.0, max=4500.0),
+        "ram": lambda: SimpleNamespace(used=11.4 * GB, total=32 * GB),
+    }
+    readable = {
+        "cpu_pct": 12.5,
+        "cpu_mhz": 3600.0,
+        "cpu_max_mhz": 4500.0,
+        "ram_used_gb": 11.4,
+        "ram_total_gb": 32.0,
+    }
+    # cpu_freq is the only source that fills two fields, so it takes both down.
+    lost = {"cpu_pct": ("cpu_pct",), "cpu_freq": ("cpu_mhz", "cpu_max_mhz"),
+            "ram": ("ram_used_gb", "ram_total_gb")}[failing]
+
+    sources[failing] = boom
+    snap = SystemProbe(gpu=FakeGpu({}), **sources).sample()
+
+    for field, value in readable.items():
+        if field in lost:
+            assert getattr(snap, field) is None, field
+        else:
+            assert getattr(snap, field) == value, field
+    assert snap.ts > 0.0
+
+
+@pytest.mark.parametrize(
+    "failing,field,expected",
+    [
+        ("util", "gpu_pct",
+         {"gpu_pct": None, "gpu_temp_c": 61.0, "vram_used_gb": 2.0, "vram_total_gb": 8.0}),
+        ("temp", "gpu_temp_c",
+         {"gpu_pct": 42.0, "gpu_temp_c": None, "vram_used_gb": 2.0, "vram_total_gb": 8.0}),
+        ("mem", "vram_used_gb",
+         {"gpu_pct": 42.0, "gpu_temp_c": 61.0, "vram_used_gb": None, "vram_total_gb": None}),
+    ],
+)
+def test_probe_isolates_one_failing_nvml_read(failing, field, expected):
+    # Same gap in the GPU probe: three reads, three guards, and nothing said
+    # so. Each case states the readings that must survive, and the dead one
+    # must be None -- reporting 0% load or 0 GB would be a fabricated reading.
+    probe = GpuProbe(nvml=FakeNvml(fail_on=(failing,)))
+    values = probe.read()
+    assert values == expected
+    assert values[field] is None
+
+
 def test_snapshot_as_dict_round_trips():
     snap = Snapshot(cpu_pct=5.0)
     assert snap.as_dict()["cpu_pct"] == 5.0
@@ -194,9 +277,19 @@ def test_snapshot_as_dict_round_trips():
 
 
 def test_real_probe_runs_on_this_machine():
-    probe = SystemProbe()
+    gpu = GpuProbe()
+    probe = SystemProbe(gpu=gpu)
     snap = probe.sample()
     assert snap.ram_total_gb and snap.ram_total_gb > 0
+    # Where NVML works, the GPU numbers must be real ones -- this test used to
+    # pass with a completely broken GPU path because it only looked at RAM.
+    # On a machine without an NVIDIA card there is nothing to assert, and the
+    # test must not become a hardware requirement, so it stays tolerant.
+    if gpu.available:
+        assert snap.gpu_pct is not None
+        assert snap.gpu_temp_c is not None
+        assert snap.vram_used_gb and snap.vram_used_gb > 0
+        assert snap.vram_total_gb and snap.vram_total_gb > 0
 
 
 def test_history_log_stays_off_when_the_file_cannot_be_opened(tmp_path):

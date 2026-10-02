@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
 from collections import deque
 from pathlib import Path
 
@@ -93,30 +94,55 @@ def resample(points: list[float], width: int) -> list[QPointF]:
 
 
 class HistoryLog:
-    """Appends one CSV row per tick. Off by default; enabled from the tray."""
+    """Appends one CSV row per tick. Off by default; enabled from the tray.
+
+    Two threads reach this object. The collector writes a row on every tick,
+    and the tray toggle calls enable()/disable() from the GUI thread, so the
+    flags they share and the append they guard are held under a lock. It is a
+    plain threading.Lock rather than a QMutex because nothing here ever waits:
+    a writer that could not take the lock would have to be abandoned or
+    retried, and neither is worth a condition variable for an append to a
+    local file.
+
+    The lock covers the whole of write() -- the enabled flag, the header
+    verdict and the append -- because anything narrower leaves the two races
+    that matter: a row landing after disable() has returned, and two threads
+    that both find no header each writing one.
+
+    It is deliberately not held across enable()'s mkdir and touch. Those can
+    block for a long time on a slow or locked-down path, and whoever waits
+    behind them would be the sampling thread rather than a user watching a
+    menu, which is the wrong way round. Nothing there reads a flag.
+    """
 
     def __init__(self, path: Path | str = "metrics_history.log") -> None:
         self._path = Path(path)
         self._enabled = False
         self._has_header = False
         self._header_checked = False
+        self._lock = threading.Lock()
 
     @property
     def enabled(self) -> bool:
         return self._enabled
 
     def enable(self) -> bool:
+        # The filesystem first and unlocked, the flag under the lock: a
+        # failure must leave the object exactly as it found it, which is what
+        # returning False without touching a flag has always meant.
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             self._path.touch(exist_ok=True)
         except OSError as exc:
             logger.warning("history log unavailable, staying off: %s", exc)
             return False
-        self._enabled = True
+        with self._lock:
+            self._enabled = True
         return True
 
     def disable(self) -> None:
-        self._switch_off()
+        with self._lock:
+            self._switch_off()
 
     def _switch_off(self) -> None:
         """Stop writing, and forget what was decided about the file.
@@ -126,36 +152,46 @@ class HistoryLog:
         enable() -- which is what the tray menu does -- skip the check and
         append this build's columns to a trace whose header belonged to another
         build, which is the exact schema mixing the check exists to prevent.
+
+        Callers hold the lock. This is the unlocked half of disable(), so that
+        write() can switch itself off from inside its own critical section
+        without reaching for a reentrant lock.
         """
         self._enabled = False
         self._has_header = False
         self._header_checked = False
 
     def write(self, snapshot) -> None:
-        if not self._enabled:
-            return
-        values = snapshot.as_dict()
-        try:
-            if not self._header_checked:
-                if not self._adopt_existing_header(values):
-                    self._switch_off()
-                    return
-                # Set only now that the check has run to completion: marking it
-                # done first left it marked when adopting raised part-way
-                # through, and the retry after a re-enable skipped the check.
-                self._header_checked = True
-            with self._path.open("a", encoding="utf-8") as handle:
-                # Both strings come from one dict, so they agree within a
-                # single write. Across runs the header is checked once, on the
-                # first write, because only then is this build's column list
-                # knowable.
-                if not self._has_header:
-                    handle.write(",".join(values.keys()) + "\n")
-                    self._has_header = True
-                handle.write(",".join(_csv(v) for v in values.values()) + "\n")
-        except OSError as exc:
-            logger.warning("history log write failed, switching off: %s", exc)
-            self._switch_off()
+        # The whole body is the critical section, and deliberately so: the
+        # append has to be atomic with the decision to write a header, and the
+        # enabled flag has to be read and acted on without disable() slipping
+        # in between. The cost is one uncontended acquire, which is a rounding
+        # error against the open-and-append it guards.
+        with self._lock:
+            if not self._enabled:
+                return
+            values = snapshot.as_dict()
+            try:
+                if not self._header_checked:
+                    if not self._adopt_existing_header(values):
+                        self._switch_off()
+                        return
+                    # Set only now that the check has run to completion: marking it
+                    # done first left it marked when adopting raised part-way
+                    # through, and the retry after a re-enable skipped the check.
+                    self._header_checked = True
+                with self._path.open("a", encoding="utf-8") as handle:
+                    # Both strings come from one dict, so they agree within a
+                    # single write. Across runs the header is checked once, on the
+                    # first write, because only then is this build's column list
+                    # knowable.
+                    if not self._has_header:
+                        handle.write(",".join(values.keys()) + "\n")
+                        self._has_header = True
+                    handle.write(",".join(_csv(v) for v in values.values()) + "\n")
+            except OSError as exc:
+                logger.warning("history log write failed, switching off: %s", exc)
+                self._switch_off()
 
     def _adopt_existing_header(self, values: dict[str, float | None]) -> bool:
         """Decide once whether a trace written by an earlier run can be extended.

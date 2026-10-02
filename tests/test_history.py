@@ -1,4 +1,5 @@
 import logging
+import threading
 from pathlib import Path
 
 import pytest
@@ -404,3 +405,186 @@ def test_history_log_rotates_a_trace_it_cannot_decode(tmp_path):
     header, row = path.read_text(encoding="utf-8").strip().splitlines()
     assert header == ",".join(Snapshot(cpu_pct=7.0, ts=2.0).as_dict().keys())
     assert row == "2,7,,,,,,,,"
+
+
+# --- two threads, one log -------------------------------------------------
+#
+# The collector writes a row every tick and the tray toggle calls
+# enable()/disable() from the GUI thread, so enable(), disable() and write()
+# race. Two threads hammering those in a loop reproduce nothing: the window
+# inside write() is one open-and-append wide, so the loop would have to be
+# enormous and even then it would only fail sometimes.
+#
+# So the interleaving is driven from outside. PausingPath is a Path that stops
+# the writer at a chosen instant inside write(), which turns the race into a
+# schedule instead of a probability -- and needs no seam in history.py, because
+# the filesystem is already part of what write() is doing while it is exposed.
+#
+# Each test's one wait is for something that must NOT happen: a caller
+# returning while a write is still in flight. With the lock it cannot return at
+# all, so the wait always expires and the assertion is one-sided -- correct code
+# cannot turn it red, and unlocked code is three attribute stores and returns
+# well inside the window.
+ESCAPE_WINDOW = 1.0
+
+
+class PausingHandle:
+    """Wraps the append handle and pauses once, just after the first line.
+
+    That first line is the header, and write() has not recorded writing it yet
+    when the pause happens: a second thread arriving here sees a file with no
+    header and writes its own.
+    """
+
+    def __init__(self, handle, paused, resume):
+        self._handle = handle
+        self._paused = paused
+        self._resume = resume
+
+    def write(self, text):
+        written = self._handle.write(text)
+        if not self._paused.is_set():
+            self._paused.set()
+            assert self._resume.wait(10.0), "the paused writer was never released"
+        return written
+
+    def __enter__(self):
+        self._handle.__enter__()
+        return self
+
+    def __exit__(self, *exc_info):
+        return self._handle.__exit__(*exc_info)
+
+
+class PausingPath:
+    """A Path that pauses the first appending writer at `stop_at`.
+
+    "before_append" -- inside write(), after it has read the enabled flag and
+    settled the header question, immediately before the file is opened to
+    append. A disable() that completes here is a row written into a trace the
+    user has just switched off.
+
+    "after_header" -- inside that same append, between the header line and the
+    first row, which is the only moment a second header can be produced.
+    """
+
+    def __init__(self, path, stop_at):
+        self._path = Path(path)
+        self._stop_at = stop_at
+        self.paused = threading.Event()
+        self.resume = threading.Event()
+
+    def open(self, mode="r", *args, **kwargs):
+        handle = self._path.open(mode, *args, **kwargs)
+        if "a" not in mode:
+            return handle
+        if self._stop_at == "after_header":
+            return PausingHandle(handle, self.paused, self.resume)
+        self.paused.set()
+        assert self.resume.wait(10.0), "the paused writer was never released"
+        return handle
+
+    def __getattr__(self, name):
+        return getattr(self._path, name)
+
+
+def hooked_log(tmp_path, stop_at="before_append"):
+    """An enabled HistoryLog whose path pauses its first writer, and that path."""
+    from history import HistoryLog
+
+    path = tmp_path / "history.log"
+    hook = PausingPath(path, stop_at)
+    log = HistoryLog(path)
+    log._path = hook
+    assert log.enable() is True
+    return log, hook
+
+
+def run_guarded(failures, call):
+    """Run `call` on a thread, keeping its exception instead of losing it.
+
+    A thread that dies quietly is indistinguishable from a thread that finished
+    quickly, and the difference between those two is this test's whole subject.
+    """
+
+    def run():
+        try:
+            call()
+        except BaseException as exc:
+            failures.append(exc)
+
+    return run
+
+
+def test_no_row_is_appended_after_disable_has_returned(tmp_path):
+    """A row must not land in a trace that has already been switched off.
+
+    Unlocked, the writer reads the enabled flag, the toggle clears it and
+    returns, and the writer appends anyway -- one row past the point where the
+    user believes the trace stopped, which is the whole reason disable() exists.
+    """
+    from metrics import Snapshot
+
+    log, hook = hooked_log(tmp_path)
+    failures = []
+    row = Snapshot(cpu_pct=1.0, ts=1.0)
+
+    writer = threading.Thread(target=run_guarded(failures, lambda: log.write(row)))
+    writer.start()
+    assert hook.paused.wait(5.0), "the writer never reached the append"
+
+    toggler = threading.Thread(target=run_guarded(failures, log.disable))
+    toggler.start()
+    toggler.join(ESCAPE_WINDOW)
+    waited = toggler.is_alive()
+
+    hook.resume.set()
+    writer.join(5.0)
+    toggler.join(5.0)
+    assert not failures, f"a thread raised: {failures[0]!r}"
+
+    assert waited, "disable() returned while a write was still in flight"
+    # What the user asked for, now that the in-flight row has landed: the trace
+    # is closed, and a later sample adds nothing.
+    log.write(Snapshot(cpu_pct=9.0, ts=9.0))
+    assert log.enabled is False
+    lines = (tmp_path / "history.log").read_text(encoding="utf-8").strip().splitlines()
+    assert lines == [",".join(row.as_dict().keys()), "1,1,,,,,,,,"]
+
+
+def test_the_header_is_written_once_when_two_writers_overlap(tmp_path):
+    """Two writes must not both decide that the file has no header.
+
+    Unlocked, the first writer pauses with its header line on disk and no memory
+    of having written one, so the second writes a second header above a row that
+    belongs to the first -- the schema mixing that _adopt_existing_header()
+    exists to prevent, arriving from a different direction.
+    """
+    from metrics import Snapshot
+
+    log, hook = hooked_log(tmp_path, stop_at="after_header")
+    failures = []
+
+    writer = threading.Thread(
+        target=run_guarded(failures, lambda: log.write(Snapshot(cpu_pct=1.0, ts=1.0)))
+    )
+    writer.start()
+    assert hook.paused.wait(5.0), "the writer never reached the header line"
+
+    second = threading.Thread(
+        target=run_guarded(failures, lambda: log.write(Snapshot(cpu_pct=2.0, ts=2.0)))
+    )
+    second.start()
+    second.join(ESCAPE_WINDOW)
+    waited = second.is_alive()
+
+    hook.resume.set()
+    writer.join(5.0)
+    second.join(5.0)
+    assert not failures, f"a thread raised: {failures[0]!r}"
+
+    assert waited, "a second write ran inside the first one's append"
+    header = ",".join(Snapshot(cpu_pct=1.0, ts=1.0).as_dict().keys())
+    lines = (tmp_path / "history.log").read_text(encoding="utf-8").strip().splitlines()
+    assert lines.count(header) == 1, f"the header was written {lines.count(header)} times"
+    assert lines == [header, "1,1,,,,,,,,", "2,2,,,,,,,,"]

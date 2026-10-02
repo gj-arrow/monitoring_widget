@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import logging
 import time
-import traceback
 
 from PyQt6.QtCore import QPoint, Qt, pyqtSignal
 from PyQt6.QtGui import QPainter
@@ -32,13 +31,13 @@ logger = logging.getLogger("widget.overlay")
 WINDOW_TITLE = "System Monitor"
 CORNER_MARGIN = 10
 
-# Seconds between two render-failure records, whatever the faults are. update()
-# fires every theme.TICK_MS, so 300 s is 150 frames of silence between records:
-# a fault that never clears is announced at most 288 times a day instead of
-# 43 200, and still often enough that "still broken" shows up several times in
-# any working session. A fault that clears and comes back later does not wait
-# for this at all -- the first frame that paints cleanly drops the memo, and the
-# next failure is written out at once.
+# Seconds between two render-failure records, whatever the faults are, and
+# however many frames pass in between. update() fires every theme.TICK_MS, so
+# 300 s is 150 frames of silence between records: 288 a day for a fault that
+# never clears, for one that fails on every other frame, and for two faults
+# alternating -- any of which the frame count alone would turn into 43 200.
+# Long enough that the log stops growing with uptime, short enough that
+# "still broken" appears several times in a working session.
 PAINT_ERROR_LOG_INTERVAL = 300.0
 
 
@@ -54,7 +53,6 @@ class MonitorPanel(QWidget):
             key: History() for key in theme.METRICS_BY_KEY
         }
         self._drag_origin: QPoint | None = None
-        self._last_paint_error: str | None = None
         self._last_paint_log = float("-inf")
 
         self.setWindowTitle(WINDOW_TITLE)
@@ -117,34 +115,30 @@ class MonitorPanel(QWidget):
             paint(painter, self._snapshot, self._histories, self.current_alpha())
         except Exception:
             self._log_paint_failure()
-        else:
-            # A frame that painted cleanly makes the next fault news again.
-            self._last_paint_error = None
         finally:
             # end() in a finally, so neither a raise nor the guard above can
             # leave the painter holding the widget's paint device.
             painter.end()
 
     def _log_paint_failure(self) -> None:
-        """At most one record per PAINT_ERROR_LOG_INTERVAL, naming the newest fault.
+        """At most one record per PAINT_ERROR_LOG_INTERVAL. That is the whole rule.
 
-        The identity alone cannot bound this. It says whether the traceback
-        changed, and a changed traceback is exactly what two faults alternating
-        every frame -- or one message carrying a varying value, `expected 37.4`
-        -- produce on every single frame: 43 200 tracebacks a day, about 17 MB,
-        into a plain basicConfig with no rotation. That is the log-growth
-        problem this rewrite set out to fix, so the interval gates every record
-        rather than only the repeats.
+        An earlier version kept a memo of the traceback and let a failure through
+        immediately whenever the memo was empty, which a clean frame emptied.
+        That bypass was the last unbounded case: a renderer failing on every
+        other frame looks healthy half the time and still wrote 21 600 records
+        a day -- one per bad frame of 43 200 -- which is the log growth this
+        rewrite exists to remove. Nothing here is exempt from the floor.
 
-        What the identity still buys: the first failure after a healthy frame is
-        reported at once, since a clean frame drops the memo, and the record
-        written when the interval is up always carries the fault as it stands
-        then -- so a new fault is delayed, never lost.
+        The cost, stated rather than discovered later: a *different* fault
+        arriving while the floor is counting down is not reported until the floor
+        expires. That is acceptable because the panel is visibly broken and the
+        record on file already names a fault from this widget, and the record
+        written when the floor is up always carries the fault as it stands
+        then -- so the new one is delayed by at most one interval, never lost.
         """
-        already_reported = self._last_paint_error is not None
-        self._last_paint_error = traceback.format_exc()
         now = time.monotonic()
-        if already_reported and now - self._last_paint_log < PAINT_ERROR_LOG_INTERVAL:
+        if now - self._last_paint_log < PAINT_ERROR_LOG_INTERVAL:
             return
         self._last_paint_log = now
         logger.exception("panel paint failed")
@@ -233,6 +227,11 @@ class MonitorPanel(QWidget):
         super().hideEvent(event)
 
     def mouseDoubleClickEvent(self, event) -> None:
+        if event.button() != Qt.MouseButton.LeftButton:
+            # The right button asks for the tray menu. It has no business
+            # moving the panel, and none at all snapping it home.
+            super().mouseDoubleClickEvent(event)
+            return
         # Before the move, not after it: a double-click whose release was
         # swallowed leaves the grab armed, and the corner the panel is about to
         # jump to would carry a closed-hand cursor claiming it is being carried

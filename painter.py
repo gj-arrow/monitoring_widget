@@ -32,8 +32,14 @@ GRAPH_LINE_WIDTH = 1.4
 GRAPH_FILL_ALPHA = 0.22
 
 NET_LABEL_GAP = "  "
-DOWN_LABEL = "DN"
-UP_LABEL = "UP"
+# What goes in and what goes out of the machine, rather than the cable and its
+# direction: "UP" reads as the upload on a panel whose other row says "DN", and
+# as the faster of two cables on anything else. The pair is also uneven -- OUT is
+# a character wider -- so the header fit is measured (tests/test_painter.py
+# rasterises the widest string against a header with no text at all) rather than
+# assumed from the labels being two letters each.
+DOWN_LABEL = "IN"
+UP_LABEL = "OUT"
 
 # Decimal, unlike the binary GB the memory rows use. The unit has to change
 # where the figure resets to 1.0 -- 999.9 KB/s, then 1.0 MB/s -- which is what

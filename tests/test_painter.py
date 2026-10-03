@@ -559,6 +559,29 @@ def test_the_cpu_row_shows_the_derived_clock_beside_the_percentage(monkeypatch):
 # --- the header ------------------------------------------------------------
 
 
+def test_the_header_labels_the_two_directions_in_and_out(monkeypatch):
+    """IN and OUT, in that order: what goes in and what goes out of the machine.
+
+    DN and UP described the wire rather than the direction -- "up" is ambiguous
+    between upload and the faster cable -- and the pair is also uneven: OUT is a
+    character longer, which the fit is measured against rather than assumed. The
+    fit test below rasterises the string against a header with no text at all and
+    measures every pixel it touched, so a wider pair that still fits is proved
+    rather than hoped for.
+    """
+    texts = [text for text, _ in drawn_texts(monkeypatch, CALM, RAMPS)]
+    (header,) = [t for t in texts if "IN" in t or "OUT" in t]
+
+    assert header == "IN 7.3 KB/s  OUT 3.7 KB/s", header
+    assert "DN" not in header and "UP" not in header, (
+        f"the header still uses the old wire labels: {header}"
+    )
+    assert header.index("IN 7.3") < header.index("OUT 3.7"), (
+        "download first, upload second: the header and the CSV agree on which "
+        "figure is which without a legend"
+    )
+
+
 def test_the_header_no_longer_shows_the_system_label_or_the_sample_age(monkeypatch):
     """Both were asked for as the space the throughput now occupies."""
     texts = [text for text, _ in drawn_texts(monkeypatch, CALM, RAMPS)]
@@ -567,17 +590,17 @@ def test_the_header_no_longer_shows_the_system_label_or_the_sample_age(monkeypat
     assert not stale, f"the header still draws the sample age: {stale}"
     # The two direction labels live in one drawText call, so neither is a whole
     # string of its own: this says the check above is looking at real output.
-    assert "DN 7.3 KB/s  UP 3.7 KB/s" in texts
+    assert "IN 7.3 KB/s  OUT 3.7 KB/s" in texts
 
 
 def test_the_header_shows_both_directions_of_throughput(monkeypatch):
     texts = [text for text, _ in drawn_texts(monkeypatch, CALM, RAMPS)]
-    (header,) = [t for t in texts if "DN" in t or "UP" in t]
-    assert "DN 7.3 KB/s" in header
-    assert "UP 3.7 KB/s" in header
-    # Download before upload, so the header and the CSV agree on which is
-    # which without a legend: the same order NET_KEYS declares.
-    assert header.index("DN 7.3") < header.index("UP 3.7")
+    (header,) = [t for t in texts if "IN" in t or "OUT" in t]
+    assert "IN 7.3 KB/s" in header
+    assert "OUT 3.7 KB/s" in header
+    # In before out, so the header and the CSV agree on which is which without a
+    # legend: the same order NET_KEYS declares.
+    assert header.index("IN 7.3") < header.index("OUT 3.7")
     # And it reaches the pixels rather than merely being formatted.
     assert max_channel_delta(render(CALM, RAMPS),
                              render(without_network(CALM), RAMPS)) > 60
@@ -585,7 +608,7 @@ def test_the_header_shows_both_directions_of_throughput(monkeypatch):
 
 def test_an_unmeasured_rate_renders_a_dash_in_both_directions(monkeypatch):
     texts = [text for text, _ in drawn_texts(monkeypatch, EMPTY, {})]
-    (header,) = [t for t in texts if "DN" in t or "UP" in t]
+    (header,) = [t for t in texts if "IN" in t or "OUT" in t]
     # Not "0 B/s": the first tick has no predecessor, which is not the same
     # claim as a link that moved nothing.
     assert header.count("--") == 2, header
@@ -663,9 +686,9 @@ def test_the_widest_rate_string_the_header_must_fit_is_bounded():
         return QFontMetricsF(theme.aux_font()).horizontalAdvance(widest), widest
 
     available = theme.header_rect().right() - theme.header_text_x()
-    for value, expected in ((999_999_999_999.0, "DN 1000000.0 MB/s  UP 1000000.0 MB/s"),
-                            (1e300, "DN >= 1000.0 TB/s  UP >= 1000.0 TB/s"),
-                            (-1e300, "DN <= -1000.0 TB/s  UP <= -1000.0 TB/s")):
+    for value, expected in ((999_999_999_999.0, "IN 1000000.0 MB/s  OUT 1000000.0 MB/s"),
+                            (1e300, "IN >= 1000.0 TB/s  OUT >= 1000.0 TB/s"),
+                            (-1e300, "IN <= -1000.0 TB/s  OUT <= -1000.0 TB/s")):
         metrics_width, widest = width(value)
         assert widest == expected
         assert metrics_width <= available, (
@@ -744,7 +767,7 @@ def test_throughput_is_never_coloured_by_magnitude(monkeypatch):
     """
     def net_colour(snapshot):
         for text, rgba in drawn_texts(monkeypatch, snapshot, RAMPS):
-            if "DN" in text:
+            if "IN" in text:
                 return rgba
         raise AssertionError("the throughput was never drawn")
 
@@ -791,7 +814,7 @@ def test_throughput_alone_does_not_light_the_status_dot(monkeypatch):
     net_only = Snapshot(net_down_bytes_per_sec=999_900_000.0,
                         net_up_bytes_per_sec=999_900_000.0, ts=1000.0)
     texts = [text for text, _ in drawn_texts(monkeypatch, net_only, {})]
-    (header,) = [t for t in texts if "DN" in t or "UP" in t]
+    (header,) = [t for t in texts if "IN" in t or "OUT" in t]
     assert "999.9 MB/s" in header
     # has_any_data() chooses between the neutral dot and a state colour, so
     # counting the throughput here would paint a calm blue dot on a panel whose

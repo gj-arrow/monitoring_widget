@@ -504,13 +504,12 @@ class MonitorApp:
         """Re-check the menu against the settings before it opens.
 
         A menu built once at startup keeps claiming the state it had then: the
-        wheel changes the alpha without coming through here, and the acrylic
-        and history toggles can be refused by the OS or by the filesystem
-        after the checkmark has already gone on. Wired to the menu's
-        aboutToShow rather than called from the one place that opens it, because
-        there are two: the panel's own context menu and a right-click on the
-        tray icon, and a checkmark that is only refreshed on one of them lies
-        on the other.
+        wheel changes the alpha without coming through here, and the history
+        toggle can be refused by the filesystem after the checkmark has already
+        gone on. Wired to the menu's aboutToShow rather than called from the one
+        place that opens it, because there are two: the panel's own context menu
+        and a right-click on the tray icon, and a checkmark that is only
+        refreshed on one of them lies on the other.
         """
         chosen = labelled_alpha(self.settings.alpha)
         for value, action in self._alpha_actions.items():

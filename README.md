@@ -126,7 +126,7 @@ load and only appears when a metric crosses a threshold.
 ### Header
 
 The header carries the status dot — the worst state across all rows — and current
-network throughput, download then upload, as `DN 7.7 KB/s  UP 7.0 KB/s`.
+network throughput, download then upload, as `IN 7.7 KB/s  OUT 7.0 KB/s`.
 
 There is no `SYSTEM` label and no sample-age figure. The dot already states the worst
 case, and a second number competing with it in the same 23-pixel strip earned its space
@@ -304,7 +304,7 @@ build started from a shortcut has a working directory nobody chose.
 
 В заголовке находятся индикатор состояния — худшее состояние среди всех строк — и
 текущая пропускная способность сети, сначала приём, потом передача, в виде
-`DN 7.7 KB/s  UP 7.0 KB/s`.
+`IN 7.7 KB/s  OUT 7.0 KB/s`.
 
 Метки `SYSTEM` и возраста последнего замера больше нет. Индикатор уже сообщает о худшем
 случае, а вторая цифра конкурировала с ним в той же полосе высотой 23 пикселя и

@@ -80,14 +80,29 @@ class MonitorPanel(QWidget):
     # --- configuration ----------------------------------------------------
 
     def apply_window_flags(self) -> None:
-        """Re-apply the window flags, e.g. after always-on-top was toggled.
+        """State the window's type, all of it, in one place.
+
+        Frameless is the design, Tool keeps the panel off the taskbar and the
+        Alt-Tab list, and StaysOnTopHint puts it above other windows. The last
+        one is unconditional and used not to be: it was added only while
+        `settings.always_on_top` was true, which was also its default, so
+        unticking removed a flag that was not what kept the panel visible -- a
+        Qt.Tool window is hardly ever covered by an ordinary window -- and
+        nothing on screen appeared to change. The user reported that it seemed to
+        do nothing, which was accurate, so the row, the setting and its
+        persistence are gone and the panel is above other windows because that is
+        what a monitor is for.
 
         Qt hides a visible widget when its window flags change and recreates it
-        as a native window, so a panel that was on screen is put back.
+        as a native window, so a panel that was on screen is put back. Nothing
+        calls this on a visible panel any more, but the re-show costs one line and
+        the method is the panel's only statement of what kind of window it is.
         """
-        flags = Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
-        if self._settings.always_on_top:
-            flags |= Qt.WindowType.WindowStaysOnTopHint
+        flags = (
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.Tool
+            | Qt.WindowType.WindowStaysOnTopHint
+        )
         visible = self.isVisible()
         self.setWindowFlags(flags)
         if visible:

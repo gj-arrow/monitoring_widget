@@ -433,13 +433,6 @@ class MonitorApp:
         opacity.addAction(custom)
         self._alpha_custom: QAction = custom
 
-        on_top = QAction("Always on top", menu)
-        on_top.setCheckable(True)
-        on_top.setChecked(self.settings.always_on_top)
-        on_top.toggled.connect(self._set_always_on_top)
-        menu.addAction(on_top)
-        self._toggle_actions["always_on_top"] = on_top
-
         history = QAction("Write history to file", menu)
         history.setCheckable(True)
         history.setChecked(self.settings.log_history)
@@ -458,10 +451,6 @@ class MonitorApp:
     def _set_alpha(self, value: float) -> None:
         self.panel.set_alpha(value)
         self.collector.poke()
-
-    def _set_always_on_top(self, enabled: bool) -> None:
-        self.settings.always_on_top = enabled
-        self.panel.apply_window_flags()
 
     def _set_log_history(self, enabled: bool) -> None:
         if not enabled:

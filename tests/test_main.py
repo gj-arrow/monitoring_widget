@@ -1163,6 +1163,23 @@ def test_tray_icon_is_not_null(qapp):
     assert not icon.isNull()
 
 
+def test_the_tray_menu_offers_no_always_on_top_toggle(qapp, tmp_path):
+    """The panel is above other windows unconditionally, so there is no switch.
+
+    It used to be a checkable row whose untick removed a flag that was not what
+    was keeping the panel visible: a Qt.Tool window is topmost by design, so
+    nothing on screen changed and the row looked broken. The window's z-order is
+    not a preference, and the flag is now stated once in overlay.py.
+    """
+    app = menu_app(tmp_path)
+    menu = app._build_menu()
+
+    labels = [action.text() for action in clickable_actions(menu)]
+    assert not [text for text in labels if "top" in text.lower()], (
+        f"the menu still offers an always-on-top toggle: {labels}"
+    )
+
+
 # --- the system backdrop, which this panel must never be given -------------
 
 DWMWA_SYSTEMBACKDROP_TYPE = 38

@@ -1291,6 +1291,59 @@ def test_a_failed_frame_does_not_take_the_process_with_it():
     )
 
 
+# --- the panel is above other windows, and there is nothing to turn off ----
+
+
+def test_the_panel_stays_on_top_and_no_setting_can_turn_it_off():
+    """The user reported the toggle "seems to do nothing", because it did nothing.
+
+    It read a setting and added WindowStaysOnTopHint only when that setting was
+    true -- and it defaulted to true -- so unticking removed a flag that was not
+    what was keeping the panel up. A Qt.Tool window is hardly ever covered by an
+    ordinary window either, so nothing on screen appeared to change. A switch
+    that reports no effect is worse than no switch, so the panel's z-order is now
+    unconditional and the setting is gone.
+
+    Written to fail on the old code by actively trying to turn it off: asserting
+    the flag is *present* on a default panel passes either way, because the old
+    default was on. Setting the attribute that used to decide it and checking the
+    flag survives is the only version of this assertion that bites.
+    """
+    from dataclasses import fields
+
+    panel = make_panel()
+    assert Qt.WindowType.WindowStaysOnTopHint in panel.windowFlags()
+
+    # Whatever a settings object claims, including the field the old code read.
+    panel._settings.always_on_top = False
+    panel.apply_window_flags()
+
+    assert Qt.WindowType.WindowStaysOnTopHint in panel.windowFlags(), (
+        "the panel dropped out of the top of the z-order: the flag is still "
+        "conditional on a setting, so there is still something to turn off"
+    )
+    assert "always_on_top" not in {f.name for f in fields(Settings)}, (
+        "always_on_top is still a persisted setting with nothing that reads it: "
+        "the file keeps a key the panel no longer honours"
+    )
+
+
+def test_the_panel_keeps_the_flags_it_is_built_with():
+    """The other two are unchanged, and the same call states all three.
+
+    Frameless is the whole design and Tool keeps the panel out of the taskbar and
+    off the Alt-Tab list; neither is negotiable, so neither belongs to a
+    preference. apply_window_flags() is where they are declared and it is called
+    once, from __init__, so the three of them cannot drift apart.
+    """
+    panel = make_panel()
+    flags = panel.windowFlags()
+
+    assert Qt.WindowType.FramelessWindowHint in flags
+    assert Qt.WindowType.Tool in flags
+    assert Qt.WindowType.WindowStaysOnTopHint in flags
+
+
 # --- a wedge has to be able to repaint at all -------------------------------
 
 

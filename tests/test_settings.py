@@ -27,7 +27,7 @@ def test_unknown_keys_are_ignored(tmp_path):
 
 def test_round_trip(tmp_path):
     path = tmp_path / "settings.json"
-    original = Settings(x=100, y=200, alpha=0.65, always_on_top=False, log_history=True)
+    original = Settings(x=100, y=200, alpha=0.65, log_history=True)
     assert save_settings(original, path) is True
     assert load_settings(path) == original
 
@@ -122,13 +122,14 @@ def test_a_non_int_position_is_dropped(tmp_path, value):
 
 @pytest.mark.parametrize("value", ['"yes"', "1", "0", "null"])
 def test_a_non_bool_toggle_is_dropped(tmp_path, value):
+    # x is the sibling rather than a second toggle, so the test still says
+    # something about the drop when only one boolean setting is left.
     path = tmp_path / "settings.json"
-    path.write_text('{"always_on_top": %s, "log_history": true}' % value, encoding="utf-8")
+    path.write_text('{"log_history": %s, "x": 5}' % value, encoding="utf-8")
     loaded = load_settings(path)
-    assert loaded == Settings(always_on_top=True, log_history=True)
+    assert loaded == Settings(x=5)
     # `1 == True` in Python, so equality alone would let an int through.
-    assert loaded.always_on_top is True
-    assert loaded.log_history is True
+    assert loaded.log_history is False
 
 
 def test_an_explicit_null_position_is_a_legitimate_value(tmp_path):
@@ -158,20 +159,21 @@ def test_every_field_wrong_still_yields_usable_settings(tmp_path):
     assert load_settings(path) == Settings()
 
 
-def test_a_settings_file_from_a_build_with_the_backdrop_still_loads(tmp_path):
-    """The file on this machine still has "acrylic": false in it.
+def test_a_settings_file_from_a_build_with_the_removed_toggles_still_loads(tmp_path):
+    """The file on this machine still has "always_on_top" and "acrylic" in it.
 
-    Removing a persisted field must not cost the user the rest of their file:
-    the loader skips keys it does not know, so an upgrade keeps the position and
-    the opacity the user chose and silently forgets a setting that no longer
-    exists. What it must *not* do is fail to load, or keep resurrecting the
-    dead field.
+    Removing a persisted field must not cost the user the rest of their file: the
+    loader skips keys it does not know, so an upgrade keeps the position and the
+    opacity the user chose and silently forgets settings that no longer exist.
+    What it must *not* do is fail to load, or keep resurrecting the dead fields.
     """
     from dataclasses import asdict, fields
 
     path = tmp_path / "settings.json"
     path.write_text(
-        json.dumps({"x": 1229, "y": 10, "alpha": 0.65, "acrylic": True}),
+        json.dumps(
+            {"x": 1229, "y": 10, "alpha": 0.65, "always_on_top": False, "acrylic": True}
+        ),
         encoding="utf-8",
     )
 
@@ -180,9 +182,10 @@ def test_a_settings_file_from_a_build_with_the_backdrop_still_loads(tmp_path):
     assert loaded.alpha == 0.65 and loaded.x == 1229, (
         "a dead key cost the user a live one"
     )
-    assert "acrylic" not in {f.name for f in fields(Settings)}, (
-        "the backdrop is still a persisted setting: nothing can change it and "
-        "nothing reads it, and the next writer puts it back in the file"
+    dead = {"always_on_top", "acrylic"} & {f.name for f in fields(Settings)}
+    assert not dead, (
+        f"{sorted(dead)} still persisted: nothing can change them and nothing "
+        "reads them, so the file carries keys the panel no longer honours"
     )
     assert asdict(loaded) == asdict(Settings(x=1229, y=10, alpha=0.65))
 

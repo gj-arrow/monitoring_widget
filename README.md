@@ -23,6 +23,7 @@ in a frameless panel that sits in a corner of the screen.
 - **Network** — download and upload throughput
 - A sparkline of the last 60 seconds on every row
 - Colour that means something: it only appears when a metric crosses a threshold
+- Always above other windows, with nothing to switch off
 
 ### How to Run
 
@@ -65,8 +66,13 @@ in a frameless panel that sits in a corner of the screen.
 | Tray icon, double-click | Snap the panel back to the top-right corner |
 | Middle-click | Quit |
 
-The menu holds **Reset position**, **Opacity**, **Always on top**, **Write history to file**,
-and **Quit**.
+The menu holds **Reset position**, **Opacity**, **Write history to file**, and **Quit**.
+
+**There is no "Always on top" switch, because the panel is always on top.** It used to be
+there, and it did nothing you could see: it removed a window flag that was not what was
+keeping the panel visible, since a borderless tool window is topmost anyway. A switch that
+reports no effect is worse than no switch, so the panel's position in the z-order is now
+stated once, in the window flags, and cannot be switched off.
 
 ### Color Coding
 
@@ -169,6 +175,7 @@ build started from a shortcut has a working directory nobody chose.
 - **Сеть** — скорость приёма и передачи
 - График последних 60 секунд в каждой строке
 - Цвет, который что-то значит: он появляется только при пересечении порога
+- Всегда поверх других окон, и выключать это не нужно
 
 ### Запуск
 
@@ -211,8 +218,13 @@ build started from a shortcut has a working directory nobody chose.
 | Значок в трее, двойной клик | Вернуть панель в правый верхний угол |
 | Центральная кнопка | Закрыть приложение |
 
-В меню есть **Reset position**, **Opacity**, **Always on top**, **Write history to file**
-и **Quit**.
+В меню есть **Reset position**, **Opacity**, **Write history to file** и **Quit**.
+
+**Переключателя «Always on top» больше нет, потому что панель всегда сверху.** Раньше он
+был и не делал ничего заметного: снимал флаг окна, который и не удерживал панель наверху,
+ведь frameless-окно типа tool и так поверх остальных. Переключатель, который ничего не
+меняет, хуже его отсутствия, поэтому положение панели в z-порядке теперь задано один раз
+во флагах окна и не выключается.
 
 ### Цветовое кодирование
 

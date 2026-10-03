@@ -10,9 +10,11 @@ no title bar: without them the process lives until the task manager notices.
 
 from __future__ import annotations
 
+import ctypes
 import logging
 import logging.handlers
 import sys
+from ctypes import wintypes
 from pathlib import Path
 
 from PyQt6.QtCore import (
@@ -33,7 +35,7 @@ import pythoncom
 
 import theme
 from history import HistoryLog
-from metrics import SystemProbe
+from metrics import SystemProbe, clear_fault, log_fault
 from overlay import MonitorPanel
 from settings import Settings, config_path, load_settings, save_settings
 
@@ -267,6 +269,92 @@ def stop_collector(collector: Collector, timeout_ms: int = SHUTDOWN_WAIT_MS) -> 
     return collector.wait(timeout_ms)
 
 
+# How often the panel puts itself back at the top of the z-order, in
+# milliseconds. Measured on this machine over 20,000 real calls against the real
+# window: 45.07 us of wall time and 27.34 us of CPU per call, so a second of
+# interval is 86,400 calls a day -- 2.4 s of CPU, or 0.024 % of one core.
+#
+# The floor is the panel's own tick: theme.TICK_MS is 2000, so a panel buried by
+# a game is already reaching the screen up to two seconds late before any of this
+# exists, and halving the exposure window costs a share of a core nobody can see.
+# The ceiling is the rate at which something could take the z-order back between
+# two assertions -- nothing that happens per frame does, and a game that grabs it
+# once on its way up is repaired within a second, which is why this is not the
+# panel's tick rate either. The test in tests/test_main.py holds the interval to
+# the measurement rather than to taste.
+TOPMOST_REASSERT_MS = 1000
+
+# SetWindowPos, spelled out. HWND_TOPMOST is the pseudo-handle for "above every
+# non-topmost window"; HWND_TOP (-2) would only move the panel to the top of the
+# ordinary band, which is not what is being asked for. The flags are NOMOVE and
+# NOSIZE because the panel's position belongs to the user and its size is fixed,
+# and NOACTIVATE because taking focus is exactly what a game must not lose --
+# without it SetWindowPos brings the panel forward *and* activates it, and a
+# fullscreen game would lose the keyboard.
+#
+# The two flags that are deliberately absent are as load-bearing as the ones
+# present: SWP_SHOWWINDOW would put a hidden panel on screen, and SWP_NOZORDER
+# would leave the z-order alone and make the whole call a no-op that looks like
+# it works.
+HWND_TOPMOST = -1
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOZORDER = 0x0004
+SWP_NOACTIVATE = 0x0010
+SWP_SHOWWINDOW = 0x0040
+TOPMOST_FLAGS = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
+
+
+def _user32_set_window_pos():
+    """SetWindowPos with its whole prototype declared.
+
+    ctypes guesses no argument types and no return type at all. A handle handed
+    to an undeclared prototype is a number the marshaller has to guess the width
+    of, and on 64-bit Windows a wrong guess truncates it and the call fails for a
+    reason nobody reading the code can find. Both handles are pointers, so both
+    have to be said rather than left to a c_int default. The function object is
+    process-wide, so the declaration is done once, here.
+    """
+    move = ctypes.windll.user32.SetWindowPos
+    move.argtypes = [
+        wintypes.HWND,
+        wintypes.HWND,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        wintypes.UINT,
+    ]
+    move.restype = wintypes.BOOL
+    return move
+
+
+def assert_topmost(hwnd: int) -> bool:
+    """Put a window back at the top of the z-order. False when it could not be.
+
+    Moves nothing, resizes nothing and takes no focus: TOPMOST_FLAGS says so, and
+    the panel's own position and size are the user's, not the z-order's.
+
+    This runs on a timer, so a fault goes through metrics' throttle rather than a
+    logger of its own: a machine where the call never succeeds would otherwise
+    write 86,400 records a day and rotate away everything else in the log. The
+    failure is not fatal either way -- the panel keeps the window flag that makes
+    it topmost in the first place -- so it is a warning once, not an error every
+    second.
+    """
+    if not sys.platform.startswith("win") or not hwnd:
+        return False
+    try:
+        moved = bool(_user32_set_window_pos()(
+            wintypes.HWND(hwnd),
+            wintypes.HWND(HWND_TOPMOST),
+            0, 0, 0, 0,
+            TOPMOST_FLAGS,
+        ))
+    except Exception as exc:
+        log_fault("topmost re-assertion", "topmost re-assertion failed", exc)
+        return False
+    clear_fault("topmost re-assertion")
+    return moved
+
+
 def build_tray_icon() -> QIcon:
     pixmap = QPixmap(32, 32)
     pixmap.fill(QColor(0, 0, 0, 0))
@@ -322,6 +410,10 @@ class MonitorApp:
         self.timer.timeout.connect(self.collector.poke)
         self.timer.start(theme.TICK_MS)
 
+        # Before the panel is shown, so the first assertion is one interval away
+        # rather than never: a window that is not up yet has no z-order to hold.
+        self._watch_topmost()
+
         self._restore_position()
         self.panel.show()
 
@@ -358,6 +450,32 @@ class MonitorApp:
         keep free. Panel painting is the only thing that belongs over there.
         """
         return Collector(SystemProbe, self._record_history)
+
+    def _watch_topmost(self) -> None:
+        """Re-assert the topmost position on a timer, for as long as the panel is up.
+
+        The window flag is a statement made once, when the window is created, not
+        a promise Windows keeps afterwards: a switch into fullscreen, a launcher
+        or another always-on-top overlay all put something above the panel, and a
+        topmost window is not immune to that. So the panel puts itself back.
+
+        Nothing here hides, suppresses or moves the panel. The call carries
+        NOMOVE and NOSIZE, so the panel keeps the corner the user dragged it to,
+        and NOACTIVATE, so a game never loses focus to it. While the panel is not
+        visible there is nothing to hold up, so the call is skipped rather than
+        made: a hidden panel must not be shown and must not be activated.
+
+        Parented to the panel, like the panel's own repaint timer, so Qt stops it
+        when the widget goes and nothing has to remember to stop it.
+        """
+        self._topmost_timer = QTimer(self.panel)
+        self._topmost_timer.timeout.connect(self._reassert_topmost)
+        self._topmost_timer.start(TOPMOST_REASSERT_MS)
+
+    def _reassert_topmost(self) -> None:
+        if not self.panel.isVisible():
+            return
+        assert_topmost(int(self.panel.winId()))
 
     def _record_history(self, snapshot) -> None:
         self.history_log.write(snapshot)

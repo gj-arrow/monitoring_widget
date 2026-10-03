@@ -22,6 +22,7 @@ import time
 from ctypes import wintypes
 from dataclasses import asdict
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from PyQt6.QtCore import QPoint, QPointF, Qt, QThread
@@ -1177,6 +1178,306 @@ def test_the_tray_menu_offers_no_always_on_top_toggle(qapp, tmp_path):
     labels = [action.text() for action in clickable_actions(menu)]
     assert not [text for text in labels if "top" in text.lower()], (
         f"the menu still offers an always-on-top toggle: {labels}"
+    )
+
+
+# --- holding the top of the z-order ---------------------------------------
+
+
+class RecordingUser32:
+    """A user32 that answers SetWindowPos and writes down how it was asked.
+
+    A function, not an object with a SetWindowPos attribute, because that is the
+    shape ctypes hands back and `_user32_set_window_pos()` is declared once and
+    cached -- so the app and the test agree about which object is the API.
+    """
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, hwnd, insert_after, x, y, cx, cy, flags):
+        self.calls.append((hwnd, insert_after, x, y, cx, cy, flags))
+        return 1  # BOOL: nonzero is success
+
+
+class FakeClock:
+    """A clock the test moves, because metrics' throttle reads the module's own.
+
+    Callable as well as monotonic()/time(), because the module is replaced with
+    SimpleNamespace(monotonic=clock, time=clock) -- the shape
+    tests/test_metrics.py uses, where `clock` has to answer to all three.
+    """
+
+    def __init__(self, now=1_000.0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+    def monotonic(self):
+        return self.now
+
+    def time(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+def visible_off_screen(panel):
+    """An hwnd for a panel Qt calls visible, with nothing on the desktop.
+
+    WA_DontShowOnScreen is Qt's own mechanism for this: isVisible() is true,
+    which is the predicate the re-assertion's guard reads, and winId() hands
+    back a real handle -- while IsWindowVisible stays false and no window
+    appears. show() alone would break the rule this file states in its
+    docstring, and stubbing isVisible() would test the stub rather than the
+    guard.
+    """
+    panel.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+    panel.show()
+    QApplication.processEvents()
+    assert panel.isVisible(), "the test fixture is not visible, so the guard is untested"
+    return int(panel.winId())
+
+
+@pytest.fixture
+def topmost(qapp, tmp_path, monkeypatch):
+    """A visible panel whose window API records instead of moving.
+
+    Yields (app, recorder, hwnd) with the timer already built, which is what the
+    tests below drive.
+    """
+    app = bare_app(tmp_path)
+    recorder = RecordingUser32()
+    monkeypatch.setattr(app_main, "_user32_set_window_pos", lambda: recorder)
+    hwnd = visible_off_screen(app.panel)
+    app._watch_topmost()
+    return app, recorder, hwnd
+
+
+def test_the_topmost_position_is_re_asserted_on_its_timer(qapp, topmost):
+    """Games take the z-order on their way up, so the panel has to take it back.
+
+    A topmost window flag is a statement made when the window is created, not a
+    promise Windows keeps: a fullscreen switch, a launcher or another
+    always-on-top overlay all put something above the panel afterwards. In
+    borderless fullscreen -- an ordinary maximised window, and what most modern
+    titles use -- the panel's window flags are enough on their own; this is the
+    half that survives a game disturbing the z-order.
+
+    Every flag is asserted rather than the call as a whole, because each one is a
+    decision: NOMOVE and NOSIZE say the panel keeps its position and size,
+    NOACTIVATE is what keeps the panel from stealing focus from the game, and the
+    absence of SHOWWINDOW is what stops a hidden panel being put on screen.
+    """
+    app, recorder, hwnd = topmost
+    assert app._topmost_timer.interval() == app_main.TOPMOST_REASSERT_MS
+    assert app._topmost_timer.isActive(), "the re-assertion timer is not running"
+
+    app._topmost_timer.timeout.emit()
+
+    assert recorder.calls, "nothing re-asserted the topmost position"
+    (hwnd_arg, insert_after, x, y, cx, cy, flags), = recorder.calls
+    # Compared through .value because the app hands over real HWND objects, not
+    # bare integers: wrapping the handle as a pointer is part of what is being
+    # asserted, since that is what the declared prototype marshals.
+    assert hwnd_arg.value == hwnd, f"asked about {hwnd_arg} rather than the panel's own handle"
+    assert insert_after.value == wintypes.HWND(app_main.HWND_TOPMOST).value, (
+        f"hWndInsertAfter was {insert_after}: only HWND_TOPMOST puts the window "
+        "back on top, and HWND_TOP only moves it to the top of the "
+        "non-topmost band"
+    )
+    assert (x, y, cx, cy) == (0, 0, 0, 0), (
+        "the call was given a position or a size, and NOMOVE/NOSIZE mean they "
+        "would be ignored -- so the panel would move if those flags were ever lost"
+    )
+    assert flags == app_main.SWP_NOMOVE | app_main.SWP_NOSIZE | app_main.SWP_NOACTIVATE
+    assert flags == 0x0013, f"the flag word is 0x{flags:04x}"
+    assert flags & app_main.SWP_NOACTIVATE, (
+        "without SWP_NOACTIVATE the panel takes focus, which is exactly what a "
+        "game must not lose"
+    )
+    assert not flags & app_main.SWP_SHOWWINDOW, (
+        "SWP_SHOWWINDOW shows the window: it would put a hidden panel on screen"
+    )
+    assert not flags & app_main.SWP_NOZORDER, (
+        "SWP_NOZORDER leaves the z-order alone, which would make the whole call "
+        "a no-op that looks like it is working"
+    )
+
+
+def test_the_re_assertion_does_not_run_while_the_panel_is_hidden(qapp, topmost):
+    """A panel nobody can see must not be put on screen by its own timer.
+
+    Asserted as one call followed by none rather than as zero calls, so a timer
+    that was never wired cannot pass it: the first half is the control.
+    """
+    app, recorder, _ = topmost
+
+    app._topmost_timer.timeout.emit()
+    assert len(recorder.calls) == 1, (
+        "the control did not fire: the timer is not reaching the call at all, so "
+        "the hidden case below would prove nothing"
+    )
+
+    app.panel.hide()
+    QApplication.processEvents()
+    assert app.panel.isVisible() is False
+
+    app._topmost_timer.timeout.emit()
+
+    assert len(recorder.calls) == 1, (
+        f"{len(recorder.calls) - 1} call(s) after the panel was hidden: a hidden "
+        "panel must not be moved, shown or focused"
+    )
+
+
+def test_a_re_assertion_that_keeps_failing_writes_one_record(monkeypatch, caplog):
+    """This runs once a second, so an unthrottled log line is 86,400 records a day.
+
+    The panel calls it every TOPMOST_REASSERT_MS for as long as it is on screen,
+    and a machine where the call fails would fail it forever: at roughly 100 bytes
+    a record that is megabytes of churn a day, rotating away everything else in
+    app_debug.log and holding the logging lock once a second besides. So the
+    failure goes through metrics' own throttle -- the rule the rest of the
+    application already obeys -- rather than a second one invented here.
+
+    600 calls is ten minutes of panel at this cadence.
+    """
+    def no_user32():
+        raise AttributeError("module 'ctypes' has no attribute 'windll'")
+
+    monkeypatch.setattr(app_main, "_user32_set_window_pos", no_user32)
+    monkeypatch.setattr(metrics, "_FAULT_LOG", {})
+
+    with caplog.at_level(logging.WARNING, logger="widget.metrics"):
+        for _ in range(600):
+            app_main.assert_topmost(0x1234)
+
+    records = [r for r in caplog.records if "topmost" in r.getMessage()]
+    assert len(records) == 1, (
+        f"600 failing calls wrote {len(records)} records: at one call a second "
+        "the log grows with uptime again"
+    )
+    # The traceback on the first one, because this is the record that has to name
+    # the fault -- here a missing user32.
+    assert records[0].exc_info is not None
+    assert "windll" in caplog.text
+
+
+def test_a_re_assertion_that_starts_working_clears_its_fault(monkeypatch, caplog):
+    """A source that answers must say so, or the one record above is all there is.
+
+    Nothing else can teach the throttle a fault is over: the healthy case is the
+    one that does not call log_fault, so clear_fault on the successful call is the
+    only way a *later* failure can earn a record. Without it a source that broke
+    once during a driver install would be silent for the rest of the session.
+    """
+    failing = RecordingUser32()
+
+    def no_user32():
+        raise AttributeError("no windll")
+
+    # metrics.log_fault measures the healthy spell against metrics.LOG_INTERVAL,
+    # so the clock has to be one the test can move -- the same reason
+    # tests/test_metrics.py installs a fake one.
+    clock = FakeClock(1_000.0)
+    monkeypatch.setattr(
+        metrics, "time", SimpleNamespace(monotonic=clock, time=clock)
+    )
+    monkeypatch.setattr(app_main, "_user32_set_window_pos", no_user32)
+    monkeypatch.setattr(metrics, "_FAULT_LOG", {})
+    with caplog.at_level(logging.WARNING, logger="widget.metrics"):
+        app_main.assert_topmost(0x1234)
+    assert [r for r in caplog.records if "topmost" in r.getMessage()]
+
+    # It heals, and stays healed for longer than LOG_INTERVAL.
+    monkeypatch.setattr(app_main, "_user32_set_window_pos", lambda: failing)
+    for _ in range(200):
+        assert app_main.assert_topmost(0x1234) is True
+    clock.advance(metrics.LOG_INTERVAL + 1.0)
+
+    caplog.clear()
+    monkeypatch.setattr(app_main, "_user32_set_window_pos", no_user32)
+    with caplog.at_level(logging.WARNING, logger="widget.metrics"):
+        app_main.assert_topmost(0x1234)
+
+    records = [r for r in caplog.records if "topmost" in r.getMessage()]
+    assert len(records) == 1, (
+        "a failure after a spell of health was not announced: the throttle "
+        "still believes the fault is the one it already wrote about"
+    )
+
+
+def test_the_topmost_placeholder_handle_is_not_the_other_one():
+    """HWND_TOPMOST is -1 and HWND_TOP is -2, and swapping them is silent.
+
+    HWND_TOP only moves a window to the top of the ordinary band, so a topmost
+    panel sent there with HWND_TOP would keep its flag, keep looking right, and
+    sit under every other topmost window -- which is the fault this whole change
+    exists to fix. It is one character apart from the right value.
+    """
+    assert app_main.HWND_TOPMOST == -1
+    # As the pointer SetWindowPos receives it: all ones, not the integer -1.
+    assert wintypes.HWND(app_main.HWND_TOPMOST).value == 0xFFFFFFFFFFFFFFFF
+
+
+def test_the_user32_call_declares_its_prototype():
+    """Every argument type and the return type, because ctypes declares none.
+
+    A handle handed to an undeclared prototype is a number the marshaller has to
+    guess the width of, and on 64-bit Windows a wrong guess truncates it and the
+    call fails for a reason nobody reading the code can find. The function object
+    is process-wide, so the declaration is done once.
+    """
+    fn = app_main._user32_set_window_pos()
+
+    assert fn.argtypes is not None and len(fn.argtypes) == 7, (
+        f"{fn.argtypes}: an undeclared SetWindowPos argument list"
+    )
+    # hWnd, hWndInsertAfter, x, y, cx, cy, uFlags -- both handles are pointers,
+    # so both have to be said rather than inherited from a c_int default.
+    assert fn.argtypes[0] is wintypes.HWND
+    assert fn.argtypes[1] is wintypes.HWND
+    assert fn.restype is wintypes.BOOL, (
+        "the return value is a BOOL; an undeclared restype defaults to c_int and "
+        "happens to match, which is not a reason to rely on it"
+    )
+
+
+def test_the_re_assertion_refuses_what_it_cannot_move(qapp, monkeypatch):
+    """No window, or no user32: a refresh timer must not be able to take the app down."""
+    recorder = RecordingUser32()
+    monkeypatch.setattr(app_main, "_user32_set_window_pos", lambda: recorder)
+
+    assert app_main.assert_topmost(0) is False
+    assert not recorder.calls, "a window handle of zero was passed to user32 anyway"
+
+    def no_user32():
+        raise AttributeError("module 'ctypes' has no attribute 'windll'")
+
+    monkeypatch.setattr(app_main, "_user32_set_window_pos", no_user32)
+    assert app_main.assert_topmost(0x1234) is False
+
+
+def test_the_re_assertion_interval_is_justified_by_the_measured_cost_of_a_call():
+    """The cadence is bounded by what a call costs, not chosen by taste.
+
+    Measured on this machine over 20,000 real calls against the real window:
+    45.07 us of wall time and 27.34 us of CPU each. The ceiling is 0.05 % of one
+    core across a whole day -- the chosen interval spends 0.024 %, and an interval
+    four times tighter (250 ms) would spend 0.09 % and fail. One second of a day
+    is 0.0012 % of a core, so the ceiling is about forty seconds of CPU a day.
+    """
+    cpu_per_call = 27.34e-6
+    cpu_per_day = 86_400_000 / app_main.TOPMOST_REASSERT_MS * cpu_per_call
+    core_per_day = cpu_per_day / 86_400
+
+    assert core_per_day < 0.0005, (
+        f"every {app_main.TOPMOST_REASSERT_MS} ms is {cpu_per_day:.1f} s of CPU a "
+        f"day, {core_per_day * 100:.3f} % of one core: the panel would be paying "
+        "for a z-order it already holds"
     )
 
 

@@ -74,6 +74,29 @@ keeping the panel visible, since a borderless tool window is topmost anyway. A s
 reports no effect is worse than no switch, so the panel's position in the z-order is now
 stated once, in the window flags, and cannot be switched off.
 
+### Above fullscreen games
+
+The panel is above other windows, and it puts itself back **once a second**, so anything
+that takes the z-order — a game launching, a launcher, another always-on-top window — is
+undone within about a second. It never takes focus doing so: the call that moves the panel
+carries `SWP_NOACTIVATE` precisely so it cannot pull the keyboard away from a game.
+
+Two cases are worth stating plainly, because only one of them can be helped:
+
+| How the game runs | The panel |
+|---|---|
+| **Borderless fullscreen** (the default for most modern titles) | Stays on top. The game is an ordinary maximised window and respects the topmost z-order. |
+| **Exclusive fullscreen** | Is hidden while the game is running, and no setting here changes that. |
+
+Exclusive fullscreen hands the display's output to the game: whatever it draws *is* what
+the screen shows, with nothing composited over it. That is a property of the graphics
+mode, not a window flag, so it cannot be raised above from a widget — a topmost window, a
+periodic re-assertion or any other trick loses to a mode that owns the output. If your game
+offers both modes, choose borderless fullscreen.
+
+Nothing in the panel hides or suppresses itself while a game is running, and nothing watches
+for one: it stays at the corner you dragged it to, at the opacity you chose.
+
 ### Color Coding
 
 Colour encodes load, and nothing else. A row is drawn in the calm blue until it has
@@ -156,6 +179,8 @@ build started from a shortcut has a working directory nobody chose.
 - GPU monitoring requires an NVIDIA graphics card
 - The CPU clock is derived from a performance-counter ratio; on some machines that
   counter is unavailable and the frequency shows `--`
+- A game in **exclusive** fullscreen covers the panel, because the game owns the display
+  output; borderless fullscreen does not. See [Above fullscreen games](#above-fullscreen-games)
 
 ---
 
@@ -225,6 +250,29 @@ build started from a shortcut has a working directory nobody chose.
 ведь frameless-окно типа tool и так поверх остальных. Переключатель, который ничего не
 меняет, хуже его отсутствия, поэтому положение панели в z-порядке теперь задано один раз
 во флагах окна и не выключается.
+
+### Поверх игр в полноэкранном режиме
+
+Панель поверх других окон, и она возвращается наверх **раз в секунду**, поэтому всё, что
+перехватило z-порядок — запуск игры, лаунчер, другое окно поверх всех, — возвращается на
+своё место примерно за секунду. Фокус она при этом не забирает: у вызова, который её
+поднимает, стоит флаг `SWP_NOACTIVATE` именно для того, чтобы клавиатура осталась у игры.
+
+Два случая стоит назвать прямо, потому что помочь можно только с одним:
+
+| Как запущена игра | Панель |
+|---|---|
+| **Пограничный полноэкранный режим** (по умолчанию у большинства современных игр) | Остаётся сверху. Игра — обычное развёрнутое окно и уважает верхний z-порядок. |
+| **Эксклюзивный полноэкранный режим** | Скрыта, пока идёт игра, и изменить это настройками нельзя. |
+
+В эксклюзивном режиме игра забирает вывод дисплея: то, что она рисует, и есть изображение
+экрана, поверх ничего не выводится. Это свойство графического режима, а не флага окна,
+поэтому виджет не может оказаться выше: окно поверх всех, периодическое переподнятие или
+любой другой приём проигрывают режиму, который владеет выводом. Если игра даёт выбор,
+выбирайте пограничный полноэкранный режим.
+
+Ничто в панели не прячется и не приглушается на время игры, и никто за играми не следит:
+панель остаётся в том углу, куда её перетащили, с той прозрачностью, которую выбрали.
 
 ### Цветовое кодирование
 
@@ -309,6 +357,9 @@ acrylic — поверх этого наложить нельзя, и это п�
 - Мониторинг GPU требует видеокарты NVIDIA
 - Частота CPU выводится из отношения счётчика производительности; на некоторых машинах
   этот счётчик недоступен и частота показывает `--`
+- Игра в **эксклюзивном** полноэкранном режиме закрывает панель, потому что игра владеет
+  выводом дисплея; пограничный полноэкранный режим — нет.
+  См. [Поверх игр в полноэкранном режиме](#поверх-игр-в-полноэкранном-режиме)
 
 ---
 

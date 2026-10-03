@@ -10,11 +10,9 @@ no title bar: without them the process lives until the task manager notices.
 
 from __future__ import annotations
 
-import ctypes
 import logging
 import logging.handlers
 import sys
-from ctypes import wintypes
 from pathlib import Path
 
 from PyQt6.QtCore import (
@@ -46,8 +44,25 @@ LOG_MAX_BYTES = 512 * 1024
 LOG_BACKUPS = 2
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 
-DWMWA_SYSTEMBACKDROP_TYPE = 38
-DWMSBT_TRANSIENTWINDOW = 3
+# There is no system backdrop here, and there is not going to be one. Measured
+# on this machine (Windows 11 25H2, the real panel, a saturated window behind
+# it): asking DWM for a backdrop material changed 538,328 of the 547,600 pixels
+# inside the window rect, and what it produced was an opaque, hard-edged,
+# SQUARE-CORNERED slab filling the 8 px bleed margin outside the rounded panel --
+# with the panel's own drop shadow gone. That slab is the dark border the user
+# reported. It is not a frame that can be suppressed either:
+# DWMWA_BORDER_COLOR set to DWMWA_COLOR_NONE changed 0 of those pixels, because
+# the slab is the material composited behind the whole window rect rather than a
+# border drawn at its edge.
+#
+# The panel keeps that margin transparent on purpose -- painter.py draws the
+# drop shadow outside panel_rect() so it can fade to nothing against the desktop
+# -- and a backdrop material fills exactly that rect. No value escapes it: Mica
+# and AUTO fill the same window rect. So the setting was removed rather than
+# retuned; see tests/test_main.py for the test that reads the live attribute back
+# off the panel's handle, which is what makes this an invariant instead of a
+# comment. overlay.py keeps the translucent fill, which is what the opacity
+# wheel, the rounded corners and the shadow are all built on.
 
 # How long shutdown waits for the sampler. Bounded because a sample already
 # blocked inside psutil cannot be cancelled, and a widget on someone's desktop
@@ -55,7 +70,6 @@ DWMSBT_TRANSIENTWINDOW = 3
 SHUTDOWN_WAIT_MS = 3000
 
 TRAY_TITLE = "System Monitor"
-ACRYLIC_REFUSED = "This Windows build refused the acrylic backdrop."
 HISTORY_REFUSED = "Could not open metrics_history.log."
 
 ALPHA_STEPS = (("35%", 0.35), ("50%", 0.50), ("65%", 0.65), ("80%", 0.80), ("100%", 1.00))
@@ -253,49 +267,6 @@ def stop_collector(collector: Collector, timeout_ms: int = SHUTDOWN_WAIT_MS) -> 
     return collector.wait(timeout_ms)
 
 
-def _dwm_set_window_attribute():
-    """DwmSetWindowAttribute with its prototype declared.
-
-    ctypes guesses no argument types at all, and this call works only because
-    wintypes.HWND happens to subclass c_void_p. A handle handed to an
-    undeclared prototype is a number the marshaller has to guess the width of,
-    and on 64-bit Windows a wrong guess truncates it and fails for a reason
-    nobody reading the code can find. The function object is process-wide, so
-    the declaration is done once, here.
-    """
-    setter = ctypes.windll.dwmapi.DwmSetWindowAttribute
-    setter.argtypes = [
-        wintypes.HWND,
-        wintypes.DWORD,
-        ctypes.c_void_p,
-        wintypes.DWORD,
-    ]
-    setter.restype = ctypes.c_long  # an HRESULT, and S_OK is 0
-    return setter
-
-
-def enable_acrylic(hwnd: int) -> bool:
-    """Ask DWM for real backdrop blur. False when the OS refuses.
-
-    Only reached when the user ticks the setting; the default translucent fill
-    needs no ctypes and works from Windows 8 onwards.
-    """
-    if not sys.platform.startswith("win") or not hwnd:
-        return False
-    try:
-        value = ctypes.c_int(DWMSBT_TRANSIENTWINDOW)
-        result = _dwm_set_window_attribute()(
-            wintypes.HWND(hwnd),
-            ctypes.c_uint(DWMWA_SYSTEMBACKDROP_TYPE),
-            ctypes.byref(value),
-            ctypes.sizeof(value),
-        )
-        return result == 0
-    except Exception:
-        logger.info("acrylic unavailable", exc_info=True)
-        return False
-
-
 def build_tray_icon() -> QIcon:
     pixmap = QPixmap(32, 32)
     pixmap.fill(QColor(0, 0, 0, 0))
@@ -338,10 +309,6 @@ class MonitorApp:
         self._stopped = False
         self._alpha_actions: dict[float, QAction] = {}
         self._toggle_actions: dict[str, QAction] = {}
-
-        # Before the menu exists, so the checkmark shows what was actually
-        # granted rather than what the file asked for.
-        self._apply_acrylic(self.settings.acrylic)
 
         self.tray = QSystemTrayIcon(build_tray_icon(), self.panel)
         self.tray.setToolTip(TRAY_TITLE)
@@ -473,13 +440,6 @@ class MonitorApp:
         menu.addAction(on_top)
         self._toggle_actions["always_on_top"] = on_top
 
-        acrylic = QAction("Acrylic backdrop", menu)
-        acrylic.setCheckable(True)
-        acrylic.setChecked(self.settings.acrylic)
-        acrylic.toggled.connect(self._set_acrylic)
-        menu.addAction(acrylic)
-        self._toggle_actions["acrylic"] = acrylic
-
         history = QAction("Write history to file", menu)
         history.setCheckable(True)
         history.setChecked(self.settings.log_history)
@@ -502,20 +462,6 @@ class MonitorApp:
     def _set_always_on_top(self, enabled: bool) -> None:
         self.settings.always_on_top = enabled
         self.panel.apply_window_flags()
-
-    def _apply_acrylic(self, enabled: bool) -> bool:
-        """Try to turn the backdrop on, and record what was actually granted."""
-        granted = bool(enabled) and enable_acrylic(int(self.panel.winId()))
-        self.settings.acrylic = granted
-        if enabled and not granted:
-            logger.info("acrylic refused, using the translucent fill")
-        return granted
-
-    def _set_acrylic(self, enabled: bool) -> None:
-        granted = self._apply_acrylic(enabled)
-        if enabled and not granted:
-            self.tray.showMessage(TRAY_TITLE, ACRYLIC_REFUSED)
-        self.panel.update()
 
     def _set_log_history(self, enabled: bool) -> None:
         if not enabled:

@@ -65,8 +65,8 @@ in a frameless panel that sits in a corner of the screen.
 | Tray icon, double-click | Snap the panel back to the top-right corner |
 | Middle-click | Quit |
 
-The menu holds **Reset position**, **Opacity**, **Always on top**, **Acrylic backdrop**,
-**Write history to file**, and **Quit**.
+The menu holds **Reset position**, **Opacity**, **Always on top**, **Write history to file**,
+and **Quit**.
 
 ### Color Coding
 
@@ -102,6 +102,28 @@ network throughput, download then upload, as `DN 7.7 KB/s  UP 7.0 KB/s`.
 There is no `SYSTEM` label and no sample-age figure. The dot already states the worst
 case, and a second number competing with it in the same 23-pixel strip earned its space
 by implying a freshness the panel does not otherwise track.
+
+### Why there is no acrylic backdrop
+
+The panel composites **directly against the desktop**: a translucent fill, a hairline
+border and its own drop shadow, all drawn by `painter.py`. A Windows *system backdrop* —
+Mica or acrylic — cannot be layered on top of that, and this was measured rather than
+assumed. On Windows 11 25H2, asking DWM for one changed **538,328 of the 547,600 pixels**
+inside the window rect, and what appeared was an opaque, hard-edged, **square-cornered**
+slab filling the 8-pixel transparent margin around the panel, with the drop shadow gone
+entirely. That slab is a border the panel never drew, and it does not go away when the
+setting is turned off, because the panel used to skip writing the attribute on the way
+out.
+
+The margin has to stay transparent, and that is the whole constraint: the drop shadow is
+drawn *outside* the panel's rounded rect and fades to nothing against whatever is behind
+it. A backdrop material fills exactly the window rect, so no backdrop value respects this
+design — Mica and "let the system decide" included. Suppressing the border does not help
+either: setting the DWM border colour to *none* changed **0** of those pixels, because
+the slab is the material itself rather than a border drawn at the window edge.
+
+So the setting was removed rather than retuned, and the panel keeps the translucent fill
+that the opacity wheel, the rounded corners and the shadow are all built on.
 
 ### Requirements
 
@@ -189,8 +211,8 @@ build started from a shortcut has a working directory nobody chose.
 | Значок в трее, двойной клик | Вернуть панель в правый верхний угол |
 | Центральная кнопка | Закрыть приложение |
 
-В меню есть **Reset position**, **Opacity**, **Always on top**, **Acrylic backdrop**,
-**Write history to file** и **Quit**.
+В меню есть **Reset position**, **Opacity**, **Always on top**, **Write history to file**
+и **Quit**.
 
 ### Цветовое кодирование
 
@@ -228,6 +250,27 @@ build started from a shortcut has a working directory nobody chose.
 случае, а вторая цифра конкурировала с ним в той же полосе высотой 23 пикселя и
 оправдывала своё место, создавая впечатление свежести, которую панель больше нигде не
 отслеживает.
+
+### Почему нет акриловой подложки
+
+Панель смешивается **напрямую с рабочим столом**: полупрозрачная заливка, волосяная рамка
+и собственная тень, всё это рисует `painter.py`. Системную подложку Windows — Mica или
+acrylic — поверх этого наложить нельзя, и это проверено измерением, а не рассуждением.
+На Windows 11 25H2 запрос такой подложки у DWM изменил **538 328 из 547 600 пикселей**
+внутри прямоугольника окна, и появилась непрозрачная, жёстко обрезанная
+**прямоугольная** пластина в 8-пиксельной прозрачной рамке вокруг панели, а тень
+исчезла полностью. Эта пластина — рамка, которую панель никогда не рисовала, и она не
+убиралась при выключении настройки, потому что атрибут раньше просто не записывался.
+
+Прозрачная рамка нужна обязательно: тень рисуется *снаружи* скруглённого прямоугольника
+панели и плавно уходит в ноль по тому, что лежит под ней. Системная подложка заливает
+ровно прямоугольник окна, поэтому ни одно значение подложки не совместимо с этой
+конструкцией — включая Mica и «пусть решит система». Не помогает и отключение рамки:
+цвет рамки DWM, установленный в «нет», изменил **0** пикселей, потому что пластина —
+это сама подложка, а не рамка на краю окна.
+
+Поэтому настройку убрали, а не перенастроили: панель сохраняет полупрозрачную заливку,
+на которой построены и колёсико прозрачности, и скруглённые углы, и тень.
 
 ### Требования
 

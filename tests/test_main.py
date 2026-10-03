@@ -11,6 +11,7 @@ open is what makes "25 pokes buy exactly one extra sample" a fact instead of a
 guess about timing.
 """
 
+import ast
 import ctypes
 import logging
 import logging.handlers
@@ -18,6 +19,7 @@ import subprocess
 import sys
 import threading
 import time
+from ctypes import wintypes
 from dataclasses import asdict
 from pathlib import Path
 
@@ -1156,37 +1158,211 @@ def test_setup_logging_quietens_the_probe_chatter(tmp_path, monkeypatch):
 # --- the parts that must exist at all -------------------------------------
 
 
-def test_enable_acrylic_rejects_a_bogus_handle():
-    assert app_main.enable_acrylic(0) is False
-
-
-def test_the_dwm_call_declares_its_prototype():
-    fn = app_main._dwm_set_window_attribute()
-    # ctypes guesses no argument types at all, and this only works at all
-    # because wintypes.HWND happens to subclass c_void_p. A handle passed
-    # through an undeclared prototype is a number the marshaller has to guess
-    # the width of: on 64-bit Windows a wrong guess truncates the handle and
-    # the call fails for a reason nobody reading the code can find.
-    assert fn.argtypes is not None and len(fn.argtypes) == 4
-    assert fn.restype is ctypes.c_long, "an HRESULT is a 32-bit signed value"
-
-
-def test_enable_acrylic_refuses_handles_that_are_not_windows():
-    # 1, -1 (0xFFFFFFFFFFFFFFFF) and 0x7FFFFFFF are the shapes a stale or
-    # already-destroyed handle has. Declaring the prototype is new code on the
-    # path that builds the argument, so it is new ways to raise.
-    for hwnd in (1, -1, 0x7FFFFFFF, 0xFFFFFFFFFFFFFFFF):
-        assert app_main.enable_acrylic(hwnd) is False
-
-
-def test_enable_acrylic_survives_a_windows_without_the_dll(monkeypatch):
-    # No dwmapi.dll, or anything else that makes the lookup fail: the widget has
-    # to stay on its translucent fill rather than take the tray menu down with
-    # it, which is the whole reason this returns False instead of raising.
-    monkeypatch.delattr(app_main.ctypes, "windll", raising=False)
-    assert app_main.enable_acrylic(0x1234) is False
-
-
 def test_tray_icon_is_not_null(qapp):
     icon = app_main.build_tray_icon()
     assert not icon.isNull()
+
+
+# --- the system backdrop, which this panel must never be given -------------
+
+DWMWA_SYSTEMBACKDROP_TYPE = 38
+
+# What the panel may be left with: never written (0, AUTO) and explicitly
+# cleared (1, NONE). Mica (2) and acrylic (3) are the two that put a system
+# material behind the window rect, and the reason neither is allowed is a
+# measurement rather than a preference -- see the test below and the README.
+BACKDROP_NONE = (0, 1)
+
+_DWM_GET = None
+
+
+def _dwm_get_window_attribute():
+    """DwmGetWindowAttribute with its prototype declared, resolved once.
+
+    The *read* side of DWM lives only here. The application does not call DWM at
+    all any more, so this exists purely so a test can ask Windows what the live
+    window actually has rather than trusting that no code wrote it.
+    """
+    global _DWM_GET
+    if _DWM_GET is None:
+        getter = ctypes.windll.dwmapi.DwmGetWindowAttribute
+        # Declared because ctypes guesses nothing: an undeclared prototype
+        # marshals the handle as a number whose width it has to invent, and on
+        # 64-bit Windows a wrong guess truncates it.
+        getter.argtypes = [
+            wintypes.HWND,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+        ]
+        getter.restype = ctypes.c_long
+        _DWM_GET = getter
+    return _DWM_GET
+
+
+def backdrop_of(hwnd):
+    """The window's live DWMWA_SYSTEMBACKDROP_TYPE, as DWM reports it."""
+    out = ctypes.c_int(-1)
+    result = _dwm_get_window_attribute()(
+        wintypes.HWND(hwnd),
+        ctypes.c_uint(DWMWA_SYSTEMBACKDROP_TYPE),
+        ctypes.byref(out),
+        ctypes.sizeof(out),
+    )
+    assert result == 0, (
+        f"could not read the backdrop attribute of {hwnd}: HRESULT 0x{result & 0xffffffff:08x}"
+    )
+    return out.value
+
+
+def clickable_actions(menu):
+    """Every action in the menu tree, submenus included, minus Quit.
+
+    Quit is skipped because it shuts the application down, and this is about what
+    a *toggle* can do to the window rather than about every action in the menu.
+    """
+    found = []
+    for action in menu.actions():
+        if action.isSeparator() or action.text() == "Quit":
+            continue
+        if action.menu() is not None:
+            found.extend(clickable_actions(action.menu()))
+        else:
+            found.append(action)
+    return found
+
+
+def test_no_menu_action_can_put_a_system_backdrop_behind_the_panel(qapp, tmp_path):
+    """Nothing the user can click may put a system material behind the panel.
+
+    Measured on this machine (Windows 11 25H2, the real panel, a saturated
+    backdrop behind it): setting DWMSBT_TRANSIENTWINDOW changed 538,328 of the
+    547,600 pixels inside the window rect. What appeared was an opaque,
+    hard-edged, *square-cornered* slab filling the 8 px bleed margin outside the
+    rounded panel -- and the panel's own drop shadow was gone. On a real desktop
+    that slab is the dark border the user reported. DWMWA_COLOR_NONE on
+    DWMWA_BORDER_COLOR changes 0 of those pixels, so there is no separate border
+    to suppress: the slab *is* the backdrop material, composited behind the whole
+    window rect, and this panel deliberately keeps that margin transparent so its
+    own shadow can fade to nothing against the desktop. No backdrop value can
+    respect that, Mica and AUTO included.
+
+    So the property is that the window never carries one, and the assertion is
+    the window's own state rather than the absence of a particular line of code:
+    every action in the real menu is triggered and the attribute is read back
+    from the live handle after each one.
+    """
+    app = menu_app(tmp_path)
+    menu = app._build_menu()
+    actions = clickable_actions(menu)
+    assert actions, "the menu has nothing to click: this test would prove nothing"
+    hwnd = int(app.panel.winId())
+    assert backdrop_of(hwnd) in BACKDROP_NONE, (
+        f"a freshly built panel already carries backdrop {backdrop_of(hwnd)}: "
+        "something is writing it before the user has touched anything"
+    )
+
+    offenders = []
+    for action in actions:
+        # trigger() is what a click does, and it flips a checkable action on --
+        # the only state in which a backdrop would ever be asked for.
+        action.trigger()
+        found = backdrop_of(hwnd)
+        if found not in BACKDROP_NONE:
+            offenders.append((action.text(), found))
+
+    assert not offenders, (
+        f"{offenders} asked DWM for a system backdrop. It is composited behind "
+        "the whole window rect, so it appears as a square-cornered slab in the "
+        "shadow's transparent margin and takes the drop shadow with it."
+    )
+
+
+def test_the_tray_menu_offers_no_acrylic_toggle(qapp, tmp_path):
+    """The toggle went with the plumbing, rather than becoming a dead switch.
+
+    The old one was worse than dead: it was also the only way to *leave* the
+    backdrop on, because the untick path short-circuited on bool(False) and never
+    wrote the attribute. So the tick was a promise the panel could not keep.
+    """
+    app = menu_app(tmp_path)
+    menu = app._build_menu()
+
+    labels = [action.text() for action in clickable_actions(menu)]
+    assert not [text for text in labels if "crylic" in text.lower()], (
+        f"the menu still offers an acrylic backdrop: {labels}"
+    )
+
+
+def test_no_application_module_can_reach_a_dwm_backdrop_attribute():
+    """The half the live-window test above cannot see: code that nothing calls.
+
+    The read-back pins what the *panel* carries. This pins that no module in the
+    application holds a DWM entry point at all, because a re-added helper the
+    menu no longer reaches would pass the test above and put the slab back the
+    day something started calling it.
+
+    Scanned through the AST rather than with a text search, so prose survives: a
+    comment may say "acrylic" or "system backdrop" and say why it cannot be used,
+    but a name, attribute or string that could reach the attribute cannot hide in
+    a line of explanation.
+    """
+    forbidden = ("dwmapi", "DwmSetWindowAttribute", "DwmGetWindowAttribute",
+                 "DWMWA", "DWMSBT", "SYSTEMBACKDROP")
+    root = Path(app_main.__file__).resolve().parent
+    modules = sorted(root.glob("*.py"))
+    assert modules, f"no application modules under {root}: the scan would pass vacuously"
+    assert any(path.name == "main.py" for path in modules), (
+        "main.py is not among the modules being scanned"
+    )
+
+    offenders = {}
+    for path in modules:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        words = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                words.add(node.value)
+            elif isinstance(node, ast.Name):
+                words.add(node.id)
+            elif isinstance(node, ast.Attribute):
+                words.add(node.attr)
+            elif isinstance(node, ast.arg):
+                words.add(node.arg)
+        hits = sorted(word for word in words if any(f in word for f in forbidden))
+        if hits:
+            offenders[path.name] = hits
+
+    assert not offenders, (
+        f"{offenders} can still reach a DWM backdrop attribute. Measured on this "
+        "machine, the backdrop material is composited behind the entire window "
+        "rect: it shows as a square-cornered slab in the 8 px transparent margin "
+        "the panel keeps for its own drop shadow, and the shadow disappears. "
+        "There is no value that avoids it -- Mica (2) and AUTO (0) fill the same "
+        "rect -- so the setting cannot come back."
+    )
+
+
+def test_every_persisted_boolean_has_a_toggle_and_nothing_else_does(qapp, tmp_path):
+    """One invariant instead of two absence checks, and it covers the next field.
+
+    A setting with no menu row cannot be changed by the user; a menu row with no
+    setting is a switch that goes somewhere else. Both are silent, and both were
+    live in this project at once: a toggle whose value was written to the window
+    flags and nowhere else, and a persisted field nothing read.
+    """
+    from dataclasses import fields
+
+    app = menu_app(tmp_path)
+    app._build_menu()
+
+    persisted = {
+        f.name for f in fields(Settings)
+        # settings.py carries `from __future__ import annotations`, so a field's
+        # declared type is the string that was written, not the class itself.
+        if f.type == "bool"
+    }
+    assert set(app._toggle_actions) == persisted, (
+        f"menu toggles {sorted(app._toggle_actions)} against persisted booleans "
+        f"{sorted(persisted)}"
+    )

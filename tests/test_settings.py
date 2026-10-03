@@ -27,7 +27,7 @@ def test_unknown_keys_are_ignored(tmp_path):
 
 def test_round_trip(tmp_path):
     path = tmp_path / "settings.json"
-    original = Settings(x=100, y=200, alpha=0.65, always_on_top=False, acrylic=True, log_history=True)
+    original = Settings(x=100, y=200, alpha=0.65, always_on_top=False, log_history=True)
     assert save_settings(original, path) is True
     assert load_settings(path) == original
 
@@ -73,10 +73,10 @@ def test_a_utf16_file_falls_back_to_defaults(tmp_path):
 def test_a_wrong_typed_field_keeps_its_valid_siblings(tmp_path):
     path = tmp_path / "settings.json"
     path.write_text(
-        json.dumps({"x": "abc", "y": 200, "alpha": 0.5, "acrylic": True}),
+        json.dumps({"x": "abc", "y": 200, "alpha": 0.5, "log_history": True}),
         encoding="utf-8",
     )
-    assert load_settings(path) == Settings(x=None, y=200, alpha=0.5, acrylic=True)
+    assert load_settings(path) == Settings(x=None, y=200, alpha=0.5, log_history=True)
 
 
 @pytest.mark.parametrize("alpha", [1.5, 0.34, 0.0, -1.0, "0.5", None])
@@ -123,12 +123,12 @@ def test_a_non_int_position_is_dropped(tmp_path, value):
 @pytest.mark.parametrize("value", ['"yes"', "1", "0", "null"])
 def test_a_non_bool_toggle_is_dropped(tmp_path, value):
     path = tmp_path / "settings.json"
-    path.write_text('{"always_on_top": %s, "acrylic": true}' % value, encoding="utf-8")
+    path.write_text('{"always_on_top": %s, "log_history": true}' % value, encoding="utf-8")
     loaded = load_settings(path)
-    assert loaded == Settings(always_on_top=True, acrylic=True)
+    assert loaded == Settings(always_on_top=True, log_history=True)
     # `1 == True` in Python, so equality alone would let an int through.
     assert loaded.always_on_top is True
-    assert loaded.acrylic is True
+    assert loaded.log_history is True
 
 
 def test_an_explicit_null_position_is_a_legitimate_value(tmp_path):
@@ -146,7 +146,6 @@ def test_every_field_wrong_still_yields_usable_settings(tmp_path):
                 "y": [],
                 "alpha": "loud",
                 "always_on_top": "yes",
-                "acrylic": 1,
                 "log_history": None,
             }
         ),
@@ -157,6 +156,35 @@ def test_every_field_wrong_still_yields_usable_settings(tmp_path):
     assert isinstance(loaded.alpha, float)
     assert save_settings(loaded, path) is True
     assert load_settings(path) == Settings()
+
+
+def test_a_settings_file_from_a_build_with_the_backdrop_still_loads(tmp_path):
+    """The file on this machine still has "acrylic": false in it.
+
+    Removing a persisted field must not cost the user the rest of their file:
+    the loader skips keys it does not know, so an upgrade keeps the position and
+    the opacity the user chose and silently forgets a setting that no longer
+    exists. What it must *not* do is fail to load, or keep resurrecting the
+    dead field.
+    """
+    from dataclasses import asdict, fields
+
+    path = tmp_path / "settings.json"
+    path.write_text(
+        json.dumps({"x": 1229, "y": 10, "alpha": 0.65, "acrylic": True}),
+        encoding="utf-8",
+    )
+
+    loaded = load_settings(path)
+
+    assert loaded.alpha == 0.65 and loaded.x == 1229, (
+        "a dead key cost the user a live one"
+    )
+    assert "acrylic" not in {f.name for f in fields(Settings)}, (
+        "the backdrop is still a persisted setting: nothing can change it and "
+        "nothing reads it, and the next writer puts it back in the file"
+    )
+    assert asdict(loaded) == asdict(Settings(x=1229, y=10, alpha=0.65))
 
 
 def test_every_field_has_a_validator():

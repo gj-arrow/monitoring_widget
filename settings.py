@@ -41,7 +41,6 @@ class Settings:
     y: int | None = None
     alpha: float = theme.DEFAULT_ALPHA
     always_on_top: bool = True
-    acrylic: bool = False
     log_history: bool = False
 
 
@@ -88,7 +87,6 @@ VALIDATORS: dict[str, Callable[[object], object]] = {
     "y": _optional_int,
     "alpha": _alpha,
     "always_on_top": _bool,
-    "acrylic": _bool,
     "log_history": _bool,
 }
 

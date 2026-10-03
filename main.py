@@ -360,6 +360,17 @@ def assert_topmost(hwnd: int) -> bool:
     failure is not fatal either way -- the panel keeps the window flag that makes
     it topmost in the first place -- so it is a warning once, not an error every
     second.
+
+    A FALSE return is the fault this is most likely to meet, and it is not an
+    exception. Windows refuses a z-order change by returning zero, and the case
+    that matters here is a game run elevated: UIPI blocks a lower-integrity
+    process from touching a higher-integrity window, so the panel -- ordinary,
+    medium integrity -- is refused every single time. That is precisely the
+    situation the re-assertion exists for, and reading the return value as
+    anything but a failure would mean the feature failing in silence, once a
+    second, for the length of a match. So both answers go through log_fault
+    under the same name; the refusal carries no exception because there is no
+    traceback to give.
     """
     if not sys.platform.startswith("win") or not hwnd:
         return False
@@ -373,8 +384,14 @@ def assert_topmost(hwnd: int) -> bool:
     except Exception as exc:
         log_fault("topmost re-assertion", "topmost re-assertion failed", exc)
         return False
+    if not moved:
+        log_fault(
+            "topmost re-assertion",
+            "topmost re-assertion refused: SetWindowPos did not move the window",
+        )
+        return False
     clear_fault("topmost re-assertion")
-    return moved
+    return True
 
 
 def build_tray_icon() -> QIcon:
@@ -641,11 +658,19 @@ class MonitorApp:
         any two of them can arrive together; a second call returns at once
         rather than waiting out another timeout or saving settings over a
         collector that is already gone.
+
+        Both timers are stopped, not just the tick timer. Both are parented to
+        the panel so Qt stops them when the *widget* goes, but this path calls
+        QApplication.quit(), which ends the event loop without destroying the
+        panel -- so parenting alone leaves the topmost re-assertion armed, waking
+        the process once a second for as long as the interpreter takes to come
+        down.
         """
         if self._stopped:
             return
         self._stopped = True
         self.timer.stop()
+        self._topmost_timer.stop()
         if not stop_collector(self.collector):
             logger.error("sampler thread did not stop within %d ms", SHUTDOWN_WAIT_MS)
         save_settings(self.settings)

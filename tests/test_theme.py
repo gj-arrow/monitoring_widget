@@ -42,25 +42,54 @@ def test_metric_keys_are_the_documented_four():
     assert [m.key for m in theme.METRICS] == ["cpu_pct", "ram", "gpu_pct", "vram"]
 
 
-def test_geometry_heights_add_up_to_280():
-    """The panel is a 280 px square at scale 1.0, and 280 is a pin not a sum.
+def test_the_panel_is_the_documented_square_at_every_scale():
+    """280, 238 and 210 -- the numbers, not a re-derivation of them.
 
-    The identity is checked at every scale below; the number is checked once, at
-    the scale the goldens were rendered at. A 280 px panel is what three
-    committed PNGs and a README describe, so changing it is a change to saved
-    art rather than a refactor.
+    The identity this used to check at every scale (pad_top + header_h +
+    n*row_h + (n-1)*row_gap + pad_bottom) is `Layout.height`'s own definition,
+    so comparing the property against it could not fail whatever the two
+    disagreed about; it was a check before the refactor and is a tautology
+    after it. What it was standing in for is the thing worth pinning: three
+    committed golden PNGs and a README both describe a 280 px square at scale
+    1.00, and the tray menu offers exactly these three scales. If a base
+    dimension moves, the panel is a different size and the saved art is stale --
+    so the numbers are written out here and have to be edited on purpose.
+
+    210 and 238 are the panel, not the window: the widget is those plus the
+    bleed on every side, which is why `test_canvas_is_the_panel_plus_a_bleed_margin`
+    is a separate assertion rather than folded in here.
+    """
+    assert [
+        (scale, theme.Layout(scale).width, theme.Layout(scale).height)
+        for scale in theme.SCALE_STEPS
+    ] == [
+        (0.75, 210, 210),
+        (0.85, 238, 238),
+        (1.00, 280, 280),
+    ]
+
+
+def test_the_panel_is_square_because_its_rows_fill_the_height_it_derives():
+    """The *why* behind the numbers above, stated so a change cannot be silent.
+
+    Width is a base dimension and height is the sum of the parts, so the two
+    agreeing at all three scales is a property of the design rather than a
+    coincidence -- and the one place a new row would show up. A fifth metric
+    makes every height longer than the number pinned above, which is the
+    intended way to notice: the test above fails, and the failure says the
+    goldens are the thing that has to be regenerated.
     """
     for scale in theme.SCALE_STEPS:
         layout = theme.Layout(scale)
-        expected = (
+        summed = (
             layout.pad_top
             + layout.header_h
             + len(theme.METRICS) * layout.row_h
             + (len(theme.METRICS) - 1) * layout.row_gap
             + layout.pad_bottom
         )
-        assert layout.height == expected, f"the rows do not add up at scale {scale}"
-    assert theme.Layout(1.0).height == theme.Layout(1.0).width == 280
+        assert layout.height == summed, f"at scale {scale}: {layout.height} != {summed}"
+        assert layout.width == layout.height, f"at scale {scale} the panel is not square"
 
 
 @pytest.mark.parametrize("scale", theme.SCALE_STEPS)
@@ -348,7 +377,7 @@ LAYOUT_DIMENSIONS = (
     "pad_x", "pad_top", "pad_bottom", "header_h",
     "row_h", "row_gap", "graph_h", "row_text_inset", "bleed",
     "panel_radius", "row_radius", "dot_r", "dot_gap",
-    "value_gap", "text_top", "text_clearance", "graph_line_width",
+    "value_gap", "text_top", "text_clearance", "graph_line_width", "outline_w",
     "label_pt", "value_pt", "aux_pt",
 )
 

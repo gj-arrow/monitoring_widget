@@ -121,7 +121,11 @@ def _draw_panel(painter: QPainter, layout: theme.Layout, rect: QRectF, alpha: fl
     fill = QColor(16, 18, 24)
     fill.setAlphaF(max(0.0, min(1.0, alpha)))
     painter.setBrush(fill)
-    painter.setPen(QPen(QColor(255, 255, 255, 26), 1.0))
+    # The outline is the last dimension to come off the layout rather than a 1.0
+    # literal, which was the one drawing dimension invisible to the test that walks
+    # every Layout dimension: at 0.75 it drew a third heavier than the design it
+    # is a third the size of.
+    painter.setPen(QPen(QColor(255, 255, 255, 26), layout.outline_w))
     painter.drawRoundedRect(rect, layout.panel_radius, layout.panel_radius)
     painter.setPen(Qt.PenStyle.NoPen)
 

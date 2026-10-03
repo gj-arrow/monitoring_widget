@@ -961,6 +961,39 @@ def test_the_longest_header_string_stays_clear_of_the_dot_and_inside_the_header(
     )
 
 
+@pytest.mark.parametrize("scale", theme.SCALE_STEPS)
+def test_the_panel_outline_is_a_scaled_width_not_a_hardcoded_pixel(monkeypatch, scale):
+    """Every other drawing dimension comes from the Layout; this one did not.
+
+    The panel's hairline border was the single `QPen(..., 1.0)` in the renderer,
+    so at 0.75 it drew a third heavier than the design it is a third the size of
+    -- and `test_every_dimension_shrinks_with_the_scale` could not see it, because
+    a number that was never in the Layout is not a dimension that failed to
+    shrink. It is the same gap that test exists for, reached from the other side.
+
+    Read off the pens the renderer actually builds rather than from the source,
+    so the assertion is about the pixels' input and not about a literal that a
+    refactor would move. `_draw_text` builds a width-0 pen for every glyph run,
+    so the check is that the Layout's own width is among them.
+    """
+    real_pen = painter.QPen
+    widths = []
+
+    def recording(*args, **kwargs):
+        pen = real_pen(*args, **kwargs)
+        widths.append(pen.widthF())
+        return pen
+
+    monkeypatch.setattr(painter, "QPen", recording)
+    layout = theme.Layout(scale)
+    render(CALM, RAMPS, scale=scale)
+
+    assert layout.outline_w in [round(width, 6) for width in widths], (
+        f"no pen of width {layout.outline_w} at scale {scale}: the panel outline "
+        f"is not drawn from the layout. Widths seen: {sorted(set(widths))}"
+    )
+
+
 def test_throughput_is_never_coloured_by_magnitude(monkeypatch):
     """Network speed is not a health metric, so it gets no alarm colour.
 

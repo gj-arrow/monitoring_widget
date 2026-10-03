@@ -94,6 +94,13 @@ _BASE_VALUE_GAP = 7.0
 _BASE_TEXT_TOP = 6.0
 _BASE_TEXT_CLEARANCE = 2.0
 _BASE_GRAPH_LINE_WIDTH = 1.4
+# The panel's own hairline border. A shape like the rest, and scaled as a float
+# rather than left at one physical pixel: the only drawing dimension that used to
+# be a literal in painter.py was this one, which made the border a third heavier
+# on a panel a third the size -- and invisible to the test that walks every
+# Layout dimension, because a number that was never in the Layout cannot fail to
+# shrink.
+_BASE_OUTLINE_W = 1.0
 
 FAMILY = "Segoe UI Variable Display"
 
@@ -270,6 +277,11 @@ class Layout:
     @property
     def graph_line_width(self) -> float:
         return _BASE_GRAPH_LINE_WIDTH * self.scale
+
+    @property
+    def outline_w(self) -> float:
+        """The panel's own hairline border, in the same units as a pen width."""
+        return _BASE_OUTLINE_W * self.scale
 
     # --- type ---------------------------------------------------------------
 
@@ -494,15 +506,3 @@ def _font(size_pt: float, *, caps: bool = False, bold: bool = False) -> QFont:
         font.setWeight(QFont.Weight.DemiBold)
     font.setFeature(QFont.Tag("tnum"), 1)
     return font
-
-
-def label_font() -> QFont:
-    return _font(LABEL_PT, caps=True, bold=True)
-
-
-def value_font() -> QFont:
-    return _font(VALUE_PT, bold=True)
-
-
-def aux_font() -> QFont:
-    return _font(AUX_PT, bold=True)

@@ -111,7 +111,7 @@ Two cases are worth stating plainly, because only one of them can be helped:
 | How the game runs | The panel |
 |---|---|
 | **Borderless fullscreen** (the default for most modern titles) | Stays on top. The game is an ordinary maximised window and respects the topmost z-order. |
-| **Exclusive fullscreen** | Is hidden while the game is running, and no setting here changes that. |
+| **Exclusive fullscreen** | Still there, still on top of every window — and not visible, because the game owns the display's output and nothing composites over it. The panel never hides itself; **borderless** fullscreen is the mode where this does not apply. |
 
 Exclusive fullscreen hands the display's output to the game: whatever it draws *is* what
 the screen shows, with nothing composited over it. That is a property of the graphics
@@ -333,7 +333,7 @@ build started from a shortcut has a working directory nobody chose.
 | Как запущена игра | Панель |
 |---|---|
 | **Пограничный полноэкранный режим** (по умолчанию у большинства современных игр) | Остаётся сверху. Игра — обычное развёрнутое окно и уважает верхний z-порядок. |
-| **Эксклюзивный полноэкранный режим** | Скрыта, пока идёт игра, и изменить это настройками нельзя. |
+| **Эксклюзивный полноэкранный режим** | Панель на месте и по-прежнему выше всех окон — но её не видно, потому что игра владеет выводом дисплея и поверх ничего не выводится. Панель никогда не прячется сама; режим, к которому это не относится, — **пограничный**. |
 
 В эксклюзивном режиме игра забирает вывод дисплея: то, что она рисует, и есть изображение
 экрана, поверх ничего не выводится. Это свойство графического режима, а не флага окна,

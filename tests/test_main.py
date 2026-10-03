@@ -12,6 +12,7 @@ guess about timing.
 """
 
 import ast
+import builtins
 import ctypes
 import json
 import logging
@@ -319,6 +320,7 @@ def shutting_down(qapp, tmp_path, monkeypatch, collectors):
     app = bare_app(tmp_path)
     app._stopped = False
     app.timer = StubTimer()
+    app._topmost_timer = StubTimer()
     app.collector = collectors(RecordingProbe)
     app.collector.start()
 
@@ -975,6 +977,17 @@ def test_shutdown_twice_leaves_one_of_everything(shutting_down):
     assert saved == [asdict(app.settings)], "settings written more than once"
     assert app.tray.hides == 1, "the tray was hidden more than once"
     assert app.timer.stops == 1, "the tick timer was stopped more than once"
+    # The z-order timer too, not just the tick timer. Both are parented to the
+    # panel so Qt stops them when the widget goes -- but shutdown() quits the
+    # event loop rather than destroying the panel, and QApplication.quit() does
+    # not close the window. A timer left running through quit() wakes the
+    # process once a second until the interpreter tears down the event loop, and
+    # the sequence is short enough that nothing observable goes wrong: a widget
+    # installed to be left running, outliving the app that installed it.
+    assert app._topmost_timer.stops == 1, (
+        "the topmost re-assertion timer was not stopped: it is still armed for "
+        f"{app_main.TOPMOST_REASSERT_MS} ms intervals after shutdown"
+    )
     assert app.collector.isRunning() is False, "shutdown returned with the sampler still running"
 
 
@@ -1420,14 +1433,19 @@ class RecordingUser32:
     A function, not an object with a SetWindowPos attribute, because that is the
     shape ctypes hands back and `_user32_set_window_pos()` is declared once and
     cached -- so the app and the test agree about which object is the API.
+
+    `succeeds=False` returns FALSE, which is what Windows does when the call is
+    refused: the archetypal case is a game running elevated, where UIPI blocks a
+    lower-integrity process from changing a higher-integrity window's z-order.
     """
 
-    def __init__(self):
+    def __init__(self, succeeds=True):
         self.calls = []
+        self.succeeds = succeeds
 
     def __call__(self, hwnd, insert_after, x, y, cx, cy, flags):
         self.calls.append((hwnd, insert_after, x, y, cx, cy, flags))
-        return 1  # BOOL: nonzero is success
+        return 1 if self.succeeds else 0  # BOOL: zero is failure
 
 
 class FakeClock:
@@ -1636,6 +1654,86 @@ def test_a_re_assertion_that_starts_working_clears_its_fault(monkeypatch, caplog
     records = [r for r in caplog.records if "topmost" in r.getMessage()]
     assert len(records) == 1, (
         "a failure after a spell of health was not announced: the throttle "
+        "still believes the fault is the one it already wrote about"
+    )
+
+
+def test_a_refused_set_window_pos_is_reported_through_the_throttle(monkeypatch, caplog):
+    """SetWindowPos returns FALSE, it does not raise -- and that was the answer
+    the feature exists to notice.
+
+    A game run elevated is the case this whole mechanism is for: UIPI blocks a
+    lower-integrity process from changing a higher-integrity window's z-order, and
+    Windows says so by returning FALSE. An exception never arrives, so the
+    `except` path alone would have logged nothing and the panel would have been
+    quietly buried under the game it was supposed to sit above, once a second,
+    silently, for the length of the session.
+
+    So FALSE goes through the same throttled path an exception does: one record
+    for the first failure, and no record per second after that -- the timer runs
+    at TOPMOST_REASSERT_MS and an unthrottled line here is 86,400 a day.
+    """
+    monkeypatch.setattr(
+        app_main, "_user32_set_window_pos",
+        lambda: RecordingUser32(succeeds=False),
+    )
+    monkeypatch.setattr(metrics, "_FAULT_LOG", {})
+
+    with caplog.at_level(logging.WARNING, logger="widget.metrics"):
+        for _ in range(600):   # ten minutes of panel at this cadence
+            assert app_main.assert_topmost(0x1234) is False
+
+    records = [r for r in caplog.records if "topmost" in r.getMessage()]
+    assert len(records) == 1, (
+        f"600 refused calls wrote {len(records)} records: a FALSE return is the "
+        "same one event as a raise, and it has to be throttled the same way"
+    )
+    assert "did not move" in records[0].getMessage() or "refus" in records[0].getMessage(), (
+        f"the record does not say the call was refused rather than raised: "
+        f"{records[0].getMessage()!r}"
+    )
+    # Nothing raised, so there is no traceback to give: the summary has to carry
+    # the whole record.
+    assert records[0].exc_info is None
+
+
+def test_a_refusal_clears_its_fault_when_the_call_works_again(monkeypatch, caplog):
+    """The other half of the throttle: a refusal that heals must be re-announced.
+
+    Without a clear_fault on the successful path the one record above is all the
+    log will ever hold for this source, and a failure that came back after a long
+    healthy spell would be invisible -- which is the case the panel shows, a
+    panel that was buried and then was not.
+    """
+    clock = FakeClock(1_000.0)
+    monkeypatch.setattr(
+        metrics, "time", SimpleNamespace(monotonic=clock, time=clock)
+    )
+    monkeypatch.setattr(metrics, "_FAULT_LOG", {})
+    monkeypatch.setattr(
+        app_main, "_user32_set_window_pos", lambda: RecordingUser32(succeeds=False)
+    )
+    with caplog.at_level(logging.WARNING, logger="widget.metrics"):
+        app_main.assert_topmost(0x1234)
+    assert [r for r in caplog.records if "topmost" in r.getMessage()]
+
+    monkeypatch.setattr(
+        app_main, "_user32_set_window_pos", lambda: RecordingUser32(succeeds=True)
+    )
+    for _ in range(200):
+        assert app_main.assert_topmost(0x1234) is True
+    clock.advance(metrics.LOG_INTERVAL + 1.0)
+
+    caplog.clear()
+    monkeypatch.setattr(
+        app_main, "_user32_set_window_pos", lambda: RecordingUser32(succeeds=False)
+    )
+    with caplog.at_level(logging.WARNING, logger="widget.metrics"):
+        app_main.assert_topmost(0x1234)
+
+    records = [r for r in caplog.records if "topmost" in r.getMessage()]
+    assert len(records) == 1, (
+        "a refusal after a spell of health was not announced: the throttle "
         "still believes the fault is the one it already wrote about"
     )
 
@@ -1889,6 +1987,142 @@ def test_no_application_module_can_reach_a_dwm_backdrop_attribute():
         "There is no value that avoids it -- Mica (2) and AUTO (0) fill the same "
         "rect -- so the setting cannot come back."
     )
+
+
+def test_no_function_references_a_name_the_module_does_not_define():
+    """The class of defect 526 tests cannot see: dead code that raises.
+
+    theme.py kept `label_font()`, `value_font()` and `aux_font()` after the
+    refactor that moved typography onto `Layout`. Nothing calls them, so no test
+    calls them, so all three stayed green while `theme.label_font()` raised
+    NameError -- the names they reach for (`LABEL_PT`, `VALUE_PT`, `AUX_PT`)
+    were deleted with the constants they used to be derived from. A function that
+    raises the moment anybody calls it is not dead code, it is a booby trap, and
+    the only reason it was safe is that nobody had wanted the feature.
+
+    Python resolves a bare name at call time, not at import time, so nothing about
+    importing the module, running the suite or starting the app notices. This is
+    the check that would have: every name a function body reads, resolved against
+    the names the module itself binds, its imports, its parameters, its locals and
+    the builtins.
+
+    Deliberately not a linter. Nothing is installed here -- no ruff, flake8,
+    pyflakes, pylint or mypy -- and one is not worth adding a dependency for a
+    single undefined-name rule; ~40 lines of `ast` does it and fails on nothing
+    else in this repository.
+    """
+    bound = set(dir(builtins)) | {
+        # Module dunders, which the import machinery binds and no assignment in
+        # the module ever names.
+        "__file__", "__name__", "__doc__", "__package__", "__spec__",
+        "__loader__", "__builtins__", "__debug__", "__path__", "__all__",
+        "__annotations__",
+    }
+    offenders = {}
+
+    def bind(node):
+        """Every name this node puts into a scope somewhere in the module."""
+        if isinstance(node, ast.Name):
+            # Store or Del only. Binding a Load would add the very name being
+            # checked, and the check would resolve itself.
+            if isinstance(node.ctx, (ast.Store, ast.Del)):
+                bound.add(node.id)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound.add(node.name)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                bound.add((alias.asname or alias.name).split(".")[0])
+        elif isinstance(node, ast.arg):
+            bound.add(node.arg)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            bound.add(node.name)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            bound.update(node.names)
+
+    root = Path(app_main.__file__).resolve().parent
+    modules = sorted(root.glob("*.py"))
+    assert modules, f"no application modules under {root}: the scan would pass vacuously"
+
+    for path in modules:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        # Bound names are collected for the whole module first, including
+        # anything bound inside a function: a local, a parameter or an import
+        # below the use is a resolution, and pretending otherwise would report
+        # perfectly good code.
+        for node in ast.walk(tree):
+            bind(node)
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                missing = sorted({
+                    name.id for name in ast.walk(node)
+                    if isinstance(name, ast.Name) and isinstance(name.ctx, ast.Load)
+                    and name.id not in bound
+                })
+                if missing:
+                    offenders.setdefault(path.name, []).append(
+                        f"{node.name}() at line {node.lineno} reads {missing}"
+                    )
+
+    assert not offenders, (
+        f"{offenders} name something the module never binds. A function whose body "
+        "raises NameError is not dead code -- it is a booby trap, and Python does "
+        "not resolve a bare name until it is called, so no test sees it until "
+        "something wants the feature back. Delete the function or bind the name."
+    )
+
+
+def test_the_readme_does_not_claim_the_panel_hides_itself_during_a_game():
+    """The README contradicted the code, three cells and a paragraph against it.
+
+    The fullscreen table said the panel "is hidden while the game is running", and
+    the Russian cell said the same. Nothing hides it: there is no hide(), no
+    show() outside __init__ and shutdown, and no code anywhere that watches for a
+    game -- the user asked for it never to disappear on its own, and three other
+    places in the same document say so correctly.
+
+    A document that contradicts its own implementation is worse than one that is
+    merely incomplete, because the contradiction is the part a reader believes
+    about the *other* claims. So both cells are checked, and so is the honest
+    statement that replaces them: the panel never hides itself, and exclusive
+    fullscreen owns the display's output so nothing composites over it, while
+    borderless fullscreen is an ordinary window the topmost re-assertion holds.
+
+    A claim checked against the code rather than against wording: the assertion
+    is that no cell says the panel hides, and that each of the two cells does say
+    the two things that are true.
+    """
+    readme = (Path(app_main.__file__).resolve().parent / "README.md").read_text(
+        encoding="utf-8"
+    )
+
+    def rows():
+        """(mode label, description) for every fullscreen row, both languages."""
+        for line in readme.splitlines():
+            if not line.startswith("|"):
+                continue
+            cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+            if len(cells) != 2 or "fullscreen" not in cells[0] and "полноэкран" not in cells[0]:
+                continue
+            yield cells[0], cells[1]
+
+    table = list(rows())
+    exclusive = [(a, b) for a, b in table if "xclusive" in a or "ксклюзивный" in a]
+    borderless = [(a, b) for a, b in table if "orderless" in a or "ограничный" in a]
+    assert len(exclusive) == 2 and len(borderless) == 2, (
+        f"expected one row per fullscreen mode in each of the two languages, got "
+        f"exclusive={exclusive} borderless={borderless}"
+    )
+
+    for label, cell in exclusive:
+        # The old claim, in both languages.
+        assert not cell.startswith("Is hidden"), (label, cell)
+        assert not cell.startswith("Скрыта"), (label, cell)
+        # The two things that are true, in both languages.
+        assert "never hides" in cell.lower() or "никогда не прячется" in cell.lower(), (
+            label, cell
+        )
+        assert "borderless" in cell.lower() or "пограничн" in cell.lower(), (label, cell)
+        assert "output" in cell.lower() or "вывод" in cell.lower(), (label, cell)
 
 
 def test_every_persisted_boolean_has_a_toggle_and_nothing_else_does(qapp, tmp_path):

@@ -66,13 +66,33 @@ in a frameless panel that sits in a corner of the screen.
 | Tray icon, double-click | Snap the panel back to the top-right corner |
 | Middle-click | Quit |
 
-The menu holds **Reset position**, **Opacity**, **Write history to file**, and **Quit**.
+The menu holds **Reset position**, **Opacity**, **Scale**, **Write history to file**, and **Quit**.
 
 **There is no "Always on top" switch, because the panel is always on top.** It used to be
 there, and it did nothing you could see: it removed a window flag that was not what was
 keeping the panel visible, since a borderless tool window is topmost anyway. A switch that
 reports no effect is worse than no switch, so the panel's position in the z-order is now
 stated once, in the window flags, and cannot be switched off.
+
+### Size
+
+**Scale** offers three steps: **75%**, **85%** and **100%** (the default). Each one is a
+proportional shrink of the whole panel — every dimension, every corner radius, every font
+size — so the design is the same picture at a different size rather than a smaller one with
+the same text crammed in. At 75% the panel is 210 × 210 instead of 280 × 280, and at 85% it
+is 238 × 238.
+
+Steps larger than the current size were offered and declined, so 100% is the top of the
+list. There is no step between the three and no "Custom" row: the Opacity submenu needs one
+because the mouse wheel moves in finer steps than its labels, so a value between two labels
+is a value this application produces. Nothing here can put the scale anywhere but on a row,
+and a `settings.json` naming a scale the panel does not offer is discarded with the same
+warning as any other unusable field.
+
+The panel keeps its top-left corner when the size changes. A panel snapped to the top-right
+therefore ends up further from the right edge than it was — it does not move on its own, and
+**Reset position** or a double-click re-snaps it. The one exception is a panel dragged hard
+against a screen edge, which is pulled back on so that it cannot end up partly off-screen.
 
 ### Above fullscreen games
 
@@ -243,13 +263,33 @@ build started from a shortcut has a working directory nobody chose.
 | Значок в трее, двойной клик | Вернуть панель в правый верхний угол |
 | Центральная кнопка | Закрыть приложение |
 
-В меню есть **Reset position**, **Opacity**, **Write history to file** и **Quit**.
+В меню есть **Reset position**, **Opacity**, **Scale**, **Write history to file** и **Quit**.
 
 **Переключателя «Always on top» больше нет, потому что панель всегда сверху.** Раньше он
 был и не делал ничего заметного: снимал флаг окна, который и не удерживал панель наверху,
 ведь frameless-окно типа tool и так поверх остальных. Переключатель, который ничего не
 меняет, хуже его отсутствия, поэтому положение панели в z-порядке теперь задано один раз
 во флагах окна и не выключается.
+
+### Размер
+
+В подменю **Scale** три шага: **75%**, **85%** и **100%** (по умолчанию). Каждый — это
+пропорциональное уменьшение всей панели: всех размеров, всех скруглений и всех размеров
+шрифта, — то есть тот же рисунок в другом размере, а не тот же текст, впихнутый в меньшую
+рамку. При 75% панель 210 × 210 вместо 280 × 280, при 85% — 238 × 238.
+
+Шагов больше текущего размера предлагали, и их отклонили, поэтому 100% — верхняя строка
+списка. Промежуточных значений нет, и строки «Custom» тоже: в подменю Opacity она нужна
+потому, что колесо мыши меняет прозрачность шагами мельче, чем расстояния между подписями,
+и значение между двумя подписями приложение производит само. Здесь ничто не может поставить
+масштаб не на строку списка, а `settings.json` с масштабом, которого панель не предлагает,
+отбрасывается с тем же предупреждением, что и любое другое негодное значение.
+
+При смене размера панель сохраняет свой левый верхний угол. Поэтому панель, прижатая к
+правому верхнему углу, окажется дальше от правого края, чем была, — сама она не
+перемещается, а **Reset position** или двойной клик возвращают её на место. Исключение одно:
+панель, притянутая вплотную к краю экрана, подтягивается обратно, чтобы не оказаться
+частично за пределами экрана.
 
 ### Поверх игр в полноэкранном режиме
 

@@ -13,6 +13,7 @@ guess about timing.
 
 import ast
 import ctypes
+import json
 import logging
 import logging.handlers
 import subprocess
@@ -35,7 +36,7 @@ import theme
 from history import HistoryLog
 from metrics import Snapshot
 from overlay import MonitorPanel
-from settings import Settings
+from settings import Settings, load_settings
 
 
 class RecordingProbe:
@@ -287,8 +288,24 @@ def menu_app(tmp_path):
     app = bare_app(tmp_path)
     app.collector = StubCollector()
     app._alpha_actions = {}
+    app._scale_actions = {}
     app._toggle_actions = {}
     return app
+
+
+def submenu(menu, title):
+    """The submenu with this title, or a failure that says what is there."""
+    for action in menu.actions():
+        if action.menu() is not None and action.text() == title:
+            return action.menu()
+    raise AssertionError(
+        f"the menu has no {title!r} submenu; it has "
+        f"{[a.text() for a in menu.actions()]}"
+    )
+
+
+def checked_labels(menu):
+    return [action.text() for action in menu.actions() if action.isChecked()]
 
 
 @pytest.fixture
@@ -1032,7 +1049,7 @@ def test_the_opacity_menu_shows_the_alpha_the_wheel_left_behind(qapp, tmp_path):
     """
     app = menu_app(tmp_path)
     menu = app._build_menu()
-    opacity = next(action.menu() for action in menu.actions() if action.menu() is not None)
+    opacity = submenu(menu, "Opacity")
 
     def checked():
         return [action.text() for action in opacity.actions() if action.isChecked()]
@@ -1079,6 +1096,170 @@ def test_the_menu_re_checks_itself_however_it_was_opened(qapp, tmp_path):
 
     assert app._alpha_custom.isVisible(), "the menu kept the checkmarks it was built with"
     assert app._alpha_custom.isChecked()
+
+
+# --- the Scale submenu ------------------------------------------------------
+
+
+def test_the_scale_submenu_offers_exactly_the_scales_the_panel_has(qapp, tmp_path):
+    """Three rows, and the labels are derived from the same tuple the loader reads.
+
+    theme.SCALE_STEPS is the one place a scale is listed, and the submenu's rows
+    and settings.py's validator both read it. Asserted against the tuple rather
+    than against a written-out list, so adding a step to theme cannot leave the
+    menu offering something the loader refuses -- or offering three rows when
+    four are on offer -- without failing here first. The labels are compared as
+    a derivation too: what has to hold is that each row is named the way the
+    Opacity submenu names its alphas, not that a percentage sign appears.
+    """
+    app = menu_app(tmp_path)
+    menu = app._build_menu()
+    scale_menu = submenu(menu, "Scale")
+
+    rows = [(action.text(), app_main.scale_action_value(action))
+            for action in scale_menu.actions()]
+
+    assert [value for _, value in rows] == list(theme.SCALE_STEPS), (
+        f"the Scale submenu offers {[v for _, v in rows]} against the panel's "
+        f"{list(theme.SCALE_STEPS)}"
+    )
+    assert [label for label, _ in rows] == [
+        f"{round(value * 100)}%" for value in theme.SCALE_STEPS
+    ], [label for label, _ in rows]
+    # No Custom row, and nothing above 1.00: scales larger than the current size
+    # were offered once and declined, and no gesture in the interface can land on
+    # a value between two steps.
+    assert len(scale_menu.actions()) == len(theme.SCALE_STEPS), (
+        f"the Scale submenu has {len(scale_menu.actions())} rows for "
+        f"{len(theme.SCALE_STEPS)} scales: a row for a value the panel cannot take"
+    )
+    assert max(theme.SCALE_STEPS) <= 1.0
+
+
+def test_picking_a_scale_resizes_the_panel_and_persists_it(qapp, tmp_path):
+    """The row is wired to the panel and to the setting, not just to itself.
+
+    Driven through the action rather than through _set_scale, because what a
+    click has to do is the whole claim: a submenu whose rows are correct labels
+    over handlers that do nothing would satisfy every other test in this file.
+    """
+    app = menu_app(tmp_path)
+    menu = app._build_menu()
+    scale_menu = submenu(menu, "Scale")
+    before = app.panel.size()
+
+    wanted = theme.SCALE_STEPS[0]
+    row = next(action for action in scale_menu.actions()
+               if app_main.scale_action_value(action) == wanted)
+    row.trigger()
+
+    assert app.panel.current_scale() == wanted
+    assert app.settings.scale == wanted, "the scale has two sources"
+    layout = theme.Layout(wanted)
+    assert (app.panel.width(), app.panel.height()) == (layout.canvas_w, layout.canvas_h)
+    assert app.panel.size() != before
+
+
+def test_the_scale_menu_re_checks_itself_whenever_it_was_opened(qapp, tmp_path):
+    """The checkmark follows the live value, not the value at startup.
+
+    Emitted through aboutToShow rather than by calling _sync_menu(), because the
+    menu is reached two ways -- the panel's own context menu and a right-click on
+    the tray icon -- and the second never goes through _show_menu_at(). A menu
+    synced on one of them lies on the other.
+    """
+    app = menu_app(tmp_path)
+    menu = app._build_menu()
+    scale_menu = submenu(menu, "Scale")
+
+    menu.aboutToShow.emit()
+    assert checked_labels(scale_menu) == ["100%"], (
+        f"the panel starts at {theme.DEFAULT_SCALE} and the menu says "
+        f"{checked_labels(scale_menu)}"
+    )
+
+    app._set_scale(theme.SCALE_STEPS[0])
+    menu.aboutToShow.emit()
+    assert checked_labels(scale_menu) == ["75%"], (
+        f"the panel is at {theme.SCALE_STEPS[0]} and the menu still says "
+        f"{checked_labels(scale_menu)}"
+    )
+
+    # Both directions: a row that cleared the others without ever setting itself
+    # would pass the first half.
+    app._set_scale(theme.DEFAULT_SCALE)
+    menu.aboutToShow.emit()
+    assert checked_labels(scale_menu) == ["100%"], (
+        f"coming back up did not move the checkmark: {checked_labels(scale_menu)}"
+    )
+
+
+def test_exactly_one_scale_is_ever_checked(qapp, tmp_path):
+    """The three rows are exhaustive, so "none checked" is unreachable.
+
+    This is what the membership validator buys. Alpha can sit between two
+    labels -- the wheel puts it there -- and needed a Custom row to say so.
+    Scale cannot, so if two rows could be checked, or none, the submenu would be
+    describing a state of the panel that the panel cannot be in, and the value
+    behind that state is one the loader refuses on the next start. Driven from
+    every scale the loader accepts, through a full menu sync.
+    """
+    app = menu_app(tmp_path)
+    menu = app._build_menu()
+    scale_menu = submenu(menu, "Scale")
+
+    for scale in theme.SCALE_STEPS:
+        app.settings.scale = scale
+        app._sync_menu()
+        marked = checked_labels(scale_menu)
+        assert marked == [f"{round(scale * 100)}%"], (
+            f"at scale {scale} the submenu has {marked} checked, which is not "
+            "exactly the one row for the scale the panel is at"
+        )
+
+
+def test_every_scale_the_loader_accepts_has_a_row_and_the_reverse(qapp, tmp_path):
+    """Two readers of one tuple, neither of them wider than the other.
+
+    A step offered but not loadable would be a row that silently reverts on the
+    next start; a loadable value with no row would be a setting the user cannot
+    undo from the menu. Both are silent, and both would be visible only from
+    outside -- hence loading a file for each candidate rather than asking the
+    validator what it thinks.
+    """
+    app = menu_app(tmp_path)
+    menu = app._build_menu()
+    offered = [app_main.scale_action_value(action)
+               for action in submenu(menu, "Scale").actions()]
+
+    for value in (0.5, 0.7, 0.75, 0.8, 0.85, 0.9, 1.0, 1.2):
+        path = tmp_path / "settings.json"
+        path.write_text(json.dumps({"scale": value}), encoding="utf-8")
+        accepted = load_settings(path).scale == value
+
+        assert accepted == (value in theme.SCALE_STEPS), (
+            f"the loader accepted {value}: {accepted}, against the panel's "
+            f"{list(theme.SCALE_STEPS)}"
+        )
+        assert (value in offered) == accepted, (
+            f"{value} is offered by the menu: {value in offered}, and accepted "
+            f"by the loader: {accepted}"
+        )
+
+
+def test_a_scale_change_refreshes_the_reading_behind_the_panel(qapp, tmp_path):
+    """Every menu action that changes something pokes the sampler.
+
+    The rule the opacity rows already follow: the numbers on screen are two
+    seconds old at worst when the menu opens, and a panel the user has just
+    resized is not the moment to show them a stale reading.
+    """
+    app = menu_app(tmp_path)
+    app._build_menu()
+
+    app._set_scale(theme.SCALE_STEPS[0])
+
+    assert app.collector.pokes == 1, "the scale changed without refreshing the panel"
 
 
 # --- logging --------------------------------------------------------------

@@ -81,9 +81,29 @@ ALPHA_STEPS = (("35%", 0.35), ("50%", 0.50), ("65%", 0.65), ("80%", 0.80), ("100
 # so this is never a question of exact equality.
 ALPHA_EPSILON = 0.001
 
+# The Scale submenu's rows, labelled from theme.SCALE_STEPS rather than written
+# out here. Those numbers are read by the loader that validates the saved
+# setting as well, and a second copy of the list is a second answer to "which
+# scales can this panel be": a step added to one and not the other is a row that
+# silently reverts on the next start, or a scale the file accepts and no row can
+# set. One tuple, two readers -- the same reason theme owns the alpha range and
+# settings.py imports it.
+SCALE_STEPS = tuple((f"{round(value * 100)}%", value) for value in theme.SCALE_STEPS)
+
 
 def alpha_label(value: float) -> str:
     return f"{round(value * 100)}%"
+
+
+def scale_action_value(action: QAction) -> float:
+    """The scale a Scale submenu row stands for.
+
+    Read off the action rather than inferred from its label or its position in
+    the submenu, so the rows can be compared with theme.SCALE_STEPS -- the tuple
+    the loader validates the saved setting against -- instead of with a
+    written-out list that would have to be kept in step by hand.
+    """
+    return action.data()
 
 
 def labelled_alpha(alpha: float) -> float | None:
@@ -396,6 +416,7 @@ class MonitorApp:
 
         self._stopped = False
         self._alpha_actions: dict[float, QAction] = {}
+        self._scale_actions: dict[float, QAction] = {}
         self._toggle_actions: dict[str, QAction] = {}
 
         self.tray = QSystemTrayIcon(build_tray_icon(), self.panel)
@@ -504,12 +525,13 @@ class MonitorApp:
         """Re-check the menu against the settings before it opens.
 
         A menu built once at startup keeps claiming the state it had then: the
-        wheel changes the alpha without coming through here, and the history
-        toggle can be refused by the filesystem after the checkmark has already
-        gone on. Wired to the menu's aboutToShow rather than called from the one
-        place that opens it, because there are two: the panel's own context menu
-        and a right-click on the tray icon, and a checkmark that is only
-        refreshed on one of them lies on the other.
+        wheel changes the alpha without coming through here, a scale row was
+        clicked the last time this menu was open, and the history toggle can be
+        refused by the filesystem after the checkmark has already gone on. Wired
+        to the menu's aboutToShow rather than called from the one place that
+        opens it, because there are two: the panel's own context menu and a
+        right-click on the tray icon, and a checkmark that is only refreshed on
+        one of them lies on the other.
         """
         chosen = labelled_alpha(self.settings.alpha)
         for value, action in self._alpha_actions.items():
@@ -518,6 +540,15 @@ class MonitorApp:
         self._alpha_custom.setChecked(chosen is None)
         if chosen is None:
             self._alpha_custom.setText(f"Custom ({alpha_label(self.settings.alpha)})")
+        # Exact equality, with no epsilon of the kind the alpha rows need.
+        # ALPHA_EPSILON exists because the wheel puts the alpha between two
+        # labels; nothing here can put the scale anywhere but on a row, and
+        # settings.py refuses anything that is not one -- so an epsilon would be
+        # admitting a state the panel cannot be in. Which is also why there is
+        # no Custom row for a scale between two steps: there is no Custom row
+        # because there is nothing for it to say.
+        for value, action in self._scale_actions.items():
+            action.setChecked(value == self.settings.scale)
         for name, action in self._toggle_actions.items():
             action.setChecked(bool(getattr(self.settings, name)))
 
@@ -550,6 +581,15 @@ class MonitorApp:
         opacity.addAction(custom)
         self._alpha_custom: QAction = custom
 
+        scale = menu.addMenu("Scale")
+        for label, value in SCALE_STEPS:
+            action = QAction(label, scale)
+            action.setCheckable(True)
+            action.setData(value)
+            action.triggered.connect(lambda _checked=False, v=value: self._set_scale(v))
+            scale.addAction(action)
+            self._scale_actions[value] = action
+
         history = QAction("Write history to file", menu)
         history.setCheckable(True)
         history.setChecked(self.settings.log_history)
@@ -567,6 +607,10 @@ class MonitorApp:
 
     def _set_alpha(self, value: float) -> None:
         self.panel.set_alpha(value)
+        self.collector.poke()
+
+    def _set_scale(self, value: float) -> None:
+        self.panel.set_scale(value)
         self.collector.poke()
 
     def _set_log_history(self, enabled: bool) -> None:

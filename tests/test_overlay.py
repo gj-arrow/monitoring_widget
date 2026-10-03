@@ -179,8 +179,9 @@ def wheel(dy):
     )
 
 
-def blank_canvas():
-    image = QImage(theme.CANVAS_W, theme.CANVAS_H, QImage.Format.Format_ARGB32_Premultiplied)
+def blank_canvas(scale=theme.DEFAULT_SCALE):
+    layout = theme.Layout(scale)
+    image = QImage(layout.canvas_w, layout.canvas_h, QImage.Format.Format_ARGB32_Premultiplied)
     image.fill(QColor(0, 0, 0, 0))
     return image
 
@@ -194,20 +195,29 @@ def render_panel(panel):
     something that may raise, the calling test has to be registered in
     ABORT_PRONE_TESTS; otherwise this raises instead, which costs one test and
     says what to do about it.
+
+    The image is sized from the *widget*, not from panel.layout(), and that is
+    deliberate rather than convenient. panel.layout() is the value paintEvent is
+    supposed to read through an accessor, so sizing the canvas through it here
+    would satisfy a spy installed on it even if paintEvent reached past the
+    accessor and read the attribute -- which is precisely what
+    test_paint_event_reads_the_layout_through_the_accessor exists to catch.
     """
     if overlay.paint is not _real_paint:
         _require_registered_caller("renders frames")
-    image = blank_canvas()
+    image = QImage(panel.width(), panel.height(), QImage.Format.Format_ARGB32_Premultiplied)
+    image.fill(QColor(0, 0, 0, 0))
     panel.render(image)
     return image
 
 
 def fresh_paint(panel):
     """One paint() call on a painter of its own: what the widget should draw."""
-    image = blank_canvas()
+    image = blank_canvas(panel.layout().scale)
     canvas_painter = QPainter(image)
     try:
-        paint(canvas_painter, panel._snapshot, panel._histories, panel.current_alpha())
+        paint(canvas_painter, panel.layout(), panel._snapshot, panel._histories,
+              panel.current_alpha())
     finally:
         canvas_painter.end()
     return image
@@ -317,19 +327,21 @@ def max_channel_delta(a, b):
     return worst
 
 
-def test_the_panel_is_the_canvas_size_and_not_the_panel_size():
+@pytest.mark.parametrize("scale", theme.SCALE_STEPS)
+def test_the_panel_is_the_canvas_size_and_not_the_panel_size(scale):
     """The widget carries the panel *and* the margin its shadow bleeds into.
 
-    painter.paint() translates by theme.BLEED and draws the drop shadow outside
-    panel_rect(), so a widget sized to theme.WIDTH x theme.HEIGHT clips the
-    halo at its own edge and the panel reads as a hard wall -- the defect the
-    golden images had before the canvas grew. The equality is on the canvas, so
-    a regression to the panel size fails here rather than looking like a
-    slightly tighter shadow nobody notices.
+    painter.paint() translates by the layout's bleed and draws the drop shadow
+    outside panel_rect(), so a widget sized to the panel clips the halo at its
+    own edge and the panel reads as a hard wall -- the defect the golden images
+    had before the canvas grew. The equality is on the canvas, so a regression
+    to the panel size fails here rather than looking like a slightly tighter
+    shadow nobody notices.
     """
-    panel = make_panel()
-    assert panel.width() == theme.CANVAS_W == theme.WIDTH + 2 * theme.BLEED
-    assert panel.height() == theme.CANVAS_H == theme.HEIGHT + 2 * theme.BLEED
+    panel = MonitorPanel(Settings(scale=scale))
+    layout = panel.layout()
+    assert panel.width() == layout.canvas_w == layout.width + 2 * layout.bleed
+    assert panel.height() == layout.canvas_h == layout.height + 2 * layout.bleed
 
 
 def test_panel_does_not_steal_focus():
@@ -776,18 +788,25 @@ def test_a_position_from_a_build_with_a_smaller_panel_is_honoured():
     panel out from under the user on the first start of this build, so the
     answer is to leave the number alone and let clamping judge it against the
     size the panel is now.
-    """
-    panel = make_panel()
-    available = panel.screen().availableGeometry()
-    stored = QPoint(available.right() - theme.WIDTH - 20, available.top() + 40)
 
-    assert panel.clamp_to_screen(stored) == stored
+    The same rule now covers a panel that shrank, which is the case this build
+    introduces: a top-left stored at scale 1.0 is still a top-left stored at
+    0.75, and the panel is drawn into the space it already occupied.
+    """
+    for scale in theme.SCALE_STEPS:
+        panel = MonitorPanel(Settings(scale=scale))
+        available = panel.screen().availableGeometry()
+        stored = QPoint(available.right() - 280 - 20, available.top() + 40)
+
+        assert panel.clamp_to_screen(stored) == stored, (
+            f"scale {scale}: a corner that was on screen at scale 1.0 was moved"
+        )
 
 
 def test_two_ticks_through_paint_event_match_one_fresh_paint():
     """The reused painter must land on the same pixels twice, and match paint().
 
-    paint() translates the canvas by theme.BLEED, so a painter that kept that
+    paint() translates the canvas by the layout's bleed, so a painter that kept that
     translate would start every tick 8 px further right than the last and walk
     the panel off the canvas -- while the golden images, each painted by a
     fresh painter, stayed green. Task 5 proves paint() hands the painter back
@@ -1289,6 +1308,341 @@ def test_a_failed_frame_does_not_take_the_process_with_it():
         f"render-driven tests in this file would otherwise have taken this run "
         f"with them:\n{report}"
     )
+
+
+# --- the panel can be drawn smaller -----------------------------------------
+
+
+@pytest.mark.parametrize("scale", theme.SCALE_STEPS)
+def test_the_panel_draws_at_the_scale_it_was_built_with(scale):
+    """The widget's size and the renderer's layout are one number.
+
+    Checked through the widget rather than against theme, because the two are
+    what can disagree: a panel that resized its window but kept handing the
+    renderer the old layout would satisfy every geometry assertion here and crop
+    on screen.
+    """
+    panel = MonitorPanel(Settings(scale=scale))
+    panel.apply_snapshot(Snapshot(cpu_pct=34.0, ram_used_gb=11.4, ram_total_gb=32.0))
+
+    assert panel.current_scale() == scale
+    assert panel.layout().scale == scale
+
+    image = render_panel(panel)
+    assert (image.width(), image.height()) == (panel.layout().canvas_w, panel.layout().canvas_h)
+    assert max_channel_delta(image, blank_canvas(scale)) > 60, (
+        f"nothing was drawn at scale {scale}"
+    )
+
+
+def test_painting_the_same_reading_at_two_scales_gives_two_different_pictures():
+    """A scale that changes no pixels is a scale that was not applied.
+
+    Sizes alone would pass for a renderer that drew the same panel into a bigger
+    window, so the pictures are compared at the size each one asked for.
+    """
+    small = MonitorPanel(Settings(scale=theme.SCALE_STEPS[0]))
+    large = MonitorPanel(Settings(scale=theme.SCALE_STEPS[-1]))
+    for panel in (small, large):
+        panel.apply_snapshot(Snapshot(cpu_pct=34.0, ram_used_gb=11.4, ram_total_gb=32.0))
+
+    assert small.layout() != large.layout()
+    assert (small.width(), small.height()) != (large.width(), large.height())
+    assert max_channel_delta(render_panel(small), render_panel(large)) > 60
+
+
+def test_setting_the_scale_resizes_the_window_without_moving_it():
+    """The panel gets smaller where it stands.
+
+    Picking a scale is the only action in the application that would otherwise
+    move the panel, and it would move it out from under a hand that had just
+    closed the menu -- so the top-left is left exactly where it was and the
+    panel occupies less of the screen from that corner. `Reset position` and the
+    double click are how the user re-snaps it.
+
+    The panel is parked in its own default corner first, and that is the whole
+    difficulty of the assertion. Anywhere in the middle of the desktop a
+    re-anchor and "leave it alone" look identical: clamp_to_screen() is a no-op
+    at (400, 300) on a 1536 px screen, so a set_scale that quietly re-snapped
+    the panel would pass every version of this test written from the middle of
+    the screen. The corner is where the panel actually lives, and its top-left is
+    still legal after a shrink -- which is what makes it the place where "did not
+    move" is a claim rather than a clamp.
+    """
+    panel = make_panel()
+    panel.restore_default_position()
+    parked = panel.pos()
+    before = panel.size()
+
+    panel.set_scale(0.75)
+
+    assert panel.pos() == parked, (
+        f"the panel moved from {parked} to {panel.pos()} when the scale changed: "
+        "picking a scale is not a placement gesture"
+    )
+    assert panel.size() != before
+    layout = theme.Layout(0.75)
+    assert (panel.width(), panel.height()) == (layout.canvas_w, layout.canvas_h)
+    assert panel.current_scale() == 0.75
+
+
+@pytest.mark.parametrize("from_scale", theme.SCALE_STEPS)
+def test_no_scale_change_can_leave_the_panel_off_screen(from_scale):
+    """The one thing a resize may change about the position: pull it back on.
+
+    Which direction matters, and it is the opposite of the one it first looks
+    like. Shrinking cannot push the panel off the screen: the top-left stays
+    where it is, so the right and bottom edges only move *inward* and there is
+    nothing new to hang over an edge. Growing is the dangerous one -- a 222 px
+    panel parked against the right edge becomes a 296 px one at the same top-left,
+    which puts 74 px of it past the screen.
+
+    So the panel is parked hard against each of the four corners at the smallest
+    scale and walked up through every step, and the whole canvas has to stay on
+    the screen at each one. Driving it in both directions matters for a second
+    reason: `set_scale` resizes and then clamps, and a version that clamped
+    against the size it already had would leave a grown panel exactly as far off
+    the screen as it already was, passing any version of this written from one
+    direction only.
+    """
+    panel = MonitorPanel(Settings(scale=from_scale))
+    available = panel.screen().availableGeometry()
+    corners = {
+        "top-left": QPoint(available.left(), available.top()),
+        "top-right": QPoint(available.right(), available.top()),
+        "bottom-left": QPoint(available.left(), available.bottom()),
+        "bottom-right": QPoint(available.right(), available.bottom()),
+    }
+
+    def on_screen(label, scale):
+        assert panel.pos().x() >= available.left(), (
+            f"{label} at scale {scale}: left edge {panel.pos().x()} is past the "
+            f"screen's {available.left()}"
+        )
+        assert panel.pos().y() >= available.top(), (
+            f"{label} at scale {scale}: top edge {panel.pos().y()} is above the "
+            f"screen's {available.top()}"
+        )
+        assert panel.pos().x() + panel.width() <= available.right() + 1, (
+            f"{label} at scale {scale}: right edge {panel.pos().x() + panel.width()} "
+            f"is past the screen's {available.right()}"
+        )
+        assert panel.pos().y() + panel.height() <= available.bottom() + 1, (
+            f"{label} at scale {scale}: bottom edge {panel.pos().y() + panel.height()} "
+            f"is past the screen's {available.bottom()}"
+        )
+
+    for name, corner in corners.items():
+        for to_scale in theme.SCALE_STEPS:
+            # Parked at the starting scale and then moved *straight* to the
+            # target. Walking the steps in order would hide an ordering bug: a
+            # set_scale that clamped against the size it already had would
+            # over-correct at each hop and still land on the screen, whereas the
+            # tray menu's rows are the scales themselves, so a user on 0.75
+            # clicking "100%" is exactly this one-call jump.
+            panel.set_scale(from_scale)
+            panel.move(panel.clamp_to_screen(corner))
+            on_screen(f"parked at the {name} corner", from_scale)
+
+            panel.set_scale(to_scale)
+
+            on_screen(f"from the {name} corner, {from_scale} to {to_scale}", to_scale)
+
+
+def test_the_scale_survives_a_restart(tmp_path):
+    """The whole reason it is a setting: a restart comes back at the same size."""
+    from settings import load_settings, save_settings
+
+    panel = make_panel()
+    panel.set_scale(0.85)
+    path = tmp_path / "settings.json"
+    assert save_settings(panel._settings, path) is True
+
+    restored = load_settings(path)
+    assert restored.scale == 0.85
+    assert MonitorPanel(restored).layout() == panel.layout()
+
+
+def test_the_repaint_timer_survives_a_change_of_scale(qapp):
+    """A resize must not disturb the timers parented to the panel.
+
+    setFixedSize() is the one call that changes the window's size, and two
+    timers hang off this widget: the repaint that keeps the staleness rule
+    reachable, and -- in the running application -- the topmost re-assertion.
+    Both are parented to the panel so Qt stops them when the widget goes; a
+    resize that stopped or replaced one would leave a panel that repaints at the
+    wrong cadence, or stops coming back on top, with nothing on screen saying
+    so.
+    """
+    panel = make_panel()
+    before = panel.findChildren(QTimer)
+    assert len(before) == 1
+    timer = before[0]
+
+    panel.set_scale(0.75)
+
+    after = panel.findChildren(QTimer)
+    assert len(after) == 1, f"the panel owns {len(after)} timers after a resize, expected 1"
+    assert after[0] is timer, "the resize replaced the panel's own repaint timer"
+    assert timer.isActive(), "the repaint timer stopped when the panel was resized"
+    assert timer.interval() == theme.TICK_MS
+    assert timer.parent() is panel
+
+
+def test_the_topmost_timer_survives_a_change_of_scale(qapp, tmp_path):
+    """Same for the one that is not the panel's own.
+
+    MonitorApp parents the re-assertion to the panel rather than to the tray or
+    the application, so the resize has to leave it running and pointed at the
+    same window. If it stopped, a game could bury the panel and the z-order
+    would never be taken back -- with no visible symptom except the panel's
+    absence behind something else.
+    """
+    import main as app_main
+
+    app = app_main.MonitorApp.__new__(app_main.MonitorApp)
+    app.settings = Settings()
+    app.panel = MonitorPanel(app.settings)
+    app._watch_topmost()
+    timer = app._topmost_timer
+    assert timer.isActive()
+    assert timer.parent() is app.panel
+
+    app.panel.set_scale(0.75)
+
+    assert timer.isActive(), (
+        "the topmost re-assertion stopped when the panel was resized: a game "
+        "could bury the panel and nothing would take the z-order back"
+    )
+    assert timer.parent() is app.panel
+    assert timer.interval() == app_main.TOPMOST_REASSERT_MS
+
+
+def test_paint_event_reads_the_layout_through_the_accessor():
+    """One route to the size on screen, the way alpha has one.
+
+    set_scale() writes the layout and layout() reads it. Reading the attribute
+    directly inside paintEvent gives one value two paths to itself, and the two
+    can only start disagreeing once something moves the scale without going
+    through set_scale(). The spy is the point: both readings return the same
+    object, so comparing them would pass whatever paintEvent did.
+    """
+    panel = make_panel()
+    panel.apply_snapshot(Snapshot(cpu_pct=34.0))
+    asked = []
+    accessor = panel.layout
+
+    def spy():
+        asked.append(None)
+        return accessor()
+
+    panel.layout = spy
+    render_panel(panel)
+
+    assert asked, "paintEvent read the layout off the widget instead of the accessor"
+
+
+@pytest.mark.parametrize("scale", theme.SCALE_STEPS)
+def test_drag_is_clamped_to_the_screen_at_every_scale(scale):
+    """A smaller panel clamps against its own smaller size.
+
+    clamp_to_screen reads self.width() and self.height(), which are the canvas
+    at whatever scale is loaded -- so this is really the assertion that the
+    resize happened before the clamp did its arithmetic, and that the panel
+    cannot be dragged far enough for any part of it to hang off the screen.
+    """
+    panel = MonitorPanel(Settings(scale=scale))
+    panel.move(100, 100)
+    available = panel.screen().availableGeometry()
+
+    panel.mousePressEvent(mouse_event(
+        QMouseEvent.Type.MouseButtonPress, panel, QPoint(110, 110),
+        Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+    ))
+    panel.mouseMoveEvent(mouse_event(
+        QMouseEvent.Type.MouseMove, panel, QPoint(99999, 99999),
+        Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton,
+    ))
+
+    # Held against the far corner exactly, with none of its canvas hanging off
+    # the screen -- and against *this* panel's corner, not a 296 px one.
+    assert panel.pos() == QPoint(
+        available.right() - panel.width(),
+        available.bottom() - panel.height(),
+    ), f"scale {scale}: left at {panel.pos()}"
+
+
+def test_clamp_keeps_a_resized_panel_on_screen():
+    """Every direction, against the size the panel actually is now.
+
+    clamp_to_screen used self.width() and self.height() before there was a scale
+    to change, so what is being asserted is that the *resize* is what the clamp
+    reads rather than a number captured at construction: the 0.75 panel is 74 px
+    narrower than the 1.0 one and the corner it is held against moves by exactly
+    that much.
+    """
+    panel = make_panel()
+    available = panel.screen().availableGeometry()
+    full = panel.size()
+
+    panel.set_scale(0.75)
+    shrunk = panel.size()
+
+    assert shrunk != full
+    corner = QPoint(available.right() - shrunk.width(), available.bottom() - shrunk.height())
+    assert panel.clamp_to_screen(QPoint(99999, 99999)) == corner
+    assert panel.clamp_to_screen(QPoint(-5000, -5000)) == QPoint(
+        available.left(), available.top()
+    )
+    # A corner that was legal at the old size is still legal at the new one,
+    # which is why nothing rewrites it: the panel only ever got smaller.
+    stored = QPoint(available.right() - full.width(), available.top() + 40)
+    assert panel.clamp_to_screen(stored) == stored
+
+
+def test_a_position_saved_at_one_scale_is_honoured_at_another():
+    """The rule that was already true of a panel that grew, applied to one that shrank.
+
+    A top-left stored at scale 1.0 is still a top-left stored at 0.75: the panel
+    is drawn inside the space it already occupied, so rewriting or discarding the
+    number would move it out from under the user for no reason. What *is*
+    re-judged is the clamp, against the size the panel now is -- so a corner that
+    the old, wider panel hung off is pulled in rather than lost, and the clamped
+    result is the one written back for the next start.
+    """
+    panel = make_panel()
+    available = panel.screen().availableGeometry()
+    stored = QPoint(available.right() - 100, available.top() + 30)
+
+    panel.set_scale(0.75)
+    canvas = theme.Layout(0.75).canvas_w
+
+    # 100 px from the right edge was inside a 296 px canvas and is outside a
+    # 222 px one, so the clamp pulls it left rather than dropping it.
+    assert panel.clamp_to_screen(stored) == QPoint(
+        available.right() - canvas, available.top() + 30
+    ), f"a stored corner {stored} came back as {panel.clamp_to_screen(stored)}"
+
+    panel.move(panel.clamp_to_screen(stored))
+    panel.remember_position()
+    assert panel._settings.x == available.right() - canvas
+    assert panel._settings.y == available.top() + 30
+
+
+def test_a_corner_well_inside_the_screen_is_left_alone_by_the_resize():
+    """Clamping is the only thing that may move a stored position.
+
+    The other half of the rule above: a panel dropped in the middle of the
+    desktop has to come back exactly where it was left, or "honour the stored
+    top-left" would be true only of corners.
+    """
+    panel = make_panel()
+    panel.move(400, 300)
+
+    panel.set_scale(0.75)
+
+    assert panel.clamp_to_screen(QPoint(400, 300)) == QPoint(400, 300)
+    assert panel.pos() == QPoint(400, 300)
 
 
 # --- the panel is above other windows, and there is nothing to turn off ----

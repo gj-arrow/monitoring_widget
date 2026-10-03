@@ -27,7 +27,7 @@ def test_unknown_keys_are_ignored(tmp_path):
 
 def test_round_trip(tmp_path):
     path = tmp_path / "settings.json"
-    original = Settings(x=100, y=200, alpha=0.65, log_history=True)
+    original = Settings(x=100, y=200, alpha=0.65, scale=0.85, log_history=True)
     assert save_settings(original, path) is True
     assert load_settings(path) == original
 
@@ -269,3 +269,127 @@ def test_deeply_nested_settings_do_not_reach_startup(tmp_path):
     path.write_text("[" * 20_000 + "]" * 20_000, encoding="utf-8")
 
     assert load_settings(path) == Settings()
+
+
+# --- the scale --------------------------------------------------------------
+#
+# Same shape as the alpha validator -- type check, reject, default, warn -- with
+# a different predicate: membership in the steps the panel offers rather than a
+# range. The predicate is the point. Alpha is moved by a wheel in steps finer
+# than its labels, so a value between two labels is a value the application
+# produces and the menu has to be able to describe (it has a Custom row for it).
+# Scale has no such gesture, so the only way an off-step value can exist is a
+# hand-edited file -- and a fourth menu row to describe a value the interface
+# cannot produce would be a menu that shows the user a control it does not have.
+
+
+@pytest.mark.parametrize("scale", [0.9, 0.5, 1.25, 1.01, 0.749, 0.0, -0.75])
+def test_a_scale_the_panel_does_not_offer_falls_back_to_the_default(tmp_path, scale):
+    path = tmp_path / "settings.json"
+    path.write_text(json.dumps({"scale": scale, "x": 10}), encoding="utf-8")
+
+    loaded = load_settings(path)
+
+    assert loaded == Settings(x=10)
+    # The number, not Settings().scale: comparing a fallback against the default
+    # it *is* the fallback from passes for any value at all.
+    assert loaded.scale == theme.DEFAULT_SCALE == 1.0
+
+
+@pytest.mark.parametrize("raw", ['"0.75"', "true", "false", "null", "[1]", "{}", "NaN",
+                                "Infinity", "-Infinity"])
+def test_a_scale_that_is_not_a_number_falls_back_to_the_default(tmp_path, raw):
+    path = tmp_path / "settings.json"
+    path.write_text('{"scale": %s, "x": 5}' % raw, encoding="utf-8")
+
+    loaded = load_settings(path)
+
+    assert loaded == Settings(x=5)
+    assert loaded.scale == theme.DEFAULT_SCALE
+    # `1 == True` in Python, so membership alone would accept `true` as 1.0.
+    assert isinstance(loaded.scale, float)
+
+
+@pytest.mark.parametrize("scale", theme.SCALE_STEPS)
+def test_every_scale_the_panel_offers_is_accepted(tmp_path, scale):
+    path = tmp_path / "settings.json"
+    path.write_text(json.dumps({"scale": scale}), encoding="utf-8")
+
+    assert load_settings(path).scale == scale
+
+
+def test_a_scale_as_an_integer_is_normalised_to_float(tmp_path):
+    path = tmp_path / "settings.json"
+    path.write_text(json.dumps({"scale": 1}), encoding="utf-8")
+
+    assert load_settings(path).scale == 1.0
+    assert isinstance(load_settings(path).scale, float)
+
+
+def test_a_dropped_scale_is_logged_with_its_name(tmp_path, caplog):
+    """The alpha field's rule, applied to the new one: no silent drop."""
+    import logging
+
+    path = tmp_path / "settings.json"
+    path.write_text(json.dumps({"scale": 0.9}), encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="widget.settings"):
+        load_settings(path)
+
+    messages = [r.getMessage() for r in caplog.records if r.name == "widget.settings"]
+    assert any("scale" in m and "0.9" in m for m in messages), messages
+
+
+def test_the_scale_steps_are_declared_once_and_the_validator_reads_them(tmp_path):
+    """Adding a step cannot leave the menu and the loader disagreeing.
+
+    The membership test is written against theme.SCALE_STEPS rather than against
+    its own copy of the three numbers, and this checks that it is *reading* the
+    tuple: a validator that rejected only 0.75, 0.85 and 1.00 by hand would go
+    on accepting a fourth scale the moment the menu offered it. The precedent is
+    in this repository -- a test that hardcoded a copy of a production constant
+    and cost several review rounds -- so the coupling is asserted from the
+    outside instead.
+    """
+    from settings import VALIDATORS
+
+    check = VALIDATORS["scale"]
+    assert Settings().scale == theme.DEFAULT_SCALE
+    assert theme.DEFAULT_SCALE in theme.SCALE_STEPS
+
+    for step in theme.SCALE_STEPS:
+        assert check(step) == step, f"the panel offers {step} and the loader refuses it"
+
+    # And one that is not a step, including each end of the range and a value
+    # between two steps, so membership -- rather than a range check that happens
+    # to agree on these three numbers -- is what is being tested.
+    for not_offered in (0.9, 0.8, 0.7, 1.1, 2.0):
+        assert not_offered not in theme.SCALE_STEPS
+        with pytest.raises(ValueError):
+            check(not_offered)
+
+
+def test_a_default_the_offer_does_not_include_would_not_load(tmp_path):
+    """theme.DEFAULT_SCALE is written by every save, so it has to load back."""
+    from settings import VALIDATORS
+
+    assert VALIDATORS["scale"](theme.DEFAULT_SCALE) == theme.DEFAULT_SCALE, (
+        "theme.DEFAULT_SCALE is not one of the scales the panel offers, so every "
+        "save of a default install writes a file that will not load"
+    )
+
+
+def test_a_settings_file_from_a_build_with_no_scale_in_it_still_loads(tmp_path):
+    """An existing settings.json has no `scale` key, and that is not an error.
+
+    Absent falls through to the dataclass default, the same as every other
+    optional field: upgrading must not move the panel off the size it was drawn
+    at, and must not cost the user the position or the opacity they chose.
+    """
+    path = tmp_path / "settings.json"
+    path.write_text(json.dumps({"x": 1229, "y": 10, "alpha": 0.65}), encoding="utf-8")
+
+    loaded = load_settings(path)
+
+    assert loaded.scale == theme.DEFAULT_SCALE
+    assert (loaded.x, loaded.y, loaded.alpha) == (1229, 10, 0.65)

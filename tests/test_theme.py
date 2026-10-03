@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import pytest
+from PyQt6.QtGui import QFontMetricsF
 
 import theme
 
@@ -42,32 +43,73 @@ def test_metric_keys_are_the_documented_four():
 
 
 def test_geometry_heights_add_up_to_280():
-    expected = (
-        theme.PAD_TOP
-        + theme.HEADER_H
-        + len(theme.METRICS) * theme.ROW_H
-        + (len(theme.METRICS) - 1) * theme.ROW_GAP
-        + theme.PAD_BOTTOM
-    )
-    assert theme.HEIGHT == expected == 280
+    """The panel is a 280 px square at scale 1.0, and 280 is a pin not a sum.
+
+    The identity is checked at every scale below; the number is checked once, at
+    the scale the goldens were rendered at. A 280 px panel is what three
+    committed PNGs and a README describe, so changing it is a change to saved
+    art rather than a refactor.
+    """
+    for scale in theme.SCALE_STEPS:
+        layout = theme.Layout(scale)
+        expected = (
+            layout.pad_top
+            + layout.header_h
+            + len(theme.METRICS) * layout.row_h
+            + (len(theme.METRICS) - 1) * layout.row_gap
+            + layout.pad_bottom
+        )
+        assert layout.height == expected, f"the rows do not add up at scale {scale}"
+    assert theme.Layout(1.0).height == theme.Layout(1.0).width == 280
+
+
+@pytest.mark.parametrize("scale", theme.SCALE_STEPS)
+def test_the_rows_tile_the_panel_at_every_scale(scale):
+    """Every gap is the gap, not merely a gap.
+
+    `upper.bottom() < lower.top()` is satisfied by any spacing at all, so it
+    cannot notice a row_gap that stopped being applied -- the rows would drift
+    away from the foot of the panel one scale at a time, and nothing about a
+    "no overlap" check would say so. Stated exactly: the first row starts one
+    header below the top, every gap between rows is row_gap, and the last row
+    ends pad_bottom above the foot.
+    """
+    layout = theme.Layout(scale)
+    panel = layout.panel_rect()
+    rects = [rect for _, rect in layout.metric_rects()]
+
+    assert len(rects) == len(theme.METRICS)
+    for rect in rects:
+        assert panel.contains(rect), f"a row at {rect} is outside {panel}"
+        assert rect.left() == layout.pad_x
+        assert rect.right() == layout.width - layout.pad_x
+    for upper, lower in zip(rects, rects[1:]):
+        assert lower.top() - upper.bottom() == layout.row_gap
+    assert rects[0].top() - panel.top() == layout.pad_top + layout.header_h
+    assert panel.bottom() - rects[-1].bottom() == layout.pad_bottom
 
 
 def test_metric_rects_never_overlap():
-    rects = [rect for _, rect in theme.metric_rects()]
+    rects = [rect for _, rect in theme.Layout(1.0).metric_rects()]
     for upper, lower in zip(rects, rects[1:]):
         assert upper.bottom() < lower.top()
 
 
 def test_metric_rects_fit_inside_the_panel():
-    panel = theme.panel_rect()
-    for _, rect in theme.metric_rects():
+    panel = theme.Layout(1.0).panel_rect()
+    for _, rect in theme.Layout(1.0).metric_rects():
         assert rect.left() >= panel.left()
         assert rect.right() <= panel.right()
         assert rect.bottom() <= panel.bottom()
 
 
 def test_graph_strip_is_shorter_than_a_row():
-    assert theme.GRAPH_H < theme.ROW_H
+    for scale in theme.SCALE_STEPS:
+        layout = theme.Layout(scale)
+        assert layout.graph_h < layout.row_h, (
+            f"at scale {scale} the graph strip is {layout.graph_h} px in a "
+            f"{layout.row_h} px row: the row has no band left for its label"
+        )
 
 
 def test_worst_state_picks_the_most_severe():
@@ -113,57 +155,77 @@ def test_gpu_temperature_boundaries(temp, expected):
 
 
 def test_panel_width_is_pinned_to_280():
-    assert theme.WIDTH == 280
-    assert theme.panel_rect().width() == 280.0
+    layout = theme.Layout(1.0)
+    assert layout.width == 280
+    assert layout.panel_rect().width() == 280.0
 
 
-def test_canvas_is_the_panel_plus_a_bleed_margin():
-    assert theme.CANVAS_W == theme.WIDTH + 2 * theme.BLEED
-    assert theme.CANVAS_H == theme.HEIGHT + 2 * theme.BLEED
+@pytest.mark.parametrize("scale", theme.SCALE_STEPS)
+def test_canvas_is_the_panel_plus_a_bleed_margin(scale):
+    layout = theme.Layout(scale)
+    assert layout.canvas_w == layout.width + 2 * layout.bleed
+    assert layout.canvas_h == layout.height + 2 * layout.bleed
 
 
-def test_canvas_is_larger_than_the_panel_on_every_side():
-    assert theme.BLEED > 0
-    assert theme.CANVAS_W > theme.WIDTH
-    assert theme.CANVAS_H > theme.HEIGHT
+@pytest.mark.parametrize("scale", theme.SCALE_STEPS)
+def test_canvas_is_larger_than_the_panel_on_every_side(scale):
+    layout = theme.Layout(scale)
+    assert layout.bleed > 0
+    assert layout.canvas_w > layout.width
+    assert layout.canvas_h > layout.height
 
 
-def test_the_bleed_does_not_move_the_panel():
-    """280 x 280 is the panel, not the window: its rect stays at the origin."""
-    panel = theme.panel_rect()
+@pytest.mark.parametrize("scale", theme.SCALE_STEPS)
+def test_the_bleed_does_not_move_the_panel(scale):
+    """The panel's rect stays at the origin: the canvas is what grew.
+
+    280 x 280 is the panel, not the window, and paint() shifts it by the bleed.
+    """
+    layout = theme.Layout(scale)
+    panel = layout.panel_rect()
     assert (panel.left(), panel.top()) == (0.0, 0.0)
-    assert (panel.width(), panel.height()) == (theme.WIDTH, theme.HEIGHT)
+    assert (panel.width(), panel.height()) == (float(layout.width), float(layout.height))
 
 
-def test_row_text_inset_is_a_theme_constant_and_sits_inside_the_padding():
-    """Row text geometry belongs in theme, not beside it in the painter."""
-    assert 0 < theme.ROW_TEXT_INSET < theme.PAD_X
-    assert theme.ROW_TEXT_INSET + theme.ROW_TEXT_INSET < theme.WIDTH - 2 * theme.PAD_X
+@pytest.mark.parametrize("scale", theme.SCALE_STEPS)
+def test_row_text_inset_sits_inside_the_padding(scale):
+    """Row text geometry belongs in the layout, not beside it in the painter."""
+    layout = theme.Layout(scale)
+    assert 0 < layout.row_text_inset < layout.pad_x
+    assert layout.row_text_inset * 2 < layout.width - 2 * layout.pad_x
 
 
-def test_the_header_dot_fits_to_the_left_of_the_aligned_text():
+@pytest.mark.parametrize("scale", theme.SCALE_STEPS)
+def test_the_header_dot_fits_to_the_left_of_the_aligned_text(scale):
     """The header text lines up with the row labels, so the dot has to squeeze in.
 
     Placing the dot first and the text after it left the two left edges 6 px
     apart, with the header starting further right than the CPU/RAM/GPU/VRAM
     labels beneath it. The dot now hangs off the text's left edge by a fixed gap,
-    and both edges are stated once in theme so the renderer and its tests cannot
-    disagree about where they are.
+    and both edges are stated once in the layout so the renderer and its tests
+    cannot disagree about where they are.
     """
-    assert theme.header_text_x() == theme.PAD_X + theme.ROW_TEXT_INSET
+    layout = theme.Layout(scale)
+    assert layout.header_text_x() == layout.pad_x + layout.row_text_inset
     # The gap is a gap plus the dot's own diameter, so it is the *edges* that
-    # are separated by DOT_GAP, not the centre and the edge.
-    assert theme.header_text_x() - theme.header_dot_x() == theme.DOT_GAP + 2 * theme.DOT_R
-    assert theme.header_dot_x() - theme.DOT_R > theme.panel_rect().left(), (
+    # are separated by dot_gap, not the centre and the edge. Approximate rather
+    # than exact: the dot's radius is a scaled float, so this is 8.499999999999998
+    # against 8.5 at 0.85 and the identity is arithmetic, not equality.
+    assert layout.header_text_x() - layout.header_dot_x() == pytest.approx(
+        layout.dot_gap + 2 * layout.dot_r
+    )
+    assert layout.header_dot_x() - layout.dot_r > layout.panel_rect().left(), (
         "the dot hangs off the panel itself"
     )
-    assert theme.DOT_GAP > 0
+    assert layout.dot_gap > 0
 
 
-def test_the_header_text_edge_is_the_same_edge_the_row_labels_start_at():
+@pytest.mark.parametrize("scale", theme.SCALE_STEPS)
+def test_the_header_text_edge_is_the_same_edge_the_row_labels_start_at(scale):
     """One alignment rule for every string in the panel, not two."""
-    first_label_left = theme.metric_rects()[0][1].left() + theme.ROW_TEXT_INSET
-    assert theme.header_text_x() == first_label_left
+    layout = theme.Layout(scale)
+    first_label_left = layout.metric_rects()[0][1].left() + layout.row_text_inset
+    assert layout.header_text_x() == first_label_left
 
 
 def test_row_value_reads_a_pct_row():
@@ -228,7 +290,7 @@ def test_throughput_alone_is_not_data_for_the_status_dot():
 def test_throughput_never_reaches_a_row_state_or_the_worst_state():
     # Same reason, one level down: the rows colour themselves from their own
     # metrics, and there is no path by which a network rate could escalate one.
-    specs = [spec for spec, _ in theme.metric_rects()]
+    specs = [spec for spec, _ in theme.Layout(1.0).metric_rects()]
     states = [theme.metric_state(spec, snapshot(
         cpu_pct=1.0, net_down_bytes_per_sec=1e12, net_up_bytes_per_sec=1e12,
     )) for spec in specs]
@@ -272,3 +334,124 @@ def test_a_snapshot_with_no_timestamp_is_treated_as_fresh():
     # because a hand-built snapshot in a test left ts alone.
     assert theme.snapshot_is_stale(snapshot(), now=1000.0) is False
     assert theme.snapshot_is_stale(snapshot(ts=0.0), now=1000.0) is False
+
+
+# --- the scaled layout -------------------------------------------------------
+#
+# Every dimension and every font size the panel draws with. Layout derives all
+# of them from one number, and a dimension that is not derived from it is a
+# dimension that does not shrink -- so this list is walked twice: once to check
+# that each name exists (a rename fails here rather than in a golden) and once
+# to check that each one actually shrinks.
+LAYOUT_DIMENSIONS = (
+    "width", "height", "canvas_w", "canvas_h",
+    "pad_x", "pad_top", "pad_bottom", "header_h",
+    "row_h", "row_gap", "graph_h", "row_text_inset", "bleed",
+    "panel_radius", "row_radius", "dot_r", "dot_gap",
+    "value_gap", "text_top", "text_clearance", "graph_line_width",
+    "label_pt", "value_pt", "aux_pt",
+)
+
+
+def test_the_scales_offered_are_the_three_that_were_asked_for():
+    """0.75, 0.85 and 1.00 -- and nothing above 1.00.
+
+    The second assertion is the one that bites. SCALE_STEPS is read by the tray
+    menu that builds its rows and by the loader that validates the saved
+    setting, so a 1.25 added here would appear in both without anybody having
+    decided to offer it. Steps larger than the current size were offered once
+    and declined.
+    """
+    assert theme.SCALE_STEPS == (0.75, 0.85, 1.00)
+    assert max(theme.SCALE_STEPS) <= 1.0
+    assert theme.DEFAULT_SCALE == 1.00
+    assert theme.DEFAULT_SCALE in theme.SCALE_STEPS
+
+
+def test_the_layout_holds_one_number_and_nothing_else():
+    """One stored field, everything else derived from it.
+
+    Two stored fields for two dimensions is two chances to hold a value from a
+    different scale; a dataclass with one field cannot be inconsistent at all,
+    and equality is then just the scale -- which is what makes two layouts
+    comparable without comparing twenty numbers.
+    """
+    layout = theme.Layout(0.85)
+    assert layout.scale == 0.85
+    assert layout == theme.Layout(0.85)
+    assert layout != theme.Layout(1.0)
+
+
+def test_the_layout_cannot_be_edited_after_it_is_built():
+    """Immutability is what lets a renderer be a pure function of its inputs.
+
+    A frozen dataclass raises rather than assigning, so a panel that handed the
+    renderer something it could change underneath itself is not constructible.
+    """
+    layout = theme.Layout(1.0)
+    with pytest.raises(AttributeError):
+        layout.scale = 0.75
+
+
+@pytest.mark.parametrize(
+    "scale", [0.0, -0.5, float("nan"), float("inf"), float("-inf")],
+    ids=["zero", "negative", "nan", "inf", "-inf"],
+)
+def test_a_layout_it_cannot_draw_at_all_is_refused(scale):
+    """Zero collapses the panel to nothing and NaN poisons every comparison.
+
+    Both would otherwise reach QPainter as a zero-sized or NaN geometry, and the
+    failure would appear as a panel that draws nothing rather than as an error
+    about the number that caused it.
+    """
+    with pytest.raises(ValueError):
+        theme.Layout(scale)
+
+
+def test_every_dimension_shrinks_with_the_scale():
+    """The one test that catches a dimension somebody forgot to scale.
+
+    A dimension left at its 1.0 value is *equal* at two scales rather than
+    smaller, and every "the layout is self-consistent" check still passes: the
+    rows still tile the panel, the canvas is still the panel plus its margin, and
+    the only thing wrong is that a quarter of the panel is now padding. Compared
+    across the three steps rather than to a copied table of expected numbers, so
+    it says the property instead of restating the design.
+    """
+    layouts = [theme.Layout(scale) for scale in theme.SCALE_STEPS]
+    for name in LAYOUT_DIMENSIONS:
+        values = [getattr(layout, name) for layout in layouts]
+        assert values == sorted(set(values)) and len(set(values)) == len(values), (
+            f"{name} does not shrink with the scale: {values} at {theme.SCALE_STEPS}"
+        )
+
+
+@pytest.mark.parametrize("scale", theme.SCALE_STEPS)
+def test_the_type_shrinks_with_the_panel_and_stays_measured_in_points(scale):
+    """Points, not pixels -- the reason the panel follows the monitor's DPI.
+
+    pixelSize() is -1 for a point-sized font and is set the moment anybody
+    reaches for setPixelSize, which pins the panel to the pixel grid of whichever
+    monitor it was built on. The rasterised advance is checked as well, because a
+    point size that Qt declined to apply would leave every other assertion here
+    true while the text stayed the size it was.
+    """
+    layout = theme.Layout(scale)
+    for font in (layout.label_font(), layout.value_font(), layout.aux_font()):
+        assert font.pixelSize() == -1, "a pixel size would not follow the monitor's DPI"
+        assert font.pointSizeF() > 0
+
+    small = QFontMetricsF(theme.Layout(0.75).label_font()).horizontalAdvance("CPU")
+    full = QFontMetricsF(theme.Layout(1.0).label_font()).horizontalAdvance("CPU")
+    assert small < full, f"'CPU' is {small} px wide at 0.75 and {full} px at 1.0"
+
+
+def test_the_corner_margin_is_a_gap_to_the_screen_and_does_not_scale():
+    """10 px from the screen edge is 10 px, whatever the panel measures.
+
+    The bleed is part of the panel's own artwork and scales with it; this is the
+    gap between the panel and something else entirely, and it is the one number
+    here that a smaller panel has no reason to change. Stated rather than left
+    implicit because "everything scales" is otherwise the natural assumption.
+    """
+    assert theme.CORNER_MARGIN == 10

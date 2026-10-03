@@ -5,11 +5,14 @@ temp directory that is wiped on exit, so a frozen build must anchor on
 sys.executable instead.
 
 The alpha range and the default come from theme rather than being restated
-here. Two copies of a bound are two answers to "what is the lowest usable
-opacity", and nothing would report the disagreement: the loader would reject a
-value the wheel had just produced, or accept one the panel clamps away. theme
-is the project's home for design tokens and settings is a consumer of them, so
-importing it is what makes the pair impossible rather than merely checked.
+here, and so do the scale steps and the scale default. Two copies of a bound
+are two answers to "what is the lowest usable opacity", and nothing would
+report the disagreement: the loader would reject a value the wheel had just
+produced, or accept one the panel clamps away. theme is the project's home for
+design tokens and settings is a consumer of them, so importing it is what
+makes the pair impossible rather than merely checked. The same argument covers
+the scale steps, which the tray menu also builds its rows from: one tuple, two
+readers, no way for a step to be offered without being loadable.
 
 Loading sanitises: a file that cannot be read, parsed or trusted degrades to
 usable settings instead of raising, because the caller is a GUI startup path
@@ -40,6 +43,7 @@ class Settings:
     x: int | None = None
     y: int | None = None
     alpha: float = theme.DEFAULT_ALPHA
+    scale: float = theme.DEFAULT_SCALE
     log_history: bool = False
 
 
@@ -75,6 +79,36 @@ def _alpha(value: object) -> float:
     return float(value)
 
 
+def _scale(value: object) -> float:
+    """Accept one of the scales the panel offers, and nothing else.
+
+    Same shape as _alpha -- type check, reject, fall back, warn -- with a
+    different predicate, and the predicate is the decision: membership in
+    theme.SCALE_STEPS rather than a range.
+
+    Alpha is moved by a wheel in steps finer than the gaps between its labels,
+    so a value between two labels is a value this application produces, and the
+    Opacity submenu carries a Custom row to say so. Scale has no such gesture:
+    there is nothing the user can do that lands between two steps, so the only
+    way an off-step value reaches this function is a hand-edited file. Accepting
+    one would mean the Scale submenu needed a fourth row to describe a value it
+    cannot set -- a menu offering a control the interface does not have -- and
+    the three checkmarks would stop being exhaustive. Rejecting it keeps "no
+    scale chosen" unreachable rather than adding a fourth state to describe.
+
+    The bound is read from theme rather than restated here, for the reason the
+    alpha range is: two copies of the answer to "which scales are legal" is two
+    answers, and the one nobody checked is the one the menu disagrees with.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"expected a number, got {_kind(value)}")
+    # Membership, so NaN -- which compares false against everything, including
+    # itself -- is rejected here rather than needing its own guard.
+    if value not in theme.SCALE_STEPS:
+        raise ValueError(f"expected one of {theme.SCALE_STEPS}, got {value!r}")
+    return float(value)
+
+
 def _bool(value: object) -> bool:
     if not isinstance(value, bool):
         raise ValueError(f"expected true or false, got {_kind(value)}")
@@ -85,6 +119,7 @@ VALIDATORS: dict[str, Callable[[object], object]] = {
     "x": _optional_int,
     "y": _optional_int,
     "alpha": _alpha,
+    "scale": _scale,
     "log_history": _bool,
 }
 

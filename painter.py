@@ -5,16 +5,19 @@ QImage with no window on screen and compare the result against a reference.
 
 Layout per row: a 52 px rounded slab holding the label on the left, the value
 and its auxiliary reading on the right, and a 26 px graph strip along the
-bottom whose filled area is the row's history.
+bottom whose filled area is the row's history. Every one of those numbers, and
+every font size, comes from the `Layout` this function is handed rather than
+from module state: `theme.Layout` holds one scale and derives the rest, so
+drawing this panel at 0.75 is a different argument and not a different run.
 
 The header carries the status dot -- the worst state across the rows -- and the
 network throughput in both directions, which is the panel's one non-metric
 reading and is therefore drawn in one neutral colour whatever its magnitude.
 
-The panel is 280 x 280 but the canvas it is painted on is larger: the drop
-shadow is drawn outside panel_rect(), and a canvas the same size as the panel
-clips it away. paint() shifts everything by theme.BLEED and theme's rects stay
-0-based, so no layout arithmetic had to change.
+The panel is 280 x 280 at scale 1.0, and the canvas it is painted on is larger:
+the drop shadow is drawn outside panel_rect(), and a canvas the same size as
+the panel clips it away. paint() shifts everything by the layout's bleed and the
+layout's rects stay 0-based, so no layout arithmetic had to change.
 """
 
 from __future__ import annotations
@@ -25,10 +28,6 @@ from PyQt6.QtGui import QColor, QFontMetricsF, QPainter, QPainterPath, QPen
 import theme
 from history import History, resample
 
-VALUE_GAP = 7.0
-TEXT_TOP = 6.0
-TEXT_CLEARANCE = 2.0
-GRAPH_LINE_WIDTH = 1.4
 GRAPH_FILL_ALPHA = 0.22
 
 NET_LABEL_GAP = "  "
@@ -41,6 +40,20 @@ NET_LABEL_GAP = "  "
 DOWN_LABEL = "IN"
 UP_LABEL = "OUT"
 
+# The drop shadow's three slabs: how far each one is grown on every side, and
+# how much of the desktop it blacks out. Grown as a share of the bleed rather
+# than in absolute pixels, because the bleed is the room the shadow has: it is
+# scaled with the panel, and a shadow that stayed 6 px on a 210 px panel would
+# be a heavier halo than the one the design shows at 280 px. As shares of 8 the
+# three grows are exactly 6, 3 and 0.
+#
+# QRectF.right() and .bottom() are edge coordinates, so adjust() takes a plain
+# `grow` for them: passing grow * 2 there pushed the right and bottom lips 12.0
+# and 7.2 px out, which was 4 px past the canvas on the right and 0.8 px from
+# clipping at the bottom, while the left side had all 8 px of the bleed to
+# itself.
+SHADOW_SLABS = ((0.75, 0.10), (0.375, 0.16), (0.0, 0.28))
+
 # Decimal, unlike the binary GB the memory rows use. The unit has to change
 # where the figure resets to 1.0 -- 999.9 KB/s, then 1.0 MB/s -- which is what
 # every network tool on the machine does and what keeps "1024.0 KB/s" from ever
@@ -52,6 +65,7 @@ _TB = 1000 ** 4
 
 def paint(
     painter: QPainter,
+    layout: theme.Layout,
     snapshot,
     histories: dict[str, History],
     alpha: float,
@@ -59,7 +73,14 @@ def paint(
 ) -> None:
     """Draw the whole panel. `histories` may be missing keys; rows degrade.
 
-    The paint target must be at least theme.CANVAS_W x theme.CANVAS_H; the
+    `layout` is an argument and not a module lookup because it is the only thing
+    that decides how large the panel is: a renderer that read its own geometry
+    would have to be told the scale out of band, and two renders at two scales
+    could not then be compared without whatever was drawn in between. Nothing
+    here mutates it -- it is a frozen value object -- so the same function gives
+    the same pixels for the same inputs at any scale.
+
+    The paint target must be at least layout.canvas_w x layout.canvas_h; the
     translate below leaves room for the drop shadow outside the panel, and the
     matching restore() puts the caller's transform back.
 
@@ -73,58 +94,57 @@ def paint(
     painter.save()
     painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
     painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
-    painter.translate(theme.BLEED, theme.BLEED)
+    painter.translate(layout.bleed, layout.bleed)
 
-    _draw_panel(painter, theme.panel_rect(), alpha)
-    _draw_header(painter, theme.header_rect(), snapshot, now)
+    _draw_panel(painter, layout, layout.panel_rect(), alpha)
+    _draw_header(painter, layout, layout.header_rect(), snapshot, now)
 
-    for spec, rect in theme.metric_rects():
-        _draw_row(painter, spec, rect, snapshot, histories.get(spec.key))
+    for spec, rect in layout.metric_rects():
+        _draw_row(painter, layout, spec, rect, snapshot, histories.get(spec.key))
 
     painter.restore()
 
 
-def _draw_panel(painter: QPainter, rect: QRectF, alpha: float) -> None:
+def _draw_panel(painter: QPainter, layout: theme.Layout, rect: QRectF, alpha: float) -> None:
     painter.setPen(Qt.PenStyle.NoPen)
 
     # Fake a soft drop shadow: three expanding slabs, biggest and faintest first.
-    # Grown by `grow` on every side. QRectF.right() and .bottom() are edge
-    # coordinates, so adjust() takes a plain `grow` for them: the old table
-    # passed grow * 2 there and pushed the right and bottom lips 12.0 and 7.2 px
-    # out, which is 4 px past the canvas on the right and 0.8 px from clipping
-    # at the bottom, while the left side had all 8 px of the bleed to itself.
-    for grow, strength in ((6.0, 0.10), (3.0, 0.16), (0.0, 0.28)):
+    for share, strength in SHADOW_SLABS:
+        grow = share * layout.bleed
         shadow = QRectF(rect)
         shadow.adjust(-grow, -grow, grow, grow)
         tint = QColor(0, 0, 0)
         tint.setAlphaF(strength)
         painter.setBrush(tint)
-        painter.drawRoundedRect(shadow, theme.PANEL_RADIUS + grow, theme.PANEL_RADIUS + grow)
+        painter.drawRoundedRect(shadow, layout.panel_radius + grow, layout.panel_radius + grow)
 
     fill = QColor(16, 18, 24)
     fill.setAlphaF(max(0.0, min(1.0, alpha)))
     painter.setBrush(fill)
     painter.setPen(QPen(QColor(255, 255, 255, 26), 1.0))
-    painter.drawRoundedRect(rect, theme.PANEL_RADIUS, theme.PANEL_RADIUS)
+    painter.drawRoundedRect(rect, layout.panel_radius, layout.panel_radius)
     painter.setPen(Qt.PenStyle.NoPen)
 
 
-def _draw_header(painter: QPainter, rect: QRectF, snapshot, now: float | None) -> None:
+def _draw_header(
+    painter: QPainter, layout: theme.Layout, rect: QRectF, snapshot, now: float | None
+) -> None:
     dot_color = _dot_color(snapshot, now)
 
     centre_y = rect.center().y()
-    # Both edges come from theme, so the dot and the text cannot end up placed
-    # against different lines. The dot hangs off the text's left edge by a fixed
-    # gap, which is what kept the header and the row labels on one alignment.
-    text_x = theme.header_text_x()
+    # Both edges come from the layout, so the dot and the text cannot end up
+    # placed against different lines. The dot hangs off the text's left edge by a
+    # fixed gap, which is what kept the header and the row labels on one
+    # alignment.
+    text_x = layout.header_text_x()
     painter.setBrush(dot_color)
     painter.setPen(Qt.PenStyle.NoPen)
-    painter.drawEllipse(QPointF(theme.header_dot_x(), centre_y), theme.DOT_R, theme.DOT_R)
+    painter.drawEllipse(QPointF(layout.header_dot_x(), centre_y), layout.dot_r, layout.dot_r)
 
     text = _format_net(snapshot)
     if text:
         _draw_text(painter, text, QRectF(text_x, rect.top(), rect.right() - text_x, rect.height()),
-                   theme.aux_font(), theme.NEUTRAL)
+                   layout.aux_font(), theme.NEUTRAL)
 
 
 def _dot_color(snapshot, now: float | None) -> QColor:
@@ -200,41 +220,35 @@ def _format_rate(value: float | None) -> str:
     return f"{value:.0f} B/s"
 
 
-def _draw_row(painter: QPainter, spec, rect: QRectF, snapshot, history) -> None:
+def _draw_row(
+    painter: QPainter, layout: theme.Layout, spec, rect: QRectF, snapshot, history
+) -> None:
     painter.setPen(Qt.PenStyle.NoPen)
     painter.setBrush(theme.ROW_BG)
-    painter.drawRoundedRect(rect, theme.ROW_RADIUS, theme.ROW_RADIUS)
+    painter.drawRoundedRect(rect, layout.row_radius, layout.row_radius)
 
     state = theme.metric_state(spec, snapshot)
     color = theme.state_color(state)
 
     if history is not None and len(history) > 1:
         graph = QRectF(rect)
-        graph.setTop(rect.bottom() - theme.GRAPH_H)
+        graph.setTop(rect.bottom() - layout.graph_h)
         # Clipped to the slab's rounded outline. The fill is a polygon and the
         # line has round caps, so unclipped both paint straight across the
         # corner arcs and out over the panel padding. save()/restore() keeps the
         # clip, pen and brush from leaking into the text drawn afterwards.
         painter.save()
-        _clip_to_rounded(painter, rect, theme.ROW_RADIUS)
-        _draw_graph(painter, graph, history.values(), color)
+        _clip_to_rounded(painter, rect, layout.row_radius)
+        _draw_graph(painter, layout, graph, history.values(), color)
         painter.restore()
 
-    # The band stops short of the graph strip: the value font's descent reaches
-    # 0.64 px past its baseline, so a band flush with the strip would put
-    # descenders on the fill.
-    text_rect = QRectF(
-        rect.left() + theme.ROW_TEXT_INSET,
-        rect.top() + TEXT_TOP,
-        rect.width() - 2 * theme.ROW_TEXT_INSET,
-        rect.height() - TEXT_TOP - theme.GRAPH_H - TEXT_CLEARANCE,
-    )
-    _draw_text(painter, spec.label, text_rect, theme.label_font(), theme.NEUTRAL)
+    text_rect = layout.row_text_rect(rect)
+    _draw_text(painter, spec.label, text_rect, layout.label_font(), theme.NEUTRAL)
 
     value_text = _format_value(spec, snapshot)
     aux_text = _format_aux(spec, snapshot)
-    value_font = theme.value_font()
-    aux_font = theme.aux_font()
+    value_font = layout.value_font()
+    aux_font = layout.aux_font()
 
     # The value is placed first, then the auxiliary reading is pushed out to the
     # right edge, so left to right it reads "34%  4.5 / 4.5 GHz": the dimmer text
@@ -242,7 +256,7 @@ def _draw_row(painter: QPainter, spec, rect: QRectF, snapshot, history) -> None:
     aux_width = QFontMetricsF(aux_font).horizontalAdvance(aux_text) if aux_text else 0.0
     _draw_text(
         painter, value_text, text_rect, value_font, color,
-        right=True, right_offset=-(aux_width + VALUE_GAP),
+        right=True, right_offset=-(aux_width + layout.value_gap),
     )
     if aux_text:
         _draw_text(painter, aux_text, text_rect, aux_font, theme.SUBTLE, right=True)
@@ -255,7 +269,9 @@ def _clip_to_rounded(painter: QPainter, rect: QRectF, radius: float) -> None:
     painter.setClipPath(path, Qt.ClipOperation.IntersectClip)
 
 
-def _draw_graph(painter: QPainter, rect: QRectF, values: list[float], color: QColor) -> None:
+def _draw_graph(
+    painter: QPainter, layout: theme.Layout, rect: QRectF, values: list[float], color: QColor
+) -> None:
     """Fill and stroke the row's history inside `rect`.
 
     `values` holds at least two samples -- the caller checks -- so resample
@@ -286,7 +302,7 @@ def _draw_graph(painter: QPainter, rect: QRectF, values: list[float], color: QCo
     for point in points[1:]:
         line.lineTo(point.x() + left, bottom - point.y() * rect.height())
 
-    pen = QPen(color, GRAPH_LINE_WIDTH)
+    pen = QPen(color, layout.graph_line_width)
     pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
     pen.setCapStyle(Qt.PenCapStyle.RoundCap)
     painter.setPen(pen)

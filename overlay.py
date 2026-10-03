@@ -5,11 +5,16 @@ click to arm a drag mode, which needed its own double-click detector, two
 QTimers and a per-click timer allocation -- thirteen commits of fixes grew out
 of that one extra step.
 
-The widget is theme.CANVAS_W x theme.CANVAS_H, not theme.WIDTH x theme.HEIGHT.
-The panel is 280 x 280 and the canvas is that plus a bleed on every side,
-because paint() draws the drop shadow *outside* panel_rect(): a widget the size
-of the panel has nowhere for the halo to go, clips it, and leaves the panel's
-edge reading as a hard wall against the desktop.
+The widget is the canvas, not the panel: the panel is 280 x 280 at scale 1.0
+and the canvas is that plus a bleed on every side, because paint() draws the
+drop shadow *outside* panel_rect(): a widget the size of the panel has nowhere
+for the halo to go, clips it, and leaves the panel's edge reading as a hard
+wall against the desktop.
+
+The widget owns the `theme.Layout` it draws at, and rebuilds it when the scale
+changes. That is the panel's half of the arrangement: `Layout` is immutable, so
+the renderer cannot be handed a size that is not the one on screen, and
+`setFixedSize` is the one statement of how big the window is.
 """
 
 from __future__ import annotations
@@ -47,6 +52,7 @@ class MonitorPanel(QWidget):
     def __init__(self, settings: Settings) -> None:
         super().__init__()
         self._settings = settings
+        self._layout = theme.Layout(settings.scale)
         self._snapshot = None
         self._histories: dict[str, History] = {
             key: History() for key in theme.METRICS_BY_KEY
@@ -74,10 +80,20 @@ class MonitorPanel(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         self.setCursor(Qt.CursorShape.OpenHandCursor)
-        self.setFixedSize(theme.CANVAS_W, theme.CANVAS_H)
+        self._resize_to_layout()
         self.apply_window_flags()
 
     # --- configuration ----------------------------------------------------
+
+    def _resize_to_layout(self) -> None:
+        """The one statement of how large the window is.
+
+        Called on construction and again whenever the scale changes. Nothing else
+        touches the size: the timers parented to this widget are untouched by a
+        resize, which is what keeps the topmost re-assertion and the repaint
+        cadence exactly as they were at the size the panel started at.
+        """
+        self.setFixedSize(self._layout.canvas_w, self._layout.canvas_h)
 
     def apply_window_flags(self) -> None:
         """State the window's type, all of it, in one place.
@@ -115,6 +131,44 @@ class MonitorPanel(QWidget):
         self._settings.alpha = max(theme.MIN_ALPHA, min(theme.MAX_ALPHA, value))
         self.update()
 
+    def current_scale(self) -> float:
+        return self._layout.scale
+
+    def layout(self) -> theme.Layout:
+        """The layout the panel is drawn at, for the renderer's own argument.
+
+        A method rather than a bare attribute so that paintEvent reads the size
+        off one accessor, the way it reads alpha off current_alpha(): a widget
+        with two routes to the same value has two places for them to disagree.
+        """
+        return self._layout
+
+    def set_scale(self, value: float) -> None:
+        """Draw at a new scale, from here on.
+
+        The panel's top-left is left alone, and that is a decision rather than
+        the absence of one. The alternative -- re-anchoring the same screen
+        corner the panel is sitting in -- would make picking a scale the only
+        action in the application that moves the panel, and it would move it out
+        from under a hand that had just closed the menu. The panel then sits the
+        same distance from the top-left corner it was dropped at and is simply
+        smaller; `Reset position` and the double click re-snap it.
+
+        Which means the panel can end up straddling the screen edge: a panel
+        parked hard against the right edge was 296 px wide and is 222 px, so its
+        top-left is now 74 px further from the edge than the panel is wide enough
+        to reach, and half of it hangs off. So the resize is followed by a clamp
+        and not by nothing: clamp_to_screen() pulls a position that no longer
+        fits back to the edge, and leaves every position that still fits exactly
+        where it was. That is the same honour-then-judge rule the saved position
+        goes through at startup, applied to the one size that changed.
+        """
+        self._settings.scale = value
+        self._layout = theme.Layout(value)
+        self._resize_to_layout()
+        self.move(self.clamp_to_screen(self.pos()))
+        self.update()
+
     def apply_snapshot(self, snapshot) -> None:
         self._snapshot = snapshot
         for spec in theme.METRICS:
@@ -148,7 +202,7 @@ class MonitorPanel(QWidget):
         painter = None
         try:
             painter = QPainter(self)
-            paint(painter, self._snapshot, self._histories, self.current_alpha())
+            paint(painter, self.layout(), self._snapshot, self._histories, self.current_alpha())
         except Exception:
             self._log_paint_failure()
         finally:

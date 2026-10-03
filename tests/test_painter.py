@@ -51,14 +51,16 @@ def build_histories(values_by_key):
 
 
 def render(snapshot, values_by_key=None, alpha=theme.DEFAULT_ALPHA, histories=None,
-           now=None):
-    image = QImage(theme.CANVAS_W, theme.CANVAS_H, QImage.Format.Format_ARGB32_Premultiplied)
+           now=None, scale=theme.DEFAULT_SCALE):
+    layout = theme.Layout(scale)
+    image = QImage(layout.canvas_w, layout.canvas_h, QImage.Format.Format_ARGB32_Premultiplied)
     image.fill(QColor(0, 0, 0, 0))
     # Not named `painter`: that would shadow the module the monkeypatch tests use.
     canvas_painter = QPainter(image)
     try:
         paint(
             canvas_painter,
+            layout,
             snapshot,
             build_histories(values_by_key or {}) if histories is None else histories,
             alpha,
@@ -93,9 +95,10 @@ def painter_state(p):
     }
 
 
-def blank_canvas():
+def blank_canvas(scale=theme.DEFAULT_SCALE):
     """The same image with nothing painted on it at all."""
-    image = QImage(theme.CANVAS_W, theme.CANVAS_H, QImage.Format.Format_ARGB32_Premultiplied)
+    layout = theme.Layout(scale)
+    image = QImage(layout.canvas_w, layout.canvas_h, QImage.Format.Format_ARGB32_Premultiplied)
     image.fill(QColor(0, 0, 0, 0))
     return image
 
@@ -126,6 +129,27 @@ def max_channel_delta(a, b):
 
 
 def assert_golden(name, snapshot, values_by_key=None):
+    """Compare against the committed PNG for this name.
+
+    The goldens exist at scale 1.00 only, and that is a decision rather than an
+    omission. A picture of the same design at 0.75 would re-check every
+    proportional relationship the layout tests already state as arithmetic --
+    rows tiling the panel, the graph inside its slab, the header string inside
+    the header -- while adding a third and fourth set of images that break on
+    the next Qt or Segoe UI build for reasons that have nothing to do with the
+    layout. Those relationships are asserted at every scale instead, and this
+    file's own header says a renderer change means regenerating and *looking* at
+    the result.
+
+    So: one set of goldens, at the scale the design was drawn at, plus
+    test_render_is_never_blank and the geometry tests at 0.75 and 0.85. What
+    the smaller scales cannot prove is what they are for anyway -- that the panel
+    still looks like the panel -- and that is checked by eye at all three.
+    """
+    assert theme.DEFAULT_SCALE == 1.0, (
+        "the committed goldens were rendered at scale 1.0; the default moved and "
+        "they would have to be regenerated"
+    )
     path = GOLDEN_DIR / f"{name}.png"
     actual = render(snapshot, values_by_key)
     if os.environ.get("MONITOR_REGEN_GOLDEN") or not path.exists():
@@ -205,21 +229,28 @@ def drawn_texts(monkeypatch, snapshot, values_by_key=None):
     return seen
 
 
-def test_shadow_bleeds_into_the_margin_outside_the_panel():
+@pytest.mark.parametrize("scale", theme.SCALE_STEPS)
+def test_shadow_bleeds_into_the_margin_outside_the_panel(scale):
     """A faint dark halo must survive outside the panel's rounded outline.
 
     While the canvas was exactly panel_rect() there was nowhere for it to go:
     the shadow slabs were clipped by the image edge and every pixel outside the
     outline was transparent. This samples the left margin, away from the
     rounded corners, and insists something faint and dark landed there.
+
+    At every scale, because the bleed is what the shadow is given to fade into
+    and both are now derived from the same number: a margin that stopped growing
+    with the panel would clip the halo on the smaller scales and leave this
+    passing only at the one the goldens were made at.
     """
-    image = render(CALM, RAMPS)
-    middle = theme.CANVAS_H // 2
+    layout = theme.Layout(scale)
+    image = render(CALM, RAMPS, scale=scale)
+    middle = layout.canvas_h // 2
     margin = [
         image.pixelColor(x, y)
         # The innermost margin column is skipped on purpose: it is the panel's
         # own antialiased outline, not shadow.
-        for x in range(1, theme.BLEED - 1)
+        for x in range(1, layout.bleed - 1)
         for y in range(middle - 40, middle + 40)
     ]
     # A shadow, not a second copy of the panel: dark, and far fainter than the
@@ -227,8 +258,8 @@ def test_shadow_bleeds_into_the_margin_outside_the_panel():
     faint = [c for c in margin if 0 < c.alpha() < 128
              and max(c.red(), c.green(), c.blue()) < 32]
     assert faint, (
-        f"no faint dark pixels in the {theme.BLEED}px left margin: the drop "
-        "shadow is still being clipped away by the canvas edge"
+        f"no faint dark pixels in the {layout.bleed}px left margin at scale "
+        f"{scale}: the drop shadow is still being clipped away by the canvas edge"
     )
     opaque = [c for c in margin if c.alpha() >= 128]
     assert not opaque, (
@@ -237,43 +268,72 @@ def test_shadow_bleeds_into_the_margin_outside_the_panel():
     )
 
 
-def test_the_shadow_does_not_reach_the_canvas_edge():
+@pytest.mark.parametrize("scale", theme.SCALE_STEPS)
+def test_the_shadow_does_not_reach_the_canvas_edge(scale):
     """The property, not a copy of _draw_panel's slab table.
 
     A previous version of this test hardcoded the shadow's 6.0 px growth and
-    compared it with theme.BLEED, which reads like coverage but is not: raise
+    compared it with the layout's bleed, which reads like coverage but is not: raise
     the growth to 10.0 and both numbers still pass while the halo is clipped
     away again. What actually has to hold is that the shadow stops short of the
     canvas edge, so this samples the outermost two pixels along each straight
     edge. Corners are skipped on purpose -- the shadow's own rounded corners
     leave them clear whatever its size.
+
+    Two pixels is 2/8 of the bleed at scale 1.0, so it is checked as a share
+    rather than a count: the bleed is 6 px at 0.75, and a shadow scaled to match
+    it stops 1.5 px from the edge. Stating it as "two pixels" would either fail
+    at every scale below 1.0 or -- worse -- be quietly loosened to whatever
+    happens to pass. The lower bound is asserted too, so the margin cannot be
+    shrunk until there is nowhere for the shadow to be.
     """
-    image = render(CALM, RAMPS)
-    inset = theme.CANVAS_W // 4
-    span = range(inset, theme.CANVAS_W - inset)
+    layout = theme.Layout(scale)
+    # The shadow's outermost slab grows to 3/4 of the bleed, so a quarter of it
+    # is left clear: 2 px at scale 1.0, 1.75 at 0.85 and 1.5 at 0.75. The floor
+    # below is a whole pixel because that is all a 6 px margin has, and the
+    # assertion is that the quarter never rounds away to nothing -- which is the
+    # way "the shadow has somewhere to go" would stop being true.
+    assert layout.bleed / 4 >= 1.0, (
+        f"a {layout.bleed} px bleed at scale {scale} leaves under a pixel of clear "
+        "margin for the shadow to stop inside"
+    )
+    clear = max(1, int(layout.bleed / 4))
+    image = render(CALM, RAMPS, scale=scale)
+    inset = layout.canvas_w // 4
+    span = range(inset, layout.canvas_w - inset)
     for x in span:
-        for edge in range(2):
-            assert image.pixelColor(x, edge).alpha() == 0, f"shadow reaches the top edge at x={x}"
-            assert image.pixelColor(x, theme.CANVAS_H - 1 - edge).alpha() == 0, (
-                f"shadow reaches the bottom edge at x={x}"
+        for edge in range(clear):
+            assert image.pixelColor(x, edge).alpha() == 0, (
+                f"the shadow reaches the top edge at x={x}, {edge} px in, "
+                f"at scale {scale}"
             )
-    for y in range(inset, theme.CANVAS_H - inset):
-        for edge in range(2):
-            assert image.pixelColor(edge, y).alpha() == 0, f"shadow reaches the left edge at y={y}"
-            assert image.pixelColor(theme.CANVAS_W - 1 - edge, y).alpha() == 0, (
-                f"shadow reaches the right edge at y={y}"
+            assert image.pixelColor(x, layout.canvas_h - 1 - edge).alpha() == 0, (
+                f"the shadow reaches the bottom edge at x={x}, {edge} px in, "
+                f"at scale {scale}"
+            )
+    for y in range(inset, layout.canvas_h - inset):
+        for edge in range(clear):
+            assert image.pixelColor(edge, y).alpha() == 0, (
+                f"the shadow reaches the left edge at y={y}, {edge} px in, "
+                f"at scale {scale}"
+            )
+            assert image.pixelColor(layout.canvas_w - 1 - edge, y).alpha() == 0, (
+                f"the shadow reaches the right edge at y={y}, {edge} px in, "
+                f"at scale {scale}"
             )
 
 
-def test_the_panel_is_inset_by_the_bleed_rather_than_moved():
+@pytest.mark.parametrize("scale", theme.SCALE_STEPS)
+def test_the_panel_is_inset_by_the_bleed_rather_than_moved(scale):
     """x=0 is margin now, and the panel fill starts one bleed in."""
-    image = render(CALM, RAMPS)
-    middle = theme.CANVAS_H // 2
+    layout = theme.Layout(scale)
+    image = render(CALM, RAMPS, scale=scale)
+    middle = layout.canvas_h // 2
     assert image.pixelColor(0, middle).alpha() == 0, (
         "x=0 is still opaque: the panel is drawn at the canvas origin instead "
         "of being inset by the bleed"
     )
-    fill = image.pixelColor(theme.BLEED + 5, middle)
+    fill = image.pixelColor(layout.bleed + 5, middle)
     assert fill.alpha() > 200, "panel fill is missing one bleed in from the edge"
     assert max(fill.red(), fill.green(), fill.blue()) < 96
 
@@ -304,7 +364,8 @@ def test_paint_restores_the_painter_it_was_given():
         caller_painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
         before = painter_state(caller_painter)
 
-        paint(caller_painter, CALM, build_histories(RAMPS), theme.DEFAULT_ALPHA)
+        paint(caller_painter, theme.Layout(1.0), CALM, build_histories(RAMPS),
+              theme.DEFAULT_ALPHA)
 
         after = painter_state(caller_painter)
     finally:
@@ -314,24 +375,28 @@ def test_paint_restores_the_painter_it_was_given():
     assert not changed, f"paint() left the caller's painter state changed: {changed}"
 
 
-def test_a_lost_restore_would_accumulate_the_bleed_translate(monkeypatch):
+@pytest.mark.parametrize("scale", theme.SCALE_STEPS)
+def test_a_lost_restore_would_accumulate_the_bleed_translate(monkeypatch, scale):
     """The failure this guards against, shown rather than asserted by proxy.
 
     overlay.py reuses one painter for every tick. A missing restore() leaves
-    the translate on it, so tick two starts 8 px further right than tick one --
-    which is why the restoration test above has to compare against state the
-    caller set up, not against a default painter.
+    the translate on it, so tick two starts one bleed further right than tick
+    one -- which is why the restoration test above has to compare against state
+    the caller set up, not against a default painter. The leak is in logical
+    pixels, so it is worth checking at a scale where the bleed is not the 8 px
+    the transform assertion at 1.0 would have shown.
     """
+    layout = theme.Layout(scale)
     monkeypatch.setattr(painter, "_draw_panel", lambda *args, **kwargs: None)
-    image = QImage(theme.CANVAS_W, theme.CANVAS_H, QImage.Format.Format_ARGB32_Premultiplied)
+    image = QImage(layout.canvas_w, layout.canvas_h, QImage.Format.Format_ARGB32_Premultiplied)
     image.fill(QColor(0, 0, 0, 0))
     caller_painter = QPainter(image)
     try:
         origin = QTransform()
-        paint(caller_painter, CALM, {}, 1.0)
+        paint(caller_painter, layout, CALM, {}, 1.0)
         first = caller_painter.transform()
         assert first == origin, "the first tick already drifted; restore() is broken now"
-        paint(caller_painter, CALM, {}, 1.0)
+        paint(caller_painter, layout, CALM, {}, 1.0)
         second = caller_painter.transform()
     finally:
         caller_painter.end()
@@ -353,39 +418,58 @@ def test_missing_data_matches_golden():
     assert_golden("missing", EMPTY, {})
 
 
-def test_render_is_never_blank():
-    image = render(CALM, RAMPS)
-    colours = {image.pixelColor(x, y).rgba() for y in range(0, theme.CANVAS_H, 3)
-               for x in range(0, theme.CANVAS_W, 3)}
-    assert len(colours) > 40
+@pytest.mark.parametrize("scale", theme.SCALE_STEPS)
+def test_render_is_never_blank(scale):
+    """At every scale the panel the user asked for is actually drawn.
+
+    The explicit counterpart to the goldens at 0.75 and 0.85: a renderer that
+    ignored the layout it was handed and drew a 280 px panel into a 222 px
+    canvas would have most of itself cropped away and would still be far from
+    blank, so the floor alone is not enough -- the sampled area is the canvas
+    the layout asked for, and the colour count has to be a panel's worth.
+    """
+    layout = theme.Layout(scale)
+    image = render(CALM, RAMPS, scale=scale)
+    colours = {image.pixelColor(x, y).rgba() for y in range(0, layout.canvas_h, 3)
+               for x in range(0, layout.canvas_w, 3)}
+    assert len(colours) > 40, (
+        f"only {len(colours)} distinct colours on a {layout.canvas_w} px canvas "
+        f"at scale {scale}"
+    )
 
 
-def test_render_is_never_blank_without_data():
-    image = render(EMPTY, {})
-    colours = {image.pixelColor(x, y).rgba() for y in range(0, theme.CANVAS_H, 3)
-               for x in range(0, theme.CANVAS_W, 3)}
-    # Measured 60 on this grid: a panel fill, four row slabs, a header dot and
-    # the five "--" labels all contribute their own antialiased values. A blank
-    # image yields exactly 1, so the floor below fails it by a wide margin
-    # while leaving room for a font change.
+@pytest.mark.parametrize("scale", theme.SCALE_STEPS)
+def test_render_is_never_blank_without_data(scale):
+    layout = theme.Layout(scale)
+    image = render(EMPTY, {}, scale=scale)
+    colours = {image.pixelColor(x, y).rgba() for y in range(0, layout.canvas_h, 3)
+               for x in range(0, layout.canvas_w, 3)}
+    # Measured 60 on this grid at scale 1.0: a panel fill, four row slabs, a
+    # header dot and the five "--" labels all contribute their own antialiased
+    # values. A blank image yields exactly 1, so the floor below fails it by a
+    # wide margin while leaving room for a font change. The floor is a share of
+    # the measured count rather than the count itself, because a smaller panel
+    # samples fewer points off the same shapes.
     assert len(colours) > 20, f"only {len(colours)} distinct colours: the panel is nearly blank"
 
 
-def test_each_rows_graph_sits_inside_its_own_slab():
+@pytest.mark.parametrize("scale", theme.SCALE_STEPS)
+def test_each_rows_graph_sits_inside_its_own_slab(scale):
     """A row's history must fill its slab: inside it *and* out to both edges.
 
     The graph is drawn from resample()'s column indices, which count from zero
     and are not panel coordinates. Used raw they put the fill 14 px left of the
-    slab -- over the panel's own padding -- and leave the same width of bare
-    slab on the right. Rendered with and without history, the difference is
-    exactly the graph, so its extent is read straight off the pixels. Both
-    bounds are asserted: an upper bound alone would not notice the graph
-    quietly shrinking to a stub in the middle of the row.
+    slab -- over the panel's own padding -- and leave the same width bare on the
+    right. Rendered with and without history, the difference is exactly the
+    graph, so its extent is read straight off the pixels. Both bounds are
+    asserted: an upper bound alone would not notice the graph quietly shrinking
+    to a stub in the middle of the row.
     """
-    graph_pixels = differing_pixels(render(CALM, RAMPS), render(CALM, {}))
+    layout = theme.Layout(scale)
+    graph_pixels = differing_pixels(render(CALM, RAMPS, scale=scale), render(CALM, {}, scale=scale))
     assert graph_pixels, "no graph was drawn at all, so this test proves nothing"
-    for spec, rect in theme.metric_rects():
-        slab = rect.translated(theme.BLEED, theme.BLEED)
+    for spec, rect in layout.metric_rects():
+        slab = rect.translated(layout.bleed, layout.bleed)
         in_row = [point for point in graph_pixels if slab.top() <= point[1] <= slab.bottom()]
         assert in_row, f"{spec.key}: no graph drawn"
         left, right = min(x for x, _ in in_row), max(x for x, _ in in_row)
@@ -399,7 +483,7 @@ def test_each_rows_graph_sits_inside_its_own_slab():
             f"{spec.key}: graph ends at x={right}, {slab.right() - right:.0f} px short of "
             f"the slab's right edge at {slab.right()}"
         )
-        strip_top = slab.bottom() - theme.GRAPH_H
+        strip_top = slab.bottom() - layout.graph_h
         assert min(y for _, y in in_row) >= strip_top, f"{spec.key}: graph climbs above its strip"
 
 
@@ -422,7 +506,8 @@ def inside_rounded(x, y, rect, radius, slack=1.0):
     return (x - cx) ** 2 + (y - cy) ** 2 <= r * r
 
 
-def test_graph_fill_never_paints_outside_the_rounded_row_slab():
+@pytest.mark.parametrize("scale", theme.SCALE_STEPS)
+def test_graph_fill_never_paints_outside_the_rounded_row_slab(scale):
     """Clipped to the slab, so no fill crosses a corner arc.
 
     Containment is tested against the rounded outline, not the bounding rect:
@@ -430,23 +515,84 @@ def test_graph_fill_never_paints_outside_the_rounded_row_slab():
     the corner arcs are out of bounds. 1 px of slack absorbs the clip's own
     antialiasing.
     """
-    graph_pixels = differing_pixels(render(CALM, RAMPS), render(CALM, {}))
+    layout = theme.Layout(scale)
+    graph_pixels = differing_pixels(render(CALM, RAMPS, scale=scale),
+                                    render(CALM, {}, scale=scale))
     assert graph_pixels, "no graph was drawn at all, so this test proves nothing"
-    slabs = [(spec, rect.translated(theme.BLEED, theme.BLEED)) for spec, rect in theme.metric_rects()]
+    slabs = [(spec, rect.translated(layout.bleed, layout.bleed))
+             for spec, rect in layout.metric_rects()]
     attributed = set()
     for spec, slab in slabs:
         # Rows do not overlap vertically, so the band attributes every pixel to
         # exactly one row.
         in_band = [p for p in graph_pixels if slab.top() <= p[1] <= slab.bottom()]
         attributed.update(in_band)
-        outside = sorted(p for p in in_band if not inside_rounded(*p, slab, theme.ROW_RADIUS))
+        outside = sorted(p for p in in_band if not inside_rounded(*p, slab, layout.row_radius))
         assert not outside, (
-            f"{spec.key}: graph painted {len(outside)} px outside its rounded slab, "
-            f"nearest at {outside[:3]}"
+            f"{spec.key}: graph painted {len(outside)} px outside its rounded slab at "
+            f"scale {scale}, nearest at {outside[:3]}"
         )
     assert attributed == graph_pixels, (
         f"{len(graph_pixels - attributed)} graph pixels sit outside every row's "
         f"vertical band, e.g. {sorted(graph_pixels - attributed)[:3]}"
+    )
+
+
+@pytest.mark.parametrize("scale", theme.SCALE_STEPS)
+def test_a_row_s_text_never_reaches_its_graph(monkeypatch, scale):
+    """The row's label, value and auxiliary reading all stay above the fill.
+
+    A row is a slab with a band of text in it and a graph along the bottom, and
+    the band is *shorter* than the value font's line height at every scale --
+    13 px of band under a 15.9 px font at 0.75, 18 px under 21.3 px at 1.0. That
+    is the design: `_draw_text` centres the baseline on the band and Qt clips
+    nothing, so what keeps a descender off the fill is the clearance the layout
+    subtracts, not a clip. A layout that shrank the font without shrinking the
+    clearance would put the numbers into the graph, and no rectangle assertion
+    would notice, because the rects would all still be where they belong.
+
+    Measured off the pixels: the render is compared against the same render with
+    text drawing stubbed out, so the only possible source of difference is the
+    glyphs, and every one of them is checked against the top of the graph strip
+    in the row it belongs to.
+    """
+    layout = theme.Layout(scale)
+    with_text = render(CALM, RAMPS, scale=scale)
+    monkeypatch.setattr(painter, "_draw_text", lambda *args, **kwargs: None)
+    untexted = render(CALM, RAMPS, scale=scale)
+    monkeypatch.undo()
+
+    glyphs = differing_pixels(with_text, untexted)
+    assert glyphs, f"no glyphs reached the pixels at scale {scale}"
+
+    by_row = {spec.key: rect for spec, rect in layout.metric_rects()}
+    bands = [(key, rect.translated(layout.bleed, layout.bleed))
+             for key, rect in by_row.items()]
+    header = layout.header_rect().translated(layout.bleed, layout.bleed)
+
+    checked = 0
+    for x, y in sorted(glyphs):
+        if header.top() <= y <= header.bottom():
+            # The header's own text. Its band is checked by the header fit test
+            # above, which measures the reach rather than asserting a ceiling.
+            continue
+        for key, slab in bands:
+            if slab.top() <= y <= slab.bottom():
+                strip_top = slab.bottom() - layout.graph_h
+                assert y < strip_top, (
+                    f"{key}: a glyph reached ({x}, {y}), inside the graph strip "
+                    f"that starts at {strip_top}, at scale {scale}"
+                )
+                checked += 1
+                break
+        else:
+            raise AssertionError(
+                f"a glyph reached ({x}, {y}) at scale {scale}, outside every "
+                "row's slab and outside the header band"
+            )
+    assert checked > 100, (
+        f"only {checked} glyph pixels were attributed to a row at scale {scale}: "
+        "the bands are not where the text is being drawn"
     )
 
 
@@ -670,37 +816,53 @@ def test_the_rate_formatter_picks_the_unit_from_the_magnitude(value, expected):
     assert painter._format_rate(value) == expected
 
 
-def test_the_widest_rate_string_the_header_must_fit_is_bounded():
+@pytest.mark.parametrize("scale", theme.SCALE_STEPS)
+def test_the_widest_rate_string_the_header_must_fit_is_bounded(scale):
     """Measured, because it decides the header's font.
 
     Not the saturated arm: the ladder's *own* ceiling is wider. A value just
     under the terabyte renders as `1000000.0 MB/s`, so that pair -- not
     `>= 1000.0 TB/s` -- is the longest string _format_net can produce. Both are
-    measured, and both are pinned in the parametrised test above, because if the
-    bound ever moved the two could swap and the header would have to change
+    measured, and both are pinned in the parametrised test above, because if
+    the bound ever moved the two could swap and the header would have to change
     rather than the bound.
+
+    At every scale, because the margin does not survive the shrinking. Measured
+    spare room on the widest string: 31.3 px at scale 1.0, 13.4 px at 0.85 and
+    7.7 px at 0.75 -- and the reason is not arithmetic. The available width
+    shrinks by 0.745 going to 0.75, but the string shrinks by only 0.819,
+    because Qt quantises a small point size to device pixels and loses a
+    proportionally larger share of it. So the header is tightest exactly where
+    the panel is smallest, and "the text scales with the panel" does not on its
+    own mean "the header still fits".
     """
+    layout = theme.Layout(scale)
+
     def width(value):
         widest = painter._format_net(SimpleNamespace(net_down_bytes_per_sec=value,
                                                     net_up_bytes_per_sec=value))
-        return QFontMetricsF(theme.aux_font()).horizontalAdvance(widest), widest
+        return QFontMetricsF(layout.aux_font()).horizontalAdvance(widest), widest
 
-    available = theme.header_rect().right() - theme.header_text_x()
+    available = layout.header_rect().right() - layout.header_text_x()
     for value, expected in ((999_999_999_999.0, "IN 1000000.0 MB/s  OUT 1000000.0 MB/s"),
                             (1e300, "IN >= 1000.0 TB/s  OUT >= 1000.0 TB/s"),
                             (-1e300, "IN <= -1000.0 TB/s  OUT <= -1000.0 TB/s")):
         metrics_width, widest = width(value)
         assert widest == expected
         assert metrics_width <= available, (
-            f"{widest!r} is {metrics_width:.0f} px against {available:.0f} px of header"
+            f"{widest!r} is {metrics_width:.0f} px against {available:.0f} px of "
+            f"header at scale {scale}"
         )
 
 
+@pytest.mark.parametrize("scale", theme.SCALE_STEPS)
 @pytest.mark.parametrize(
     "rate", [999_900_000.0, 1_250_000_000.0, 999_999_999_999.0, 1e300],
     ids=["999.9 MB/s", "1250.0 MB/s", "1000000.0 MB/s", "saturated"],
 )
-def test_the_longest_header_string_stays_clear_of_the_dot_and_inside_the_header(monkeypatch, rate):
+def test_the_longest_header_string_stays_clear_of_the_dot_and_inside_the_header(
+    monkeypatch, scale, rate
+):
     """Measured, not asserted from a metrics calculation.
 
     No glyph coordinates are hardcoded and no font is assumed. The control is a
@@ -713,7 +875,12 @@ def test_the_longest_header_string_stays_clear_of_the_dot_and_inside_the_header(
     Both figures are wider than the usual reading: 999.9 MB/s is the example in
     the brief, and 1250.0 MB/s is what a saturated 10 GbE link reports, which is
     the widest pair a machine of this class can actually produce.
+
+    Every rate at every scale: twelve renders, and the pixels are what say
+    whether the header still holds, not the metrics calculation the test above
+    does.
     """
+    layout = theme.Layout(scale)
     widest = Snapshot(**{
         **{name: getattr(CALM, name) for name in ("cpu_pct", "cpu_live_mhz",
              "cpu_nominal_mhz", "ram_used_gb", "ram_total_gb", "gpu_pct",
@@ -721,40 +888,44 @@ def test_the_longest_header_string_stays_clear_of_the_dot_and_inside_the_header(
         "net_down_bytes_per_sec": rate,
         "net_up_bytes_per_sec": rate,
     })
-    with_text = render(widest, RAMPS)
+    with_text = render(widest, RAMPS, scale=scale)
     monkeypatch.setattr(painter, "_format_net", lambda snapshot: "")
-    without_text = render(CALM, RAMPS)
+    without_text = render(CALM, RAMPS, scale=scale)
     monkeypatch.undo()
 
     pixels = differing_pixels(with_text, without_text)
-    assert pixels, "the throughput reached no pixels, so this test proves nothing"
+    assert pixels, f"the throughput reached no pixels at scale {scale}, so this test proves nothing"
 
-    header = theme.header_rect()
-    dot_right = theme.header_dot_x() + theme.DOT_R
+    header = layout.header_rect()
+    dot_right = layout.header_dot_x() + layout.dot_r
     xs = []
     for canvas_x, canvas_y in sorted(pixels):
-        x, y = canvas_x - theme.BLEED, canvas_y - theme.BLEED
+        x, y = canvas_x - layout.bleed, canvas_y - layout.bleed
         xs.append(x)
         assert header.top() <= y <= header.bottom(), (
-            f"the throughput was drawn at y={y}, outside the header band "
-            f"{header.top()}..{header.bottom()}"
+            f"the throughput was drawn at y={y} at scale {scale}, outside the header "
+            f"band {header.top()}..{header.bottom()}"
         )
         assert x > dot_right, (
-            f"the throughput starts at x={x}, on top of the status dot which "
-            f"ends at {dot_right}"
+            f"the throughput starts at x={x} at scale {scale}, on top of the status "
+            f"dot which ends at {dot_right}"
         )
         assert x <= header.right(), (
-            f"the throughput reaches x={x}, past the header's right edge at "
-            f"{header.right()} and the panel's padding"
+            f"the throughput reaches x={x} at scale {scale}, past the header's right "
+            f"edge at {header.right()} and the panel's padding"
         )
     # Both bounds: it starts on the edge every other string in the panel starts
     # on, so the dot keeps its companion and the header and the row labels stay
     # on one alignment -- and it does not start so far right that the alignment
-    # is lost altogether. A glyph's leading is 1-2 px past the pen position.
+    # is lost altogether. A glyph's leading is 1-2 px past the pen position,
+    # which is wider in absolute terms as the panel shrinks, so the window is
+    # scaled with the panel rather than left at 2.
     start = min(xs)
-    assert theme.header_text_x() - 2 <= start <= theme.header_text_x() + 2, (
-        f"the throughput starts at x={start}, not on the aligned text edge at "
-        f"{theme.header_text_x()}: the header and the row labels no longer line up"
+    leading = 2 * layout.scale + 0.001
+    assert layout.header_text_x() - leading <= start <= layout.header_text_x() + leading, (
+        f"the throughput starts at x={start} at scale {scale}, not on the aligned "
+        f"text edge at {layout.header_text_x()}: the header and the row labels no "
+        "longer line up"
     )
 
 
@@ -792,8 +963,9 @@ def test_the_status_dot_survives_the_header_change_and_still_reports_the_worst_s
     what lets the pixel read back as the pure state colour instead of a blend
     with a translucent fill.
     """
-    x = int(theme.BLEED + theme.header_dot_x())
-    y = int(theme.BLEED + theme.header_rect().center().y())
+    layout = theme.Layout(theme.DEFAULT_SCALE)
+    x = int(layout.bleed + layout.header_dot_x())
+    y = int(layout.bleed + layout.header_rect().center().y())
     calm = render(CALM, RAMPS, alpha=1.0).pixelColor(x, y)
     hot = render(HOT, RAMPS, alpha=1.0).pixelColor(x, y)
     empty = render(EMPTY, {}, alpha=1.0).pixelColor(x, y)
@@ -820,8 +992,9 @@ def test_throughput_alone_does_not_light_the_status_dot(monkeypatch):
     # counting the throughput here would paint a calm blue dot on a panel whose
     # every row reads "--": a healthy-looking alarm light over nothing.
     assert theme.has_any_data(net_only) is False
-    x = int(theme.BLEED + theme.header_dot_x())
-    y = int(theme.BLEED + theme.header_rect().center().y())
+    layout = theme.Layout(theme.DEFAULT_SCALE)
+    x = int(layout.bleed + layout.header_dot_x())
+    y = int(layout.bleed + layout.header_rect().center().y())
     assert render(net_only, {}, alpha=1.0).pixelColor(x, y).name() == theme.NEUTRAL.name()
 
 
@@ -858,7 +1031,8 @@ def test_unknown_history_keys_are_ignored():
     )
 
 
-def test_alpha_zero_still_draws_the_text(monkeypatch):
+@pytest.mark.parametrize("scale", theme.SCALE_STEPS)
+def test_alpha_zero_still_draws_the_text(monkeypatch, scale):
     """At alpha 0 the panel background vanishes but the glyphs must remain.
 
     The obvious version of this test -- diff an alpha=0 render against an
@@ -870,27 +1044,31 @@ def test_alpha_zero_still_draws_the_text(monkeypatch):
     No glyph coordinates are hardcoded. That would need a font-aware probe to
     survive a font change; this measures whatever actually rasterised.
     """
-    clear = render(CALM, RAMPS, alpha=0.0)
+    layout = theme.Layout(scale)
+    clear = render(CALM, RAMPS, alpha=0.0, scale=scale)
     monkeypatch.setattr(painter, "_draw_text", lambda *args, **kwargs: None)
-    untexted = render(CALM, RAMPS, alpha=0.0)
+    untexted = render(CALM, RAMPS, alpha=0.0, scale=scale)
 
-    cpu_rect = next(rect for spec, rect in theme.metric_rects() if spec.key == "cpu_pct")
+    cpu_rect = next(rect for spec, rect in layout.metric_rects() if spec.key == "cpu_pct")
     differing = in_cpu_row = 0
-    for y in range(theme.CANVAS_H):
-        for x in range(theme.CANVAS_W):
+    for y in range(layout.canvas_h):
+        for x in range(layout.canvas_w):
             if clear.pixelColor(x, y).rgba() == untexted.pixelColor(x, y).rgba():
                 continue
             differing += 1
-            if cpu_rect.contains(QPointF(x - theme.BLEED, y - theme.BLEED)):
+            if cpu_rect.contains(QPointF(x - layout.bleed, y - layout.bleed)):
                 in_cpu_row += 1
 
-    assert differing > 300, (
-        f"only {differing} pixels changed when text drawing was stubbed out: "
-        "the alpha=0 render carries no glyphs"
+    # The floors are shares of the counts measured at scale 1.0, because a 0.75
+    # panel has three quarters of the pixels to draw them into. Set them to the
+    # measured numbers and this would only be true of one scale.
+    assert differing > 300 * layout.scale ** 2, (
+        f"only {differing} pixels changed when text drawing was stubbed out at "
+        f"scale {scale}: the alpha=0 render carries no glyphs"
     )
-    assert in_cpu_row > 30, (
-        f"{differing} pixels differ but only {in_cpu_row} inside the CPU row: "
-        "row values are not being drawn, only the header"
+    assert in_cpu_row > 30 * layout.scale ** 2, (
+        f"{differing} pixels differ but only {in_cpu_row} inside the CPU row at "
+        f"scale {scale}: row values are not being drawn, only the header"
     )
     assert max_channel_delta(clear, untexted) > 60
 
@@ -898,15 +1076,16 @@ def test_alpha_zero_still_draws_the_text(monkeypatch):
 # --- the status dot and a stale snapshot -----------------------------------
 
 
-def dot_colour(snapshot, now=None, **kwargs):
+def dot_colour(snapshot, now=None, scale=theme.DEFAULT_SCALE, **kwargs):
     """The colour the status dot actually reached the pixels in.
 
     Read back at alpha 1.0, where the panel fill behind the dot is opaque, so
     the pixel is the pure dot colour and not a blend with it.
     """
-    x = int(theme.BLEED + theme.header_dot_x())
-    y = int(theme.BLEED + theme.header_rect().center().y())
-    return render(snapshot, RAMPS, alpha=1.0, now=now, **kwargs).pixelColor(x, y)
+    layout = theme.Layout(scale)
+    x = int(layout.bleed + layout.header_dot_x())
+    y = int(layout.bleed + layout.header_rect().center().y())
+    return render(snapshot, RAMPS, alpha=1.0, now=now, scale=scale, **kwargs).pixelColor(x, y)
 
 
 def test_a_fresh_snapshot_lights_the_status_dot_in_its_state_colour():
@@ -937,26 +1116,28 @@ def test_a_stale_snapshot_goes_neutral_instead_of_reporting_a_state():
     )
 
 
-def test_staleness_does_not_disturb_any_row():
+@pytest.mark.parametrize("scale", theme.SCALE_STEPS)
+def test_staleness_does_not_disturb_any_row(scale):
     """Only the dot changes. The numbers stay, because they are all there is."""
+    layout = theme.Layout(scale)
     aged = HOT.ts + theme.STALE_AFTER_S + 0.001
-    fresh_render = render(HOT, RAMPS, alpha=1.0, now=HOT.ts)
-    stale_render = render(HOT, RAMPS, alpha=1.0, now=aged)
+    fresh_render = render(HOT, RAMPS, alpha=1.0, now=HOT.ts, scale=scale)
+    stale_render = render(HOT, RAMPS, alpha=1.0, now=aged, scale=scale)
 
-    x = int(theme.BLEED + theme.header_dot_x())
-    y = int(theme.BLEED + theme.header_rect().center().y())
+    x = int(layout.bleed + layout.header_dot_x())
+    y = int(layout.bleed + layout.header_rect().center().y())
     assert fresh_render.pixelColor(x, y) != stale_render.pixelColor(x, y), (
         "the dot did not change colour: nothing was tested"
     )
     rows = [
-        (spec, rect) for spec, rect in theme.metric_rects()
-        if not rect.contains(QPointF(x - theme.BLEED, y - theme.BLEED))
+        (spec, rect) for spec, rect in layout.metric_rects()
+        if not rect.contains(QPointF(x - layout.bleed, y - layout.bleed))
     ]
     differing = [
         (px, py)
         for spec, rect in rows
-        for py in range(int(rect.top()) + theme.BLEED, int(rect.bottom()) + theme.BLEED)
-        for px in range(int(rect.left()) + theme.BLEED, int(rect.right()) + theme.BLEED)
+        for py in range(int(rect.top()) + layout.bleed, int(rect.bottom()) + layout.bleed)
+        for px in range(int(rect.left()) + layout.bleed, int(rect.right()) + layout.bleed)
         if fresh_render.pixelColor(px, py).rgba() != stale_render.pixelColor(px, py).rgba()
     ]
     assert not differing, f"{len(differing)} row pixels changed with staleness"
@@ -981,6 +1162,8 @@ def test_render_defaults_to_treating_the_snapshot_as_current():
     a picture of a panel whose collector has been dead for 55 years.
     """
     assert render(HOT, RAMPS).pixelColor(
-        int(theme.BLEED + theme.header_dot_x()),
-        int(theme.BLEED + theme.header_rect().center().y()),
+        int(theme.Layout(theme.DEFAULT_SCALE).bleed
+            + theme.Layout(theme.DEFAULT_SCALE).header_dot_x()),
+        int(theme.Layout(theme.DEFAULT_SCALE).bleed
+            + theme.Layout(theme.DEFAULT_SCALE).header_rect().center().y()),
     ).name() == theme.CRITICAL_COLOR.name()

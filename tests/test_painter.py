@@ -1,4 +1,4 @@
-﻿"""Renderer tests, half of them golden-image comparisons.
+"""Renderer tests, half of them golden-image comparisons.
 
 The goldens are near-exact matches: `max_channel_delta` compares the alpha
 channel as well as RGB, so anything above a handful of counts is a real

@@ -1,4 +1,4 @@
-﻿"""Tests for the entry point: the sampler thread, the log and the menu wiring.
+"""Tests for the entry point: the sampler thread, the log and the menu wiring.
 
 No test here calls show(). MonitorApp's constructor shows the panel and the
 tray icon, so the methods worth driving directly are run against an instance

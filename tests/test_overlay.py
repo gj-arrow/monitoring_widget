@@ -1256,9 +1256,9 @@ def test_a_failed_frame_does_not_take_the_process_with_it():
 
     PyQt calls qFatal() when a Python exception escapes a reimplemented virtual
     method, so a raise out of paintEvent ends the interpreter, and this widget is
-    meant to sit on someone's screen all day. painter.py reads cpu_live_mhz,
-    cpu_nominal_mhz and the two net columns straight off the dataclass rather
-    than through an accessor, so any snapshot thinner than metrics.Snapshot would
+    meant to sit on someone's screen all day. painter.py reads cpu_pct,
+    gpu_temp_c and the two net columns straight off the dataclass rather than
+    through an accessor, so any snapshot thinner than metrics.Snapshot would
     take the whole application down from inside a paint event.
 
     Asserting that here is impossible: the test that proves it has to drive a

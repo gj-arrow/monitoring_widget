@@ -340,29 +340,48 @@ def shutting_down(qapp, tmp_path, monkeypatch, collectors):
 # --- where the WMI connection is opened ------------------------------------
 
 
-class QueryingProbe(metrics.SystemProbe):
-    """The real probe, plus the one WMI query SystemProbe hides.
+class NoNvidia:
+    """pynvml as a machine with no NVIDIA driver presents it."""
 
-    sample() catches every source exception, so a WMI connection opened on the
-    wrong thread is invisible through a Snapshot -- the row simply reads `--`
-    and `_reconnect()` quietly repairs it. So this records what the raw query
-    did, and it does that *before* super().sample() runs: by the time sample()
-    returns, _reconnect() may already have replaced the connection, which would
-    hide the very failure under test.
+    def nvmlInit(self):
+        raise RuntimeError("no NVIDIA driver")
+
+
+class QueryingProbe(metrics.SystemProbe):
+    """The real probe, with its GPU source forced onto the WMI path.
+
+    The GPU fallback is the only WMI caller left, and on a machine with an NVIDIA
+    card it is never taken -- so a probe built normally would never reach WMI at
+    all and this test would pass having measured nothing. GpuProbe is therefore
+    built with an NVML stub that refuses to start, which is what puts it on the
+    fallback, and metrics._wmi_video_controllers() is wrapped rather than
+    replaced so the app still answers from the real WMI service while every call
+    is recorded.
+
+    The raw query in sample() is deliberately unguarded and outside the wrapper.
+    metrics._wmi_video_controllers() catches everything and returns [], so a
+    cross-apartment failure is otherwise invisible: the row reads `--` and
+    nothing says why. Two separate facts are recorded because both are needed --
+    "the call happened here" alone would pass with the wrong apartment, and "the
+    query did not raise" alone would pass if the query never ran.
     """
 
     built_on: list = []
     queried_on: list = []
     outcomes: list = []
+    callers: list = []
 
     def __init__(self):
-        super().__init__()
+        super().__init__(gpu=metrics.GpuProbe(nvml=NoNvidia()))
         QueryingProbe.built_on.append(QThread.currentThread())
 
     def sample(self):
         QueryingProbe.queried_on.append(QThread.currentThread())
         try:
-            self._cpu_clock._conn.query(metrics._PERF_RATIO_WQL)
+            # The same unprojected fetch the fallback makes, uncaught.
+            import wmi
+
+            list(wmi.WMI().Win32_VideoController())
         except Exception as exc:  # noqa: BLE001 - the point is that it raised
             QueryingProbe.outcomes.append(f"{type(exc).__name__}: {exc}")
         else:
@@ -371,18 +390,26 @@ class QueryingProbe(metrics.SystemProbe):
 
     @classmethod
     def reset(cls):
-        cls.built_on, cls.queried_on, cls.outcomes = [], [], []
+        cls.built_on, cls.queried_on, cls.outcomes, cls.callers = [], [], [], []
 
 
 @pytest.fixture
 def querying_probe(qapp, tmp_path, monkeypatch, collectors):
     """QueryingProbe behind main.py's own wiring, torn down after.
 
-    The probe is the real one on purpose: every CPU-clock test in the suite
-    injects a fake WMI, so nothing else in this repository can tell a connection
-    opened on the wrong thread from one opened on the right one.
+    The probe is the real one on purpose: every WMI test in test_metrics.py
+    monkeypatches `_wmi_video_controllers`, so nothing else in this repository
+    can tell a connection opened on the wrong thread from one opened on the
+    right one.
     """
     QueryingProbe.reset()
+    real_controllers = metrics._wmi_video_controllers
+
+    def recording_controllers():
+        QueryingProbe.callers.append(QThread.currentThread())
+        return real_controllers()
+
+    monkeypatch.setattr(metrics, "_wmi_video_controllers", recording_controllers)
     monkeypatch.setattr(app_main, "SystemProbe", QueryingProbe)
     app = bare_app(tmp_path)
     collector = collectors(app._make_collector())
@@ -399,37 +426,60 @@ def test_the_wmi_connection_is_opened_on_the_thread_that_queries_it(
     connection there, and then every query ran on the collector's thread. COM
     refuses that call: WMI's object is an apartment-threaded proxy, and using it
     from a thread it was not created on fails with RPC_E_WRONG_THREAD
-    (0x8001010E). The app survived only because CpuClockProbe._reconnect()
-    rebuilt the connection on the worker thread, and the exception was logged at
-    INFO on a logger main.py pins to WARNING.
+    (0x8001010E). The exception was logged at INFO on a logger main.py pins to
+    WARNING, and the row read `--`.
 
     Measured before this test existed: tick 0 raised on every single launch.
+
+    Two assertions, and the first is the one that would catch a regression now.
+    Every call to metrics' WMI entry point has to come from the collector,
+    because that is what both opens the connection and queries it; a second
+    caller is a second connection, opened on whoever's thread it happened to be.
+    The second says the collector's apartment can actually answer -- which it
+    cannot if the CoInitializeEx in run() is removed, whatever thread the call
+    comes from.
     """
     probe, collector = querying_probe
     collector.start()
 
-    assert wait_until(lambda: probe.outcomes, 10.0), (
-        "the collector never queried WMI: the panel would be showing dashes "
-        "with no attempt to measure anything"
+    assert wait_until(lambda: probe.outcomes and probe.callers, 10.0), (
+        "the collector never reached WMI: on a machine with no NVIDIA card the "
+        "panel would show dashes with no attempt to measure anything"
     )
     collector.requestInterruption()
     collector.poke()
     assert collector.wait(5000) is True
 
+    assert set(probe.callers) == {collector}, (
+        f"WMI was reached from {probe.callers} and not only from the collector: "
+        "a connection opened on the GUI thread and queried on this one is a "
+        "cross-apartment call"
+    )
     assert probe.outcomes[0] is None, (
         f"the first WMI query on the collector's thread raised {probe.outcomes[0]}: "
-        "the connection was opened somewhere else"
+        "the connection was opened somewhere else, or the collector's apartment "
+        "was never initialised"
+    )
+    # The cache means one call per WMI_FALLBACK_REFRESH_S, not one per tick, so
+    # this is the whole of it and it is not a single tick that got lucky.
+    assert len(probe.callers) == 1, (
+        f"{len(probe.callers)} WMI calls in one tick: the no-NVIDIA path opens a "
+        "COM connection and re-reads Win32_VideoController every two seconds, "
+        "which is the 44.6 ms a query costs times thirty a minute"
     )
 
 
 def test_the_probe_itself_is_built_on_the_collector_thread(qapp, querying_probe):
-    """Why the query above succeeds has to be the connection, not COM init.
+    """The factory is what puts the probe on the thread that will query it.
 
     Initialising COM on the querying thread does *not* rescue a connection
     opened elsewhere -- see the characterisation test below -- so "the query no
     longer raises" on its own would be satisfied by anything that merely
-    initialised COM. This pins the actual fix: the object holding the COM
-    connection is constructed on the thread that will use it.
+    initialised COM. This pins the actual fix: the object that will reach WMI is
+    constructed on the thread that will use it, so there is no connection for the
+    GUI thread to have opened in the first place. `import wmi` runs GetObject at
+    module scope, so a probe built here would bind one to this thread for the
+    life of the process whatever later ran.
     """
     probe, collector = querying_probe
     collector.start()
@@ -441,9 +491,9 @@ def test_the_probe_itself_is_built_on_the_collector_thread(qapp, querying_probe)
     assert collector.wait(5000) is True
 
     assert built_on is collector, (
-        f"the probe was built on {built_on!r}, not the collector's thread: the "
-        "WMI connection inside it belongs to the GUI thread and every query "
-        "against it is a cross-apartment call"
+        f"the probe was built on {built_on!r}, not the collector's thread: a COM "
+        "connection opened on the GUI thread belongs to the GUI thread, and every "
+        "later query against it is a cross-apartment call"
     )
     assert probe.queried_on[0] is collector, "the query did not run on the collector's thread"
 
@@ -556,13 +606,12 @@ def test_a_probe_factory_that_raises_is_logged_and_the_run_returns(
     """The escape hatch, because an exception out of run() is fatal to the process.
 
     Building the probe here rather than on the GUI thread is what fixed the
-    cross-apartment WMI fault, and it moved `import psutil` (SystemProbe) and
-    the COM connection (CpuClockProbe) under main()'s try/except no more: both
-    are unguarded, and an exception escaping a QThread virtual cannot be caught
-    from the outside. Measured before the fix: the process died with
-    -1073740791 (0xC0000409) and app_debug.log held **zero** records, so a
-    missing dependency or an unavailable sensor at startup killed the app with
-    no explanation at all -- strictly worse than the failure the factory fixed.
+    cross-apartment WMI fault, and it moved `import psutil` under main()'s
+    try/except no more: it is unguarded, and an exception escaping a QThread
+    virtual cannot be caught from the outside. Measured before the fix: the
+    process died with -1073740791 (0xC0000409) and app_debug.log held **zero**
+    records, so a missing dependency at startup killed the app with no
+    explanation at all -- strictly worse than the failure the factory fixed.
 
     run() is called here rather than started on a thread, and that is the point:
     it makes a regression a failed test instead of a dead interpreter, the same

@@ -251,12 +251,15 @@ def _draw_row(
     aux_font = layout.aux_font()
 
     # The value is placed first, then the auxiliary reading is pushed out to the
-    # right edge, so left to right it reads "34%  4.5 / 4.5 GHz": the dimmer text
-    # trails the number it qualifies instead of preceding it.
+    # right edge, so left to right it reads "29.4  / 32.0 GB": the dimmer text
+    # trails the number it qualifies instead of preceding it. With no auxiliary
+    # the offset is zero and the value sits on the right edge alone, which is
+    # what the CPU row does -- its value is the row, and it is not padded out
+    # into a second slot to look like the others.
     aux_width = QFontMetricsF(aux_font).horizontalAdvance(aux_text) if aux_text else 0.0
     _draw_text(
         painter, value_text, text_rect, value_font, color,
-        right=True, right_offset=-(aux_width + layout.value_gap),
+        right=True, right_offset=-(aux_width + layout.value_gap) if aux_text else 0.0,
     )
     if aux_text:
         _draw_text(painter, aux_text, text_rect, aux_font, theme.SUBTLE, right=True)
@@ -342,9 +345,17 @@ def _format_value(spec, snapshot) -> str:
 
 
 def _format_aux(spec, snapshot) -> str:
+    """The reading that qualifies the row's value, or "" when it has none.
+
+    Three of the four rows have one. The CPU row does not: it used to carry the
+    derived clock, and that is gone because the number did not follow load --
+    PercentProcessorPerformance reads about 99 % of nominal at 9 % load and at
+    100 % alike, since a Ryzen 5 5600X drops voltage rather than frequency in
+    proportion to the work it has been given. An empty string here is what the
+    CPU row says, and `_draw_text` returns on one, so nothing is drawn and no
+    gap is left where a reading used to sit.
+    """
     if spec.kind == theme.PCT:
-        if spec.key == "cpu_pct":
-            return _format_frequency(snapshot)
         if spec.key == "gpu_pct":
             # theme.gpu_temp(), not snapshot.gpu_temp_c: the accessor exists so
             # a snapshot without the field degrades to "--" instead of raising
@@ -354,25 +365,3 @@ def _format_aux(spec, snapshot) -> str:
         return ""
     total = getattr(snapshot, f"{spec.key}_total_gb", None)
     return "--" if total is None else f"/ {total:.1f} GB"
-
-
-def _format_frequency(snapshot) -> str:
-    """The derived clock beside the nominal one it was derived from.
-
-    Two decimals, because the derived figure moves in the hundredths of a GHz:
-    99.0% of nominal idle and 99.5% loaded on this machine, so 4460 and 4501
-    both read "4.5" at one place and the row looks frozen even though the
-    reading is alive.
-
-    With no derived clock the answer is a dash. The nominal is a ceiling, not a
-    measurement of what the core is running at, and printing it in the live
-    position is the frozen-constant bug this replaces -- so it is only shown
-    beside a clock that was actually derived.
-    """
-    live = snapshot.cpu_live_mhz
-    if live is None:
-        return "--"
-    nominal = snapshot.cpu_nominal_mhz
-    if nominal:
-        return f"{live / 1000:.2f} / {nominal / 1000:.2f} GHz"
-    return f"{live / 1000:.2f} GHz"

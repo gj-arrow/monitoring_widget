@@ -9,7 +9,7 @@ import pytest
 import main as app_main
 import metrics
 import theme
-from metrics import CpuClockProbe, GpuProbe, NetProbe, Snapshot, SystemProbe, wmi_fallback
+from metrics import GpuProbe, NetProbe, Snapshot, SystemProbe, wmi_fallback
 
 GB = 1024 ** 3
 
@@ -87,94 +87,6 @@ class FakeGpu:
 
     def read(self):
         return dict(self.values)
-
-
-class FakeCpuClock:
-    def __init__(self, values):
-        self.values = values
-        self.reads = 0
-
-    def read(self):
-        self.reads += 1
-        return dict(self.values)
-
-
-class BrokenCpuClock:
-    """A clock source that dies the way a stopped WMI service does."""
-
-    def read(self):
-        raise RuntimeError("the WMI service has stopped")
-
-
-class FakeWmiConnection:
-    """The two Win32 classes CpuClockProbe queries, dispatched by WQL.
-
-    Dispatching on the query rather than on a per-class convenience method is
-    how the real client behaves, and it matters: a WQL projection naming a
-    property the repository does not have is rejected outright rather than
-    quietly returning a row without it. That is exactly what this machine does
-    with Win32_Processor.ProcessorFrequency.
-    """
-
-    def __init__(self, processors=(), perf=(), absent=("ProcessorFrequency",), fail=False):
-        self._processors = processors
-        self._perf = perf
-        self._absent = absent
-        self.fail = fail
-        self.queries = []
-
-    def query(self, wql):
-        self.queries.append(wql)
-        if self.fail:
-            raise RuntimeError("the WMI service has stopped")
-        for name in self._absent:
-            if name in wql:
-                raise RuntimeError(f"invalid query: {name} is not a property")
-        if "PercentProcessorPerformance" in wql:
-            return list(self._perf)
-        # Every other projection gets the same instances back, unfiltered: a real
-        # projection returns the row with only the column it named, so dropping
-        # a row here would quietly do the probe's own deciding for it. What the
-        # row does not carry has to come back as a missing attribute.
-        return list(self._processors)
-
-    def Win32_Processor(self):
-        raise AssertionError(
-            "the unprojected Win32_Processor fetch measured 1044 ms on this "
-            "machine against a 6 ms projection; the nominal clock has to come "
-            "from a projection or it eats half of every tick"
-        )
-
-    def Win32_PerfFormattedData_Counters_ProcessorInformation(self):
-        raise AssertionError(
-            "the unprojected perf-counter fetch measured 481 ms on this machine "
-            "against 353 ms projected; the counter has to come from a projection"
-        )
-
-
-class FakeWmi:
-    """Stands in for the wmi module and counts every connection it builds."""
-
-    def __init__(self, connection=None, fail_connect=False):
-        self.connects = 0
-        self._connection = connection
-        self._fail_connect = fail_connect
-        self.down = False
-
-    def WMI(self):
-        self.connects += 1
-        if self._fail_connect or self.down:
-            raise RuntimeError("the WMI service has stopped")
-        self._connection.fail = False   # a fresh handle is not a stale one
-        return self._connection
-
-
-def perf_rows(*ratios):
-    """One Win32_PerfFormattedData_Counters_ProcessorInformation row per ratio."""
-    return [
-        SimpleNamespace(Name=f"0,{index}", PercentProcessorPerformance=ratio)
-        for index, ratio in enumerate(ratios)
-    ]
 
 
 class FakeCounters:
@@ -296,15 +208,12 @@ def test_wmi_fallback_handles_no_controllers(monkeypatch):
 def test_sample_fills_every_field():
     probe = SystemProbe(
         cpu_pct=lambda: 12.5,
-        cpu_clock=FakeCpuClock({"cpu_nominal_mhz": 4501.0, "cpu_live_mhz": 4464.0}),
         ram=lambda: SimpleNamespace(used=11.4 * GB, total=32 * GB),
         gpu=FakeGpu({"gpu_pct": 61.0, "gpu_temp_c": 58.0, "vram_used_gb": 6.2, "vram_total_gb": 20.0}),
         net=FakeGpu({}),
     )
     snap = probe.sample()
     assert snap.cpu_pct == 12.5
-    assert snap.cpu_live_mhz == 4464.0
-    assert snap.cpu_nominal_mhz == 4501.0
     assert snap.ram_used_gb == 11.4
     assert snap.ram_total_gb == 32.0
     assert snap.gpu_pct == 61.0
@@ -318,59 +227,43 @@ def test_sample_fills_every_field():
     assert snap.ts > 0.0
 
 
-def test_sample_drops_a_zero_nominal_frequency():
-    probe = CpuClockProbe(
-        wmi=FakeWmi(FakeWmiConnection(processors=[SimpleNamespace(MaxClockSpeed=0)], perf=[])),
-        nominal_max=lambda: 0.0,
-    )
-    # 0 is not a measurement of the CPU's ceiling -- it is a driver that has
-    # nothing to say, and dividing by it or displaying it would be inventing one.
-    assert probe.read() == {"cpu_nominal_mhz": None, "cpu_live_mhz": None}
-
-
 def test_sample_reports_none_when_a_source_raises():
     def boom():
         raise RuntimeError("sensor bus is on fire")
 
     probe = SystemProbe(
-        cpu_pct=boom, cpu_clock=BrokenCpuClock(), ram=boom,
-        gpu=FakeGpu({}), net=FakeGpu({}),
+        cpu_pct=boom, ram=boom,
+        gpu=BrokenGpu(), net=BrokenNet(),
     )
     snap = probe.sample()
     assert snap.cpu_pct is None
-    assert snap.cpu_live_mhz is None
-    assert snap.cpu_nominal_mhz is None
     assert snap.ram_used_gb is None
     assert snap.ram_total_gb is None
     assert snap.gpu_pct is None
     assert snap.ts > 0.0
 
 
-@pytest.mark.parametrize("failing", ["cpu_pct", "cpu_clock", "ram", "net"])
+@pytest.mark.parametrize("failing", ["cpu_pct", "ram", "net"])
 def test_sample_isolates_one_failing_source(failing):
-    # The test above breaks every source at once, so it cannot tell five
+    # The test above breaks every source at once, so it cannot tell four
     # separate guards from one: collapsing them into a single try would leave
     # it green while one dead sensor blanked the whole panel. One source fails
     # here and every other reading must survive.
     dependencies = {
         "cpu_pct": lambda: 12.5,
         "ram": lambda: SimpleNamespace(used=11.4 * GB, total=32 * GB),
-        "cpu_clock": FakeCpuClock({"cpu_nominal_mhz": 4501.0, "cpu_live_mhz": 4464.0}),
         "net": FakeGpu({"net_down_bytes_per_sec": 15000.0, "net_up_bytes_per_sec": 30000.0}),
     }
     readable = {
         "cpu_pct": 12.5,
-        "cpu_live_mhz": 4464.0,
-        "cpu_nominal_mhz": 4501.0,
         "ram_used_gb": 11.4,
         "ram_total_gb": 32.0,
         "net_down_bytes_per_sec": 15000.0,
         "net_up_bytes_per_sec": 30000.0,
     }
-    # The clock source fills two fields, so it takes both down with it.
+    # The RAM source fills two fields, so it takes both down with it.
     lost = {
         "cpu_pct": ("cpu_pct",),
-        "cpu_clock": ("cpu_live_mhz", "cpu_nominal_mhz"),
         "ram": ("ram_used_gb", "ram_total_gb"),
         "net": ("net_down_bytes_per_sec", "net_up_bytes_per_sec"),
     }[failing]
@@ -378,7 +271,7 @@ def test_sample_isolates_one_failing_source(failing):
     def boom():
         raise RuntimeError("sensor bus is on fire")
 
-    dependencies[failing] = _broken_source() if failing in ("cpu_clock", "net") else boom
+    dependencies[failing] = _broken_source() if failing == "net" else boom
     snap = SystemProbe(gpu=FakeGpu({}), **dependencies).sample()
 
     for field, value in readable.items():
@@ -404,15 +297,12 @@ def test_sample_isolates_a_failing_gpu_read():
     # this file green while one missing driver blanked the other rows too.
     probe = SystemProbe(
         cpu_pct=lambda: 12.5,
-        cpu_clock=FakeCpuClock({"cpu_nominal_mhz": 4501.0, "cpu_live_mhz": 4464.0}),
         ram=lambda: SimpleNamespace(used=11.4 * GB, total=32 * GB),
         gpu=BrokenGpu(),
         net=FakeGpu({"net_down_bytes_per_sec": 15000.0, "net_up_bytes_per_sec": 30000.0}),
     )
     snap = probe.sample()
     assert snap.cpu_pct == 12.5
-    assert snap.cpu_live_mhz == 4464.0
-    assert snap.cpu_nominal_mhz == 4501.0
     assert snap.ram_used_gb == 11.4
     assert snap.ram_total_gb == 32.0
     assert snap.gpu_pct is None
@@ -445,156 +335,6 @@ def test_snapshot_as_dict_round_trips():
     snap = Snapshot(cpu_pct=5.0)
     assert snap.as_dict()["cpu_pct"] == 5.0
     assert snap.as_dict()["gpu_temp_c"] is None
-
-
-# --- the CPU clock -------------------------------------------------------
-
-
-def clock_probe(perf=(), processors=(), nominal=4500.0, connect_fails=False, absent=("ProcessorFrequency",)):
-    """A CpuClockProbe on a fake COM connection, built the way the app does."""
-    return CpuClockProbe(
-        wmi=FakeWmi(FakeWmiConnection(processors=processors, perf=perf, absent=absent),
-                    fail_connect=connect_fails),
-        nominal_max=lambda: nominal,
-    )
-
-
-def test_cpu_clock_probe_builds_one_wmi_connection_for_the_whole_process():
-    # wmi.WMI() opens a COM connection and holds it. Calling it per tick means a
-    # fresh connect every two seconds for as long as the panel is up, which is
-    # exactly the waste GpuProbe avoids by holding one NVML handle.
-    wmi = FakeWmi(FakeWmiConnection(
-        processors=[SimpleNamespace(MaxClockSpeed=4501)], perf=perf_rows(99.0),
-    ))
-    probe = CpuClockProbe(wmi=wmi, nominal_max=lambda: None)
-    for _ in range(20):
-        probe.read()
-    assert wmi.connects == 1
-
-
-def test_the_live_clock_is_the_nominal_times_the_average_performance_ratio():
-    # Win32_PerfFormattedData_Counters_ProcessorInformation.PercentProcessor-
-    # Performance is the ratio of the actual clock to the nominal one, so it is
-    # a multiplier and not a reading: the clock is nominal * ratio / 100. The
-    # three ratios here are the ones measured on this machine -- 99.0 idle,
-    # 99.5 under load -- and their mean, 99.2, gives 4500 * 0.992 = 4464.0.
-    probe = clock_probe(perf=perf_rows(99.0, 99.5, 99.1),
-                        processors=[SimpleNamespace(MaxClockSpeed=4500)])
-    values = probe.read()
-    assert values == {"cpu_nominal_mhz": 4500.0, "cpu_live_mhz": 4464.0}
-    # And it is a derivation, not the nominal passed through under a new name:
-    # the old code filled the row with a frozen 4501 that looked measured.
-    assert values["cpu_live_mhz"] != values["cpu_nominal_mhz"]
-
-
-def test_the_live_clock_averages_the_logical_processors_and_ignores_the_total_rows():
-    # The class carries two aggregate rows beside the per-processor ones --
-    # "_Total" and "0,_Total" on this 12-thread machine. Averaging those in
-    # counts the machine twice over and lets one aggregate value steer the
-    # reading, so 4464 would become 4114.
-    perf = perf_rows(*([100.0] * 12))
-    perf += [SimpleNamespace(Name="_Total", PercentProcessorPerformance=40.0),
-             SimpleNamespace(Name="0,_Total", PercentProcessorPerformance=40.0)]
-    probe = clock_probe(perf=perf, processors=[SimpleNamespace(MaxClockSpeed=4500)])
-    assert probe.read()["cpu_live_mhz"] == 4500.0
-
-
-def test_the_live_clock_is_unmeasured_when_the_performance_counter_is_unavailable():
-    # The nominal is known, so filling the live field with it would look
-    # correct on screen and be a lie: it is the same frozen constant the panel
-    # has always shown. A counter that will not answer means no live reading.
-    probe = clock_probe(perf=[], processors=[SimpleNamespace(MaxClockSpeed=4501)])
-    assert probe.read() == {"cpu_nominal_mhz": 4501.0, "cpu_live_mhz": None}
-
-
-def test_the_live_clock_uses_whatever_processors_did_answer():
-    # One processor whose ratio never arrived must not be read as zero: that
-    # would halve the average and understate the clock on a machine where a
-    # single core's counter is unavailable.
-    perf = [SimpleNamespace(Name="0,0", PercentProcessorPerformance=99.0),
-            SimpleNamespace(Name="0,1")]
-    probe = clock_probe(perf=perf, processors=[SimpleNamespace(MaxClockSpeed=4500)])
-    assert probe.read()["cpu_live_mhz"] == 4455.0
-
-
-def test_the_live_clock_cannot_be_derived_without_a_nominal_reference():
-    # A ratio with nothing to multiply is not a clock. Reporting the ratio as
-    # one, or as 100% of nothing, would be a number nobody measured.
-    probe = clock_probe(perf=perf_rows(99.0), processors=[], nominal=None)
-    assert probe.read() == {"cpu_nominal_mhz": None, "cpu_live_mhz": None}
-
-
-def test_the_nominal_clock_falls_back_to_psutil_when_wmi_has_nothing_to_say():
-    # psutil.cpu_freq().max is the same quantity on Windows -- the nominal
-    # clock -- so it is a second source for the reference and never for the
-    # live reading. MaxClockSpeed 0 is dropped for the reason its psutil twin
-    # is: zero is a driver with nothing to report, not a ceiling.
-    probe = clock_probe(perf=perf_rows(99.0),
-                        processors=[SimpleNamespace(MaxClockSpeed=0)], nominal=4500.0)
-    assert probe.read() == {"cpu_nominal_mhz": 4500.0, "cpu_live_mhz": 4455.0}
-
-
-def test_the_nominal_clock_comes_from_a_projection_and_not_the_full_fetch():
-    # Two measured facts force this. wmi's per-class convenience wrapper pulls
-    # every property of every instance: Win32_Processor took 1044 ms that way on
-    # this machine and 6 ms as a projection naming one column -- half of a
-    # two-second tick spent on a hardware constant that cannot change while the
-    # process runs. And a projection naming ProcessorFrequency is rejected
-    # outright by a repository that lacks it, which is every machine measured
-    # here, so the ceiling has to be projected under a name that is there. The
-    # fake raises on both unprojected wrappers, so a revert is a failure with
-    # the measurement in the message rather than a slow test nobody notices.
-    probe = clock_probe(perf=perf_rows(99.0),
-                        processors=[SimpleNamespace(MaxClockSpeed=4501)])
-    assert probe.read()["cpu_nominal_mhz"] == 4501.0
-
-
-def test_the_nominal_clock_uses_processor_frequency_when_max_clock_speed_is_absent():
-    # Both names for the reference exist in the class and a provider may answer
-    # to only one of them, so the second is tried when the first says nothing.
-    # ProcessorFrequency is the *last* source and not the first: it is
-    # documented as the processor's current speed, which is a poorer ceiling
-    # than MaxClockSpeed and the same confusion this task is removing.
-    probe = clock_probe(perf=perf_rows(99.0),
-                        processors=[SimpleNamespace(ProcessorFrequency=4200)],
-                        nominal=None, absent=())
-    assert probe.read()["cpu_nominal_mhz"] == 4200.0
-
-
-def test_the_cpu_clock_probe_survives_a_wmi_service_that_will_not_connect(caplog):
-    with caplog.at_level(logging.INFO, logger="widget.metrics"):
-        probe = clock_probe(perf=perf_rows(99.0),
-                            processors=[SimpleNamespace(MaxClockSpeed=4501)],
-                            nominal=4500.0, connect_fails=True)
-    # The secondary source does not need WMI, so the nominal still arrives; the
-    # derived clock does, and is therefore unmeasured rather than nominal.
-    assert probe.read() == {"cpu_nominal_mhz": 4500.0, "cpu_live_mhz": None}
-    messages = [r.getMessage() for r in caplog.records]
-    assert any("WMI" in m for m in messages), (
-        f"a WMI connection that could not be built logged nothing: {messages}"
-    )
-
-
-def test_the_cpu_clock_probe_survives_a_query_that_raises():
-    class Exploding(FakeWmiConnection):
-        def query(self, wql):
-            raise RuntimeError("WQL error")
-
-    probe = CpuClockProbe(wmi=FakeWmi(Exploding()), nominal_max=lambda: 4500.0)
-    assert probe.read() == {"cpu_nominal_mhz": 4500.0, "cpu_live_mhz": None}
-
-
-def test_the_cpu_clock_probe_survives_a_repository_that_rejects_every_projection():
-    # A projection can be refused where the unprojected wrapper is not, so the
-    # secondary source has to be reachable without WMI at all. Otherwise a
-    # machine whose provider rejects the query loses the nominal for good --
-    # the derived clock with it -- and the row shows a dash forever.
-    class Rejecting(FakeWmiConnection):
-        def query(self, wql):
-            raise RuntimeError("invalid query")
-
-    probe = CpuClockProbe(wmi=FakeWmi(Rejecting()), nominal_max=lambda: 4500.0)
-    assert probe.read() == {"cpu_nominal_mhz": 4500.0, "cpu_live_mhz": None}
 
 
 # --- network throughput --------------------------------------------------
@@ -737,181 +477,6 @@ def test_the_network_probe_samples_the_counters_once_per_read():
     probe._now.advance(2.0)
     probe.read()
     assert counters.calls == 2
-
-
-def test_aggregate_rows_are_not_a_substitute_for_the_logical_processors():
-    """`_Total` is a summary of the per-processor rows, not a processor.
-
-    When it is the only row that comes back it reads 100 -- exactly nominal --
-    and publishing it as the live clock reproduces, byte for byte, the frozen
-    psutil constant this whole probe exists to remove. That branch had no test:
-    the one test with an empty perf list produces `[] or []`, which never
-    reaches it.
-    """
-    for name in ("_Total", "0,_Total"):
-        probe = clock_probe(
-            perf=[SimpleNamespace(Name=name, PercentProcessorPerformance=100)],
-            processors=[SimpleNamespace(MaxClockSpeed=4501)],
-        )
-        assert probe.read() == {"cpu_nominal_mhz": 4501.0, "cpu_live_mhz": None}, name
-
-
-def test_a_genuine_hundred_percent_average_is_still_allowed_to_equal_the_nominal():
-    """The counterpart to the aggregate test, and the reason it is not a lookup.
-
-    live == nominal is not by itself the bug: on a boosted part the mean over
-    the logical processors really does land on 100.0, and then the derived clock
-    and the reference agree. What made the old code wrong was arriving there from
-    an aggregate row. Measured on this machine, a sample under load does produce
-    exactly 100.0 across the twelve per-processor rows, so a test that forbade
-    the equality outright would be forbidding a real reading.
-    """
-    perf = perf_rows(*([99.0] * 8 + [102.0] * 4))
-    assert sum(float(r.PercentProcessorPerformance) for r in perf) / len(perf) == 100.0
-    probe = clock_probe(perf=perf, processors=[SimpleNamespace(MaxClockSpeed=4501)])
-    assert probe.read() == {"cpu_nominal_mhz": 4501.0, "cpu_live_mhz": 4501.0}
-
-
-def test_an_aggregate_at_a_plausible_ratio_is_still_not_a_processor():
-    """The rejection is about *which rows* answered, not about the value.
-
-    A turbo-looking 99 on `_Total` is no more a measurement of any individual
-    processor than 100 is. If the band were the only guard, this one would slip
-    through and look like a live reading.
-    """
-    probe = clock_probe(
-        perf=[SimpleNamespace(Name="_Total", PercentProcessorPerformance=99)],
-        processors=[SimpleNamespace(MaxClockSpeed=4501)],
-    )
-    assert probe.read()["cpu_live_mhz"] is None
-
-
-@pytest.mark.parametrize(
-    "ratio",
-    [0, 0.0, -1, -42, float("inf"), float("-inf"), float("nan"),
-     0.5, 1.0, 1e-06, 9.9, 201, 255, 4501],
-)
-def test_a_ratio_outside_the_plausible_band_is_not_a_measurement(ratio):
-    # The module's own docstring promises nothing here invents a number, and a
-    # counter with no range check does: 0 renders 0.00 GHz, -42 as -1.89 GHz,
-    # inf as inf, 255 as 11.48 GHz on a 4.5 GHz part, and a merely tiny positive
-    # ratio renders 0.04 GHz. All measured on this code.
-    probe = clock_probe(perf=perf_rows(ratio),
-                        processors=[SimpleNamespace(MaxClockSpeed=4501)])
-    assert probe.read() == {"cpu_nominal_mhz": 4501.0, "cpu_live_mhz": None}, ratio
-
-
-@pytest.mark.parametrize("ratio", [10.0, 99.0, 100.0, 118.0, 155.0, 200.0])
-def test_a_plausible_ratio_is_still_derived(ratio):
-    # The band has to leave room for genuine boost, not just for the 99-100 this
-    # machine idles at. 155% is below what real silicon reaches: the widest turbo
-    # ratio on any shipping part is a ~3.7 GHz Xeon over a 2.4 GHz base, about
-    # 154%. A ceiling at 200 clears that with room and still rejects garbage,
-    # since nothing clocks a CPU at twice nominal. 10% is the floor for the same
-    # reason at the bottom: no x86 core has ever run at a tenth of its nominal
-    # clock while an OS is scheduling it, and a formatted counter reports integer
-    # percent, so there is nothing real down there to keep.
-    probe = clock_probe(perf=perf_rows(ratio),
-                        processors=[SimpleNamespace(MaxClockSpeed=4500)])
-    assert probe.read()["cpu_live_mhz"] == round(4500 * ratio / 100.0, 1), ratio
-
-
-@pytest.mark.parametrize("speed", [20001.0, 450100.0, 1e30, 1e300])
-def test_a_nominal_faster_than_any_shipped_core_is_dropped(speed):
-    # Positive and finite is not enough. The fastest core in production is about
-    # 5.7 GHz, so a ceiling at 20 GHz cannot reject a real part, while 450100 --
-    # a unit slip in whatever produced the value -- renders "450.10 GHz" as
-    # though it were a clock. There is no part to measure, so it is not measured.
-    probe = CpuClockProbe(
-        wmi=FakeWmi(FakeWmiConnection(processors=[SimpleNamespace(MaxClockSpeed=speed)],
-                                      perf=perf_rows(99.0))),
-        nominal_max=lambda: None,
-    )
-    assert probe.read() == {"cpu_nominal_mhz": None, "cpu_live_mhz": None}, speed
-
-
-@pytest.mark.parametrize("speed", [0, -4501, -0.5, float("nan"), float("inf")])
-def test_a_nominal_that_is_not_a_positive_finite_speed_is_dropped(speed):
-    # `if speed:` is a truthiness test, and a negative, NaN or infinite ceiling
-    # is perfectly truthy. A negative nominal is worse than none at all: it
-    # multiplies straight into a negative clock on the panel.
-    probe = CpuClockProbe(
-        wmi=FakeWmi(FakeWmiConnection(processors=[SimpleNamespace(MaxClockSpeed=speed)],
-                                      perf=perf_rows(99.0))),
-        nominal_max=lambda: None,
-    )
-    assert probe.read() == {"cpu_nominal_mhz": None, "cpu_live_mhz": None}, speed
-
-
-@pytest.mark.parametrize("speed", [0, -4501, float("nan"), float("inf"),
-                                  20001.0, 450100.0, 1e300])
-def test_a_secondary_nominal_that_is_not_a_positive_finite_speed_is_dropped(speed):
-    # The psutil fallback is a source like any other and gets the same checks,
-    # bounds included. Trusting one path and not the other is how -4501 gets onto
-    # the panel, and how a unit slip in psutil's own field would too: the absurd
-    # values are here as well as in the WMI test because the ceiling is a property
-    # of the quantity, not of where it was read from.
-    probe = clock_probe(perf=perf_rows(99.0), processors=[], nominal=speed)
-    assert probe.read() == {"cpu_nominal_mhz": None, "cpu_live_mhz": None}, speed
-
-
-def test_the_nominal_clock_is_read_once_for_the_life_of_the_process():
-    # 6.9 ms a tick, for a value that cannot change while the process runs: the
-    # CPU's ceiling is a property of the installed part, not a reading. The
-    # performance counter is still read every tick, so the derived clock keeps
-    # moving -- only the reference stops being re-asked.
-    connection = FakeWmiConnection(processors=[SimpleNamespace(MaxClockSpeed=4501)],
-                                   perf=perf_rows(99.0))
-    probe = CpuClockProbe(wmi=FakeWmi(connection), nominal_max=lambda: None)
-    values = [probe.read() for _ in range(5)]
-    assert all(v["cpu_live_mhz"] == 4456.0 for v in values)
-    assert sum("Win32_Processor" in q for q in connection.queries) == 1, connection.queries
-    assert sum("PercentProcessorPerformance" in q for q in connection.queries) == 5
-
-
-def test_the_nominal_clock_is_still_retried_while_it_is_unknown():
-    # Caching must not cache a *failure*. A provider that was not ready at
-    # startup -- or a WMI service that comes back mid-session -- gets asked
-    # again, or the row reads -- for the rest of the session.
-    connection = FakeWmiConnection(processors=[], perf=perf_rows(99.0))
-    wmi = FakeWmi(connection)
-    probe = CpuClockProbe(wmi=wmi, nominal_max=lambda: None)
-    assert probe.read() == {"cpu_nominal_mhz": None, "cpu_live_mhz": None}
-    connection._processors = [SimpleNamespace(MaxClockSpeed=4501)]
-    assert probe.read()["cpu_live_mhz"] == 4456.0
-
-
-def test_the_cpu_clock_probe_reconnects_once_when_the_cached_handle_goes_stale():
-    # A WMI service that restarts mid-session leaves the cached connection
-    # unusable and every later query failing. Without a reconnect the nominal
-    # falls back to psutil and the derived clock reads -- for the rest of the
-    # session, however many ticks go by. A handle that recovers on reconnect
-    # costs not even a dash, because the retry happens inside the same read.
-    connection = FakeWmiConnection(processors=[SimpleNamespace(MaxClockSpeed=4501)],
-                                   perf=perf_rows(99.0))
-    wmi = FakeWmi(connection)
-    probe = CpuClockProbe(wmi=wmi, nominal_max=lambda: None)
-    assert probe.read()["cpu_live_mhz"] == 4456.0
-
-    connection.fail = True                      # the service restarts
-    assert probe.read()["cpu_live_mhz"] == 4456.0, (
-        "the probe did not recover on the reconnect inside its own read"
-    )
-    assert wmi.connects == 2
-
-
-def test_a_dead_wmi_service_is_not_reconnected_to_once_per_query():
-    # Three queries go into a read. A service that is genuinely down should be
-    # failed fast, not re-connected to three times a tick for nothing: the
-    # reconnect is paid once per read, however many of its queries then fail.
-    wmi = FakeWmi(fail_connect=True)
-    probe = CpuClockProbe(wmi=wmi, nominal_max=lambda: None)
-    probe.read()
-    first = wmi.connects
-    probe.read()
-    assert wmi.connects == first + 1, (
-        f"connect attempts went {first} -> {wmi.connects} for one read"
-    )
 
 
 def test_a_counter_reset_reseeds_the_average_instead_of_decaying_it():
@@ -1172,46 +737,6 @@ def test_a_pseudo_adapter_appearing_does_not_cost_the_tick():
                             "net_up_bytes_per_sec": 5_000.0}
 
 
-def test_a_repository_that_rejects_a_projection_is_not_reconnected_to_every_tick():
-    # A permanently invalid projection is not a stale handle. Answering both with
-    # "reconnect" made "one connection per process" untrue in exactly the degraded
-    # case: measured at 1.3 connects a tick over three reads, ~2.3 ms each.
-    connection = FakeWmiConnection(processors=[], perf=[],
-                                   absent=("MaxClockSpeed", "ProcessorFrequency",
-                                           "PercentProcessorPerformance"))
-    wmi = FakeWmi(connection)
-    probe = CpuClockProbe(wmi=wmi, nominal_max=lambda: None)
-    for _ in range(3):
-        assert probe.read() == {"cpu_nominal_mhz": None, "cpu_live_mhz": None}
-    settled = wmi.connects
-    for _ in range(20):
-        probe.read()
-    assert wmi.connects == settled, (
-        f"connect attempts went {settled} -> {wmi.connects} over 20 reads of a "
-        "projection the repository rejects outright"
-    )
-
-
-def test_a_repository_that_rejects_a_projection_still_takes_a_fresh_connection():
-    # Marking a query rejected must not stop the probe recovering from a stale
-    # handle later, which is the opposite failure: the clock would go dashed for
-    # the rest of the session after one transient outage.
-    connection = FakeWmiConnection(processors=[SimpleNamespace(MaxClockSpeed=4501)],
-                                   perf=perf_rows(99.0))
-    wmi = FakeWmi(connection)
-    probe = CpuClockProbe(wmi=wmi, nominal_max=lambda: None)
-    assert probe.read()["cpu_live_mhz"] == 4456.0
-
-    connection.fail = True          # the service restarts
-    wmi.down = True
-    assert probe.read()["cpu_live_mhz"] is None
-
-    connection.fail = False         # and returns; nothing was marked rejected
-    wmi.down = False
-    assert probe.read()["cpu_live_mhz"] == 4456.0
-    assert wmi.connects == 3
-
-
 def test_real_net_probe_reads_this_machine():
     # No assertion on the value: an idle machine legitimately transfers nothing.
     # What is asserted is that the plumbing works against the real driver, and
@@ -1328,7 +853,7 @@ def test_every_csv_column_holds_the_value_that_names_it(tmp_path):
     from history import HistoryLog
 
     filled = {
-        "ts": 7.0, "cpu_pct": 11.0, "cpu_live_mhz": 4464.0, "cpu_nominal_mhz": 4501.0,
+        "ts": 7.0, "cpu_pct": 11.0,
         "ram_used_gb": 11.4, "ram_total_gb": 32.0,
         "gpu_pct": 61.0, "gpu_temp_c": 58.0, "vram_used_gb": 6.2, "vram_total_gb": 20.0,
         "net_down_bytes_per_sec": 15000.0, "net_up_bytes_per_sec": 30000.0,
@@ -1350,26 +875,131 @@ def test_every_csv_column_holds_the_value_that_names_it(tmp_path):
         )
 
 
-def test_snapshot_always_defines_the_frequency_and_network_fields():
+def test_snapshot_always_defines_the_network_fields():
     # painter.py reads these straight off the dataclass, so dropping one would
     # raise AttributeError out of paint() rather than degrade to a dash -- and
     # overlay.py swallows that, which costs a frame every two seconds instead
     # of failing loudly. getattr accessors would hide the same deletion.
     names = {f.name for f in fields(Snapshot)}
-    assert {"cpu_live_mhz", "cpu_nominal_mhz", *metrics.NET_KEYS} <= names
+    assert set(metrics.NET_KEYS) <= names
     empty = Snapshot()
-    assert empty.cpu_live_mhz is None
-    assert empty.cpu_nominal_mhz is None
     for key in metrics.NET_KEYS:
         assert getattr(empty, key) is None
 
 
-def test_the_nominal_frequency_no_longer_has_a_second_field():
-    # cpu_max_mhz was psutil's ceiling and cpu_nominal_mhz is the same quantity
-    # from a better source. Keeping both invites a row that prints one as the
-    # live clock, which is the bug being fixed; there is one reference now.
-    assert "cpu_mhz" not in {f.name for f in fields(Snapshot)}
-    assert "cpu_max_mhz" not in {f.name for f in fields(Snapshot)}
+def test_no_cpu_clock_field_has_come_back():
+    # cpu_mhz and cpu_max_mhz were psutil's readings, and cpu_nominal_mhz was
+    # the nominal from WMI. All three are gone, and there is no fourth waiting
+    # under another name: a frequency field that nothing renders is a column
+    # every trace row carries, and a probe that fills it is a per-tick cost for
+    # a number nobody asked for.
+    names = {f.name for f in fields(Snapshot)}
+    for gone in ("cpu_mhz", "cpu_max_mhz", "cpu_live_mhz", "cpu_nominal_mhz"):
+        assert gone not in names, gone
+
+
+def test_the_snapshot_has_no_frequency_field_left_on_it():
+    """The removal reaches the dataclass, not just the renderer.
+
+    Two arguments for it being total. The CSV derives its columns from the
+    declared fields, so a field nobody reads is a column every row of every
+    trace carries forever. And a field the renderer used to read is a field
+    overlay.py's paint guard now protects for nothing -- it would keep a thin
+    snapshot from being cheap to build on the strength of a field that no longer
+    exists.
+    """
+    names = {f.name for f in fields(Snapshot)}
+    assert names == {
+        "ts", "cpu_pct",
+        "ram_used_gb", "ram_total_gb",
+        "gpu_pct", "gpu_temp_c", "vram_used_gb", "vram_total_gb",
+        "net_down_bytes_per_sec", "net_up_bytes_per_sec",
+    }, sorted(names)
+    assert "cpu_live_mhz" not in names
+    assert "cpu_nominal_mhz" not in names
+    assert "CPU_CLOCK_KEYS" not in dir(metrics)
+    assert not hasattr(metrics, "CpuClockProbe"), (
+        "CpuClockProbe is still defined: an uncalled class is the dead weight "
+        "this change exists to delete, along with its WMI query, its reconnect "
+        "and its plausibility band"
+    )
+
+
+def test_wmi_is_left_only_for_the_gpu_fallback():
+    """What `wmi` is still a dependency *for*, stated so it can be checked.
+
+    The clock was the other half of it. It is gone, and what remains is the one
+    place metrics.py opens a COM connection: `_wmi_video_controllers()`, behind
+    GpuProbe's 60-second cache. So `wmi` stays in requirements.txt -- dropping it
+    would break the no-NVIDIA path this project is judged on -- but nothing else
+    in the module may open a WMI connection, and the two per-tick Win32 classes
+    the clock probe queried must not be named anywhere in it.
+
+    Walked as an AST with docstrings skipped rather than grepped, because the
+    module docstring now explains *why* those classes are gone: a plain text
+    search would fail on the explanation and pass on a WQL literal still in a
+    query.
+    """
+    import ast
+
+    gone = ("Win32_Processor", "PercentProcessorPerformance",
+            "ProcessorFrequency", "MaxClockSpeed", "CpuClockProbe")
+    tree = ast.parse(Path(metrics.__file__).read_text(encoding="utf-8"))
+
+    docstrings = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            body = getattr(node, "body", None)
+            if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+                docstrings.add(id(body[0].value))
+
+    named, connects = [], 0
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            connects += sum(1 for alias in node.names if alias.name == "wmi")
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if id(node) in docstrings:
+                continue
+            for name in gone:
+                if name in node.value:
+                    named.append(f"{node.lineno}: {node.value!r}")
+        elif isinstance(node, ast.Name) and node.id in gone:
+            named.append(f"{node.lineno}: {node.id}")
+        elif isinstance(node, ast.Attribute) and node.attr in gone:
+            named.append(f"{node.lineno}: .{node.attr}")
+
+    assert not named, (
+        f"metrics.py still reaches the removed clock at {named}: the fields, the "
+        "probe and its WMI queries are meant to be gone together"
+    )
+    assert connects == 1, (
+        f"metrics.py imports wmi from {connects} places; every entry point is a "
+        "COM connection, and a COM connection belongs to the thread that opened it"
+    )
+    assert "Win32_VideoController" in Path(metrics.__file__).read_text(encoding="utf-8"), (
+        "the remaining WMI caller is the GPU fallback; if it is gone too, wmi "
+        "should come out of requirements.txt rather than sit here unused"
+    )
+
+
+def test_the_sample_loop_no_longer_reads_a_clock_source():
+    """SystemProbe takes four sources now, and its signature says so.
+
+    The `cpu_clock` argument was injectable purely so the clock probe could be
+    replaced by a fake. Left in place with nothing behind it, it would be a
+    keyword every caller passes and no module reads -- so it goes with the probe,
+    and the fault-site test below has one fewer site to know about.
+    """
+    import inspect
+
+    parameters = list(inspect.signature(SystemProbe).parameters)
+    assert parameters == ["cpu_pct", "ram", "gpu", "net"], parameters
+    probe = SystemProbe(
+        cpu_pct=lambda: 12.5,
+        ram=lambda: SimpleNamespace(used=11.4 * GB, total=32 * GB),
+        gpu=FakeGpu({}), net=FakeGpu({}),
+    )
+    assert probe.sample().cpu_pct == 12.5
 
 
 def test_the_network_columns_appear_in_the_declared_direction_order():
@@ -1395,11 +1025,12 @@ TEN_MINUTES_S = 300 * TICK_S
 # The spec's ceiling on app_debug.log, in bytes, for ten minutes of running.
 SPEC_CEILING_BYTES = 5 * 1024
 
-# The seven sites that report a fault. Five are SystemProbe's, and the other two
-# are a source away: NetProbe catches its own counter failure, and the CPU clock
-# catches its own psutil fallback.
-SOURCES = ("cpu_percent", "cpu clock read", "virtual_memory", "gpu read", "net read")
-FAULT_SITES = SOURCES + ("net_io_counters", "nominal CPU frequency")
+# The five sites in metrics.py that report a fault: four are SystemProbe's, and
+# NetProbe catches its own counter failure. (main.py's topmost re-assertion is
+# throttled through the same pair and is checked in tests/test_main.py, which is
+# why it is not in this list -- the test that compares them reads metrics.py.)
+SOURCES = ("cpu_percent", "virtual_memory", "gpu read", "net read")
+FAULT_SITES = SOURCES + ("net_io_counters",)
 
 
 @pytest.fixture
@@ -1424,8 +1055,8 @@ def at_real_cadence(probe, clock, seconds, read=None):
 
     TICK_MS apart, which is what the collector does: sampling back to back would
     put a whole ten minutes inside one interval and flatter every count. `read`
-    names the entry point for probes that are not a SystemProbe -- NetProbe and
-    CpuClockProbe answer to read(), SystemProbe to sample().
+    names the entry point for a probe that is not a SystemProbe -- NetProbe
+    answers to read(), SystemProbe to sample().
     """
     step = read or probe.sample
     for _ in range(int(seconds / TICK_S)):
@@ -1474,16 +1105,15 @@ def breakable(name, faults, answer):
 
 
 def switchable_probe(faults):
-    """A SystemProbe whose five sources all fail and recover on command.
+    """A SystemProbe whose four sources all fail and recover on command.
 
-    One probe rather than five, because the rule is about a source's own
+    One probe rather than four, because the rule is about a source's own
     history: what matters is that the same source faults, heals and faults
     again, and that one source's history does not reopen another's silence.
     """
     return SystemProbe(
         cpu_pct=breakable("cpu_percent", faults, 1.0),
         ram=breakable("virtual_memory", faults, readable_ram()),
-        cpu_clock=Switchable("cpu clock read", faults, FakeCpuClock({})),
         gpu=Switchable("gpu read", faults, FakeGpu({})),
         net=Switchable("net read", faults, FakeNet()),
     )
@@ -1491,26 +1121,22 @@ def switchable_probe(faults):
 
 # Each source is driven on its own, because a throttle that counted all sources
 # together would pass every one of these while a per-source throttle was missing
-# from four of the five call sites.
+# from three of the four call sites.
 FAILING_SOURCES = {
     "cpu_percent": lambda: SystemProbe(
-        cpu_pct=boom, ram=readable_ram, cpu_clock=FakeCpuClock({}),
+        cpu_pct=boom, ram=readable_ram,
         gpu=FakeGpu({}), net=FakeNet(),
     ),
     "virtual_memory": lambda: SystemProbe(
-        cpu_pct=lambda: 1.0, ram=boom, cpu_clock=FakeCpuClock({}),
-        gpu=FakeGpu({}), net=FakeNet(),
-    ),
-    "cpu clock read": lambda: SystemProbe(
-        cpu_pct=lambda: 1.0, ram=readable_ram, cpu_clock=BrokenCpuClock(),
+        cpu_pct=lambda: 1.0, ram=boom,
         gpu=FakeGpu({}), net=FakeNet(),
     ),
     "gpu read": lambda: SystemProbe(
-        cpu_pct=lambda: 1.0, ram=readable_ram, cpu_clock=FakeCpuClock({}),
+        cpu_pct=lambda: 1.0, ram=readable_ram,
         gpu=BrokenGpu(), net=FakeNet(),
     ),
     "net read": lambda: SystemProbe(
-        cpu_pct=lambda: 1.0, ram=readable_ram, cpu_clock=FakeCpuClock({}),
+        cpu_pct=lambda: 1.0, ram=readable_ram,
         gpu=FakeGpu({}), net=BrokenNet(),
     ),
 }
@@ -1534,9 +1160,10 @@ def test_a_persistently_failing_source_writes_one_record_over_ten_minutes(
 
     A source broken since the panel came up has nothing new to say after its
     first record, and the per-interval summary it used to be given is what put
-    five broken sources permanently over the spec's 5 KB ceiling: measured at the
-    real cadence over these ten minutes, 1,080 B for one source and 5,250 B for
-    five, with every one of those bytes saying what the first record said.
+    every broken source permanently over the spec's 5 KB ceiling: measured at the
+    real cadence over these ten minutes with five sources broken, 1,080 B for one
+    and 5,250 B for five, with every one of those bytes saying what the first
+    record said.
 
     The clock moves with the samples, because the property is a rate and a run
     that leaves every tick at the same instant measures nothing about one.
@@ -1626,7 +1253,7 @@ def test_a_changing_exception_type_is_announced_again(caplog, fault_log):
         raise state["exc"]("sensor bus is on fire")
 
     probe = SystemProbe(
-        cpu_pct=cpu_pct, ram=readable_ram, cpu_clock=FakeCpuClock({}),
+        cpu_pct=cpu_pct, ram=readable_ram,
         gpu=FakeGpu({}), net=FakeNet(),
     )
     with caplog.at_level(logging.WARNING, logger="widget.metrics"):
@@ -1660,7 +1287,7 @@ def test_a_changing_exception_type_gets_a_traceback(caplog, fault_log):
         raise state["exc"]("sensor bus is on fire")
 
     probe = SystemProbe(
-        cpu_pct=cpu_pct, ram=readable_ram, cpu_clock=FakeCpuClock({}),
+        cpu_pct=cpu_pct, ram=readable_ram,
         gpu=FakeGpu({}), net=FakeNet(),
     )
     with caplog.at_level(logging.WARNING, logger="widget.metrics"):
@@ -1681,7 +1308,7 @@ def test_each_source_keeps_its_own_history(caplog, fault_log):
     """Per source, including per source's recovery.
 
     A shared floor, or a shared healthy streak, lets one source's recovery
-    reopen another's silence -- and five broken sources have to stay five floors.
+    reopen another's silence -- and every broken source has to keep its own.
     """
     faults = {name: True for name in SOURCES}
     probe = switchable_probe(faults)
@@ -1701,12 +1328,10 @@ def test_each_source_keeps_its_own_history(caplog, fault_log):
 
 
 def test_the_net_counter_fault_is_announced_again_after_a_recovery(caplog, fault_log):
-    """The seventh call site, which is one source away from SystemProbe's five.
+    """The fifth call site, one source away from SystemProbe's four.
 
     NetProbe catches its own counter failure and returns two dashes, so this is
-    the record a machine with a dead psutil net counter actually produces. It
-    has to follow the same rule, and unlike the CPU clock's nominal source --
-    which caches the answer and so can only ever fail once -- a net counter
+    the record a machine with a dead psutil net counter actually produces, and it
     goes on failing and recovering for as long as the machine is up.
     """
     failing = {"on": True}
@@ -1746,8 +1371,9 @@ def test_every_fault_site_also_reports_health():
     cleared = set(re.findall(r'clear_fault\(\s*"([^"]+)"', text))
 
     assert logged == set(FAULT_SITES), (
-        f"the fault sites moved: {sorted(logged)} against the seven this suite "
-        f"knows about, {sorted(set(FAULT_SITES) - logged)} missing"
+        f"the fault sites moved: {sorted(logged)} against the "
+        f"{len(FAULT_SITES)} this suite knows about, "
+        f"{sorted(set(FAULT_SITES) - logged)} missing"
     )
     assert cleared == logged, (
         "reported healthy nowhere: "
@@ -1757,11 +1383,11 @@ def test_every_fault_site_also_reports_health():
 
 
 def test_one_source_going_bad_does_not_silence_another(caplog, fault_log):
-    """Per source, not per logger: five broken sources are five floors."""
+    """Per source, not per logger: every broken source is its own floor."""
     with caplog.at_level(logging.WARNING, logger="widget.metrics"):
         for _ in range(3):
             SystemProbe(
-                cpu_pct=boom, ram=boom, cpu_clock=BrokenCpuClock(),
+                cpu_pct=boom, ram=boom,
                 gpu=BrokenGpu(), net=BrokenNet(),
             ).sample()
 
@@ -1827,7 +1453,7 @@ def test_a_differing_fault_does_not_restart_the_interval(caplog, fault_log):
         raise RuntimeError(f"attempt {alternating['n']}")
 
     probe = SystemProbe(
-        cpu_pct=flip, ram=readable_ram, cpu_clock=FakeCpuClock({}),
+        cpu_pct=flip, ram=readable_ram,
         gpu=FakeGpu({}), net=FakeNet(),
     )
     with caplog.at_level(logging.WARNING, logger="widget.metrics"):
@@ -1857,21 +1483,6 @@ def test_the_network_counter_failure_is_rate_limited_too(caplog, fault_log):
     )
 
 
-def test_the_psutil_nominal_failure_is_rate_limited_too(caplog, fault_log):
-    """The clock's own fallback, which fires on every tick until it works."""
-    probe = CpuClockProbe(
-        wmi=FakeWmi(connection=FakeWmiConnection(processors=(), perf=())),
-        nominal_max=boom,
-    )
-    with caplog.at_level(logging.WARNING, logger="widget.metrics"):
-        at_real_cadence(probe, fault_log, TEN_MINUTES_S, read=probe.read)
-
-    assert len(records_for(caplog, "nominal CPU frequency")) == 1, (
-        f"{len(records_for(caplog, 'nominal CPU frequency'))} records in "
-        f"{TEN_MINUTES_S:.0f}s of continuous failure"
-    )
-
-
 def test_the_interval_cannot_be_looser_than_the_spec_allows():
     # The spec's rule is "no more than one record per source per minute". The
     # gate cannot be looser than that by construction -- two records for a
@@ -1885,9 +1496,11 @@ def test_the_ceiling_holds_even_when_every_source_flaps(fault_log, tmp_path):
     """The case that decides LOG_INTERVAL, measured in bytes.
 
     The spec caps app_debug.log at 5 KB per ten minutes. One record is about
-    95 bytes, so the ceiling allows roughly 53 of them per ten minutes, and
-    there are seven fault sites: five sources in SystemProbe, plus NetProbe's
-    own counter and the CPU clock's psutil fallback.
+    95 bytes, so the ceiling allows roughly 53 of them per ten minutes, and there
+    were seven fault sites when the number was set: five sources in
+    SystemProbe, plus NetProbe's own counter and the CPU clock's psutil fallback.
+    The clock is gone, so there are five now; the interval was chosen for the
+    worse case and the ceiling only got easier.
 
     With the gate at the spec's minute, a flapping source still earns a record
     every minute -- the measured 5,250 B for five sources -- so the breach was
@@ -1916,24 +1529,25 @@ def test_the_ceiling_holds_even_when_every_source_flaps(fault_log, tmp_path):
 
     written = path.stat().st_size
     assert written <= SPEC_CEILING_BYTES, (
-        f"{written} bytes in {TEN_MINUTES_S:.0f}s with five sources flapping "
+        f"{written} bytes in {TEN_MINUTES_S:.0f}s with every source flapping "
         f"just inside the interval, against the spec's {SPEC_CEILING_BYTES}: "
         f"LOG_INTERVAL is {metrics.LOG_INTERVAL}s, and the ceiling needs it longer"
     )
 
 
 def test_a_continuously_failing_source_costs_about_one_record(caplog, fault_log, tmp_path):
-    """The number the steady state is made of, for one source and for five.
+    """The number the steady state is made of, for one source and for all four.
 
-    This is the case the review measured as permanently over the ceiling: five
-    sources failing without interruption, which is what a machine with nothing
+    This is the case the review measured as permanently over the ceiling: every
+    source failing without interruption, which is what a machine with nothing
     measurable at all looks like. It went from 1,080 B to one record per source,
     and the trace is what makes the difference -- before, every minute carried a
     fresh summary of a fault nobody had read.
     """
+    every = len(SOURCES)
     sizes = {}
     counts = {}
-    for broken in (1, 5):
+    for broken in (1, every):
         faults = {name: (index < broken) for index, name in enumerate(SOURCES)}
         path = tmp_path / f"app_debug_{broken}.log"
         handler = app_main.build_log_handler(path)
@@ -1952,13 +1566,13 @@ def test_a_continuously_failing_source_costs_about_one_record(caplog, fault_log,
             f"{size} bytes for {broken} continuously failing source(s) over "
             f"{TEN_MINUTES_S:.0f}s, against the spec's {SPEC_CEILING_BYTES}"
         )
-    # Independence measured in records, not bytes: five broken sources write
-    # five, so the floors are five. A shared floor would show up here as two or
-    # three for five sources.
-    assert (counts[1], counts[5]) == (1, 5), (
-        f"{counts[1]} record(s) for one broken source and {counts[5]} for five: "
-        "a record is supposed to be owed per source, so five broken sources "
-        "are five records and never fewer"
+    # Independence measured in records, not bytes: every broken source writes one,
+    # so the floors are as many as there are sources. A shared floor would show up
+    # here as two or three for all of them.
+    assert (counts[1], counts[every]) == (1, every), (
+        f"{counts[1]} record(s) for one broken source and {counts[every]} for "
+        f"{every}: a record is supposed to be owed per source, so {every} broken "
+        "sources are that many records and never fewer"
     )
 
 

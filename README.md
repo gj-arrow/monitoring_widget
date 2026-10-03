@@ -17,7 +17,7 @@ in a frameless panel that sits in a corner of the screen.
 
 ### Features
 
-- **CPU** — usage percentage, with the derived clock beside the nominal it came from
+- **CPU** — usage percentage
 - **RAM** — used and total
 - **GPU** — utilization, temperature, and VRAM
 - **Network** — download and upload throughput
@@ -134,7 +134,6 @@ something to say; there is no colour switch to flip for its own sake.
 | GPU | < 80% | ≥ 80% | ≥ 95% |
 | VRAM | < 80% | ≥ 80% | ≥ 95% |
 | GPU temperature | < 70 °C | ≥ 70 °C | ≥ 80 °C |
-| CPU frequency | — no thresholds, never coloured by load — | | |
 
 Two states, not one. A row goes amber at the warning threshold and red at the critical
 one, so "busy" and "in trouble" are not the same colour.
@@ -156,6 +155,31 @@ network throughput, download then upload, as `IN 7.7 KB/s  OUT 7.0 KB/s`.
 There is no `SYSTEM` label and no sample-age figure. The dot already states the worst
 case, and a second number competing with it in the same 23-pixel strip earned its space
 by implying a freshness the panel does not otherwise track.
+
+### Why the CPU row shows no clock
+
+The CPU row carries its load percentage and nothing else. It used to carry a
+derived clock beside the nominal it came from, and the clock is gone because it
+did not say anything.
+
+It was built from the OS counter `PercentProcessorPerformance`, which is the ratio
+of the actual clock to the nominal one. Measured on the machine that decided it —
+a Ryzen 5 5600X, nominal 4501 MHz — that counter reads **99.1 % at 9 % load and
+99.2 % at 100 %**. The core does not slow down in proportion to the work it is
+given; the part drops *voltage* instead. So the whole load sweep moves the figure
+by about 1 %, and a row's auxiliary slot was being spent on a number that could
+not distinguish an idle machine from a busy one.
+
+It was also being read as something it was not. The form on screen was
+`4.48 / 4.50 GHz` with no unit on the second figure, which reads as a percentage
+of nominal — and did, twice.
+
+Reading it was not free either: the counter came from a WMI query that measured
+**~530 ms of wall time and ~140 ms of process CPU per sample, about 7 % of a
+core**, every two seconds. The query is gone along with the figure.
+
+Nothing took the space. The CPU row reads `CPU 34 %`, and the value sits on the
+same right edge as the `/ 32.0 GB` and `58 °C` of the rows below it.
 
 ### Why there is no acrylic backdrop
 
@@ -202,8 +226,6 @@ build started from a shortcut has a working directory nobody chose.
 ### Known Limitations
 
 - GPU monitoring requires an NVIDIA graphics card
-- The CPU clock is derived from a performance-counter ratio; on some machines that
-  counter is unavailable and the frequency shows `--`
 - A game in **exclusive** fullscreen covers the panel, because the game owns the display
   output; borderless fullscreen does not. See [Above fullscreen games](#above-fullscreen-games)
 
@@ -218,8 +240,7 @@ build started from a shortcut has a working directory nobody chose.
 
 ### Особенности
 
-- **CPU** — использование в процентах, а также реальная частота рядом с номинальной,
-  из которой она выведена
+- **CPU** — использование в процентах
 - **RAM** — занято и всего
 - **GPU** — утилизация, температура и объём VRAM
 - **Сеть** — скорость приёма и передачи
@@ -335,7 +356,6 @@ build started from a shortcut has a working directory nobody chose.
 | GPU | < 80% | ≥ 80% | ≥ 95% |
 | VRAM | < 80% | ≥ 80% | ≥ 95% |
 | Температура GPU | < 70 °C | ≥ 70 °C | ≥ 80 °C |
-| Частота CPU | — без порогов, никогда не окрашивается по нагрузке — | | |
 
 Состояний два, а не одно. Строка становится янтарной на пороге предупреждения и
 красной на критическом, поэтому «занято» и «проблема» — это разные цвета.
@@ -359,6 +379,31 @@ build started from a shortcut has a working directory nobody chose.
 случае, а вторая цифра конкурировала с ним в той же полосе высотой 23 пикселя и
 оправдывала своё место, создавая впечатление свежести, которую панель больше нигде не
 отслеживает.
+
+### Почему в строке CPU нет частоты
+
+В строке CPU есть только загрузка в процентах. Раньше рядом с ней была
+выведенная частота рядом с номинальной, и убрана она потому, что ничего
+не говорила.
+
+Она считалась из системного счётчика `PercentProcessorPerformance` — это отношение
+фактической частоты к номинальной. Измерено на машине, где это решили (Ryzen 5
+5600X, номинальная 4501 МГц): счётчик читает **99,1 % при загрузке 9 % и 99,2 %
+при загрузке 100 %**. Ядро не замедляется пропорционально выданной работе; часть
+снижает *напряжение*. За весь диапазон нагрузки цифра меняется примерно на 1 %,
+то есть вспомогательное место в строке занимала величина, не отличающая
+холостое состояние от загруженного.
+
+Её к тому же читали не тем, чем она была. На экране это выглядело как
+`4.48 / 4.50 GHz` без единицы у второй цифры — читается как процент от
+номинала, и читалось именно так дважды.
+
+И чтение не было бесплатным: счётчик брался запросом WMI, который на этой машине
+занимал **~530 мс по времени и ~140 мс процессорного времени на замер, около
+7 % ядра**, каждые две секунды. Запрос ушёл вместе с цифрой.
+
+Место не занял ничего: строка читается как `CPU 34 %`, и значение стоит у того
+же правого края, что `/ 32.0 GB` и `58 °C` у строк ниже.
 
 ### Почему нет акриловой подложки
 
@@ -404,8 +449,6 @@ acrylic — поверх этого наложить нельзя, и это п�
 ### Ограничения
 
 - Мониторинг GPU требует видеокарты NVIDIA
-- Частота CPU выводится из отношения счётчика производительности; на некоторых машинах
-  этот счётчик недоступен и частота показывает `--`
 - Игра в **эксклюзивном** полноэкранном режиме закрывает панель, потому что игра владеет
   выводом дисплея; пограничный полноэкранный режим — нет.
   См. [Поверх игр в полноэкранном режиме](#поверх-игр-в-полноэкранном-режиме)
@@ -440,7 +483,8 @@ Runtime / Время выполнения — `requirements.txt`:
 
 - `psutil` — CPU, RAM, network counters / счётчики CPU, RAM, сети
 - `pynvml` — NVIDIA GPU monitoring / мониторинг GPU NVIDIA
-- `wmi` — CPU clock, perf counters, GPU fallback / частота CPU, счётчики, запасной путь для GPU
+- `wmi` — GPU fallback for machines with no usable NVML handle / запасной путь для GPU,
+  когда нет рабочей ручки NVML
 - `PyQt6` — GUI framework / графический интерфейс
 
 Tests / Тесты — `requirements-dev.txt` (`-r requirements.txt` plus pinned pytest /

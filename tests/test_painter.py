@@ -176,7 +176,7 @@ def assert_golden(name, snapshot, values_by_key=None):
 
 
 CALM = Snapshot(
-    cpu_pct=34.0, cpu_live_mhz=4460.0, cpu_nominal_mhz=4501.0,
+    cpu_pct=34.0,
     ram_used_gb=11.4, ram_total_gb=32.0,
     gpu_pct=61.0, gpu_temp_c=58.0,
     vram_used_gb=6.2, vram_total_gb=20.0,
@@ -188,7 +188,7 @@ CALM = Snapshot(
 # directions. It is in the hot panel on purpose, so the golden is also the
 # proof that the widest string fits.
 HOT = Snapshot(
-    cpu_pct=97.0, cpu_live_mhz=4350.0, cpu_nominal_mhz=4501.0,
+    cpu_pct=97.0,
     ram_used_gb=29.4, ram_total_gb=32.0,
     gpu_pct=97.0, gpu_temp_c=84.0,
     vram_used_gb=18.1, vram_total_gb=20.0,
@@ -209,9 +209,8 @@ RAMPS = {
 def without_network(snapshot):
     return Snapshot(
         **{name: getattr(snapshot, name)
-           for name in ("cpu_pct", "cpu_live_mhz", "cpu_nominal_mhz",
-                        "ram_used_gb", "ram_total_gb", "gpu_pct", "gpu_temp_c",
-                        "vram_used_gb", "vram_total_gb", "ts")}
+           for name in ("cpu_pct", "ram_used_gb", "ram_total_gb", "gpu_pct",
+                        "gpu_temp_c", "vram_used_gb", "vram_total_gb", "ts")}
     )
 
 
@@ -610,14 +609,14 @@ def test_a_snapshot_without_a_gpu_temperature_renders_a_dash():
     the auxiliary returned an empty string.
     """
     no_temp = SimpleNamespace(
-        cpu_pct=34.0, cpu_live_mhz=4460.0, cpu_nominal_mhz=4501.0,
+        cpu_pct=34.0,
         ram_used_gb=11.4, ram_total_gb=32.0, gpu_pct=61.0,
         vram_used_gb=6.2, vram_total_gb=20.0,
         net_down_bytes_per_sec=7300.0, net_up_bytes_per_sec=3700.0, ts=1000.0,
     )
     image = render(no_temp, RAMPS)
     explicit_none = Snapshot(
-        cpu_pct=34.0, cpu_live_mhz=4460.0, cpu_nominal_mhz=4501.0,
+        cpu_pct=34.0,
         ram_used_gb=11.4, ram_total_gb=32.0, gpu_pct=61.0, gpu_temp_c=None,
         vram_used_gb=6.2, vram_total_gb=20.0,
         net_down_bytes_per_sec=7300.0, net_up_bytes_per_sec=3700.0, ts=1000.0,
@@ -631,75 +630,108 @@ def test_a_snapshot_without_a_gpu_temperature_renders_a_dash():
     )
 
 
-# --- the derived CPU clock -------------------------------------------------
+# --- the CPU row ------------------------------------------------------------
 
 
-def frequency(live, nominal):
-    return SimpleNamespace(cpu_live_mhz=live, cpu_nominal_mhz=nominal)
+def cpu_row_texts(monkeypatch, snapshot, scale=theme.DEFAULT_SCALE):
+    """Every string paint() draws inside the CPU row's own text band.
 
-
-@pytest.mark.parametrize(
-    ("live", "nominal", "expected"),
-    [
-        # Two decimals, not one: the derived figure only moves in the
-        # hundredths of a GHz (99.0% idle, 99.5% loaded on this machine), so
-        # 4460 and 4501 both render as "4.5" at one place and the reading
-        # looks frozen even though it is alive.
-        (4460.0, 4501.0, "4.46 / 4.50 GHz"),
-        (4464.0, 4501.0, "4.46 / 4.50 GHz"),
-        (4350.0, 4501.0, "4.35 / 4.50 GHz"),
-        # A nominal on its own is a reference, not a clock, so it cannot stand
-        # in for the derived one.
-        (None, 4501.0, "--"),
-        (None, None, "--"),
-        # With no reference to compare against there is still a live clock.
-        (4460.0, None, "4.46 GHz"),
-    ],
-)
-def test_the_frequency_formatter_shows_the_derived_clock_to_two_places(live, nominal, expected):
-    assert painter._format_frequency(frequency(live, nominal)) == expected
-
-
-def test_an_unmeasured_live_clock_renders_a_dash_and_never_the_nominal():
-    """The bug this task exists for, asserted on the pixels.
-
-    psutil's `current` on Windows is the nominal clock: 4501.0 on three
-    consecutive calls, at idle, under a 12-thread load and after it. A row that
-    printed the nominal in the live position therefore showed a number that
-    looked measured and was in fact a constant. Two things are checked, and both
-    matter: a snapshot carrying only a nominal must render exactly like one
-    carrying no clock at all (so the nominal is not being borrowed), and it must
-    render *differently* from a snapshot with a derived clock, which is what
-    pins the dash itself rather than an empty string.
+    Position matters, so this spies with the rect as well as the text: a count of
+    the strings in the panel would pass with a clock still in the CPU row and
+    something else missing from RAM, and the row's band is the only place the
+    question "what does the CPU row say" has an answer.
     """
-    nominal_only = Snapshot(**{
-        **{name: getattr(CALM, name) for name in ("cpu_pct", "ram_used_gb", "ram_total_gb",
-                                                  "gpu_pct", "gpu_temp_c", "vram_used_gb",
-                                                  "vram_total_gb", "ts")},
-        "cpu_live_mhz": None, "cpu_nominal_mhz": 4501.0,
-    })
-    no_clock_at_all = Snapshot(**{
-        **{name: getattr(CALM, name) for name in ("cpu_pct", "ram_used_gb", "ram_total_gb",
-                                                  "gpu_pct", "gpu_temp_c", "vram_used_gb",
-                                                  "vram_total_gb", "ts")},
-    })
-    assert max_channel_delta(render(nominal_only, RAMPS),
-                             render(no_clock_at_all, RAMPS)) == 0, (
-        "a snapshot with a nominal clock but no derived one rendered "
-        "differently from one with no clock at all: the nominal is being "
-        "printed as though it were live"
-    )
-    assert max_channel_delta(render(nominal_only, RAMPS), render(CALM, RAMPS)) > 60, (
-        "an unmeasured live clock renders the same as a measured one: the CPU "
-        "auxiliary is not showing a dash"
+    seen = []
+    real = painter._draw_text
+
+    def spy(canvas_painter, text, rect, font, color, **kwargs):
+        seen.append((rect, text))
+        return real(canvas_painter, text, rect, font, color, **kwargs)
+
+    monkeypatch.setattr(painter, "_draw_text", spy)
+    render(snapshot, RAMPS, scale=scale)
+    return seen
+
+
+def test_the_cpu_row_is_the_load_percentage_and_nothing_else(monkeypatch):
+    """The user's decision, asserted on what reaches the CPU row's own band.
+
+    The clock came out because it does not follow load: PercentProcessor-
+    Performance reads 99 % of nominal at 9 % load and 99.2 % at 100 %, because
+    the part drops voltage rather than frequency in proportion to the work it
+    has been given. A row's auxiliary slot spent on a figure that moves about 1 %
+    across a full load sweep, written `4.48 / 4.50` so that it read as a
+    percentage of nominal, was a number saying almost nothing -- and it was
+    misread as a percentage twice, which is what settled it.
+
+    So the value stays and the CPU row's auxiliary slot is empty. Nothing
+    replaces it: this asserts the absence, not a substitute reading.
+    """
+    layout = theme.Layout(theme.DEFAULT_SCALE)
+    cpu_rect = next(rect for spec, rect in layout.metric_rects() if spec.key == "cpu_pct")
+    band = layout.row_text_rect(cpu_rect)
+    in_cpu = [text for rect, text in cpu_row_texts(monkeypatch, CALM) if rect == band]
+
+    assert in_cpu == ["CPU", "34%"], (
+        f"the CPU row draws {in_cpu!r}: the load percentage and its label, and "
+        "nothing else"
     )
 
 
-def test_the_cpu_row_shows_the_derived_clock_beside_the_percentage(monkeypatch):
-    """Both halves have to be on screen, or the derivation is invisible."""
-    texts = [text for text, _ in drawn_texts(monkeypatch, CALM, RAMPS)]
-    assert "34%" in texts
-    assert "4.46 / 4.50 GHz" in texts
+@pytest.mark.parametrize("scale", theme.SCALE_STEPS)
+def test_a_cpu_row_with_no_load_draws_one_dash_and_no_second_string(monkeypatch, scale):
+    """At every scale, because the value is placed by the layout the panel is at.
+
+    A renderer that reached for a second string would do it through the same
+    right-edge arithmetic, and the smallest scale is where there is least room
+    for it -- so this is the case a scale change would break first.
+    """
+    layout = theme.Layout(scale)
+    cpu_rect = next(rect for spec, rect in layout.metric_rects() if spec.key == "cpu_pct")
+    band = layout.row_text_rect(cpu_rect)
+    unmeasured = Snapshot(ts=1000.0)
+    in_cpu = [text for rect, text in cpu_row_texts(monkeypatch, unmeasured, scale)
+              if rect == band]
+
+    assert in_cpu == ["CPU", "--"], (
+        f"the CPU row draws {in_cpu!r} at scale {scale}: an unmeasured row is a "
+        "label and a dash, not a label, a dash and a guess"
+    )
+
+
+def test_no_application_module_reaches_a_cpu_frequency_field():
+    """The removal is total, in every module and not only in the renderer.
+
+    A field left on the Snapshot with nothing reading it is a column the CSV
+    carries on every row forever; a probe left building it is the entire cost
+    this change exists to delete -- the WMI query, its plausibility band, its
+    reconnect and the 7 % of a core it spent per tick. Walking the AST rather
+    than grepping is what makes the answer exact: an attribute access and a
+    string literal are both found, a comment and a docstring are not, and a
+    computed getattr is not missed for being computed.
+    """
+    import ast
+    from pathlib import Path
+
+    removed = {"cpu_live_mhz", "cpu_nominal_mhz"}
+    root = Path(__file__).resolve().parent.parent
+    modules = [p for p in sorted(root.glob("*.py")) if not p.name.startswith("test_")]
+    assert modules, f"no application modules found under {root}"
+
+    survivors = []
+    for path in modules:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and node.attr in removed:
+                survivors.append(f"{path.name}:{node.lineno} {node.attr}")
+            elif isinstance(node, ast.Name) and node.id in removed:
+                survivors.append(f"{path.name}:{node.lineno} {node.id}")
+            elif isinstance(node, ast.Constant) and node.value in removed:
+                survivors.append(f"{path.name}:{node.lineno} {node.value!r}")
+    assert not survivors, (
+        f"the removed clock is still reached from {survivors}; the fields, the "
+        "probe and the query are meant to be gone together"
+    )
 
 
 # --- the header ------------------------------------------------------------
@@ -882,9 +914,9 @@ def test_the_longest_header_string_stays_clear_of_the_dot_and_inside_the_header(
     """
     layout = theme.Layout(scale)
     widest = Snapshot(**{
-        **{name: getattr(CALM, name) for name in ("cpu_pct", "cpu_live_mhz",
-             "cpu_nominal_mhz", "ram_used_gb", "ram_total_gb", "gpu_pct",
-             "gpu_temp_c", "vram_used_gb", "vram_total_gb", "ts")},
+        **{name: getattr(CALM, name) for name in ("cpu_pct", "ram_used_gb",
+             "ram_total_gb", "gpu_pct", "gpu_temp_c", "vram_used_gb",
+             "vram_total_gb", "ts")},
         "net_down_bytes_per_sec": rate,
         "net_up_bytes_per_sec": rate,
     })

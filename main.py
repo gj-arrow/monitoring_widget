@@ -161,11 +161,13 @@ class Collector(QThread):
     appending a CSV row on every tick.
 
     `make_probe` is a factory, and it is called here rather than by the caller,
-    because a probe is not just an object: SystemProbe opens a COM connection
-    for the CPU clock, and a COM connection belongs to the thread that opened
-    it. Building the probe on the GUI thread and querying it here made the first
-    WMI query of every launch fail with RPC_E_WRONG_THREAD (0x8001010E), which
-    only _reconnect() hid -- see the docstring on run().
+    because a probe is not just an object: `import wmi` at module scope runs
+    GetObject("winmgmts:") and opens a connection from whichever thread asked
+    for it, and metrics._wmi_video_controllers() opens a second one on the
+    thread that calls it. A COM connection belongs to the thread that opened it,
+    so the only arrangement in which the GPU fallback works is one where the
+    probe is built and queried by the same thread -- this one. See the
+    docstring on run() for what a cross-apartment call actually costs.
     """
 
     sampled = pyqtSignal(object)
@@ -233,13 +235,13 @@ class Collector(QThread):
             # worse than the cross-apartment fault the factory above fixed,
             # which at least logged.
             #
-            # It is here rather than in main()'s try/except because neither
-            # SystemProbe.__init__ nor CpuClockProbe guards what it builds --
-            # `import psutil` and a COM connection are both unguarded -- and the
-            # factory that moved the construction onto this thread moved it out
-            # of main()'s reach. What is left when this catches is a panel whose
-            # status dot goes neutral, which is the signal for a collector that
-            # stopped, and one record here saying why.
+            # It is here rather than in main()'s try/except because
+            # SystemProbe.__init__ does not guard what it builds -- `import
+            # psutil` is unguarded -- and the factory that moved the
+            # construction onto this thread moved it out of main()'s reach.
+            # What is left when this catches is a panel whose status dot goes
+            # neutral, which is the signal for a collector that stopped, and one
+            # record here saying why.
             logger.exception("sampler thread stopped on an unhandled fault")
         finally:
             # Released before CoUninitialize, on the thread that opened it. A
@@ -445,14 +447,20 @@ class MonitorApp:
     def _make_collector(self) -> Collector:
         """The sampler, with the CSV trace hanging off its worker side.
 
-        `SystemProbe` is passed as a class, not called here: the probe opens a
-        WMI COM connection while it is being built, and that connection belongs
-        to whichever thread did the building. Collector builds it on the worker
-        thread that will query it. Building it on this one made the first query
-        of every launch fail -- measured, every launch, x_wmi
-        RPC_E_WRONG_THREAD -- and the app only survived because
-        CpuClockProbe._reconnect() silently rebuilt the handle on the worker a
-        few microseconds later.
+        `SystemProbe` is passed as a class, not called here, and the reason is
+        the thread rather than the object: `import wmi` is not a passive import
+        -- wmi.py runs GetObject("winmgmts:") at module scope to find its
+        namespace, so the first import opens a COM connection from whichever
+        thread asked for it -- and metrics._wmi_video_controllers() opens
+        another on the thread that calls it, which is this one. COM refuses a
+        query issued from a thread the connection was not created on: WMI's
+        object is an apartment-threaded proxy, and using it from elsewhere fails
+        with RPC_E_WRONG_THREAD (0x8001010E). Measured, every launch: with the
+        probe built on the GUI thread, tick 0 raised every single time.
+
+        So the factory is not ceremony. Building the probe here and querying it
+        on the worker would put the GPU fallback -- the only WMI caller left --
+        back into exactly that fault.
 
         Initialising COM at the top of Collector.run() was the other candidate
         and it does not work, which is worth recording so nobody tries it again:

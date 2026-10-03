@@ -89,10 +89,15 @@ is a value this application produces. Nothing here can put the scale anywhere bu
 and a `settings.json` naming a scale the panel does not offer is discarded with the same
 warning as any other unusable field.
 
-The panel keeps its top-left corner when the size changes. A panel snapped to the top-right
-therefore ends up further from the right edge than it was — it does not move on its own, and
-**Reset position** or a double-click re-snaps it. The one exception is a panel dragged hard
-against a screen edge, which is pulled back on so that it cannot end up partly off-screen.
+The panel keeps its top-left corner when the size changes, so **making it smaller never
+moves it**: a panel snapped to the top-right keeps its top-left and simply gains margin on
+the right (10 px → 54 px at 85% → 84 px at 75%). **Reset position** or a double-click
+re-snaps it to the corner.
+
+**Making it bigger does move it**, and it has to: a panel 74 px narrower than it is about to
+be cannot keep a top-left that close to the right edge without hanging off the screen, so it
+is pulled back to stay on-screen — flush against the edge rather than 10 px inside it.
+**Reset position** or a double-click restores that 10 px.
 
 ### Above fullscreen games
 
@@ -285,11 +290,15 @@ build started from a shortcut has a working directory nobody chose.
 масштаб не на строку списка, а `settings.json` с масштабом, которого панель не предлагает,
 отбрасывается с тем же предупреждением, что и любое другое негодное значение.
 
-При смене размера панель сохраняет свой левый верхний угол. Поэтому панель, прижатая к
-правому верхнему углу, окажется дальше от правого края, чем была, — сама она не
-перемещается, а **Reset position** или двойной клик возвращают её на место. Исключение одно:
-панель, притянутая вплотную к краю экрана, подтягивается обратно, чтобы не оказаться
-частично за пределами экрана.
+При смене размера панель сохраняет свой левый верхний угол, поэтому **уменьшение никогда не
+двигает панель**: прижатая к правому верхнему углу, она просто набирает отступ справа
+(10 px → 54 px при 85% → 84 px при 75%). **Reset position** или двойной клик возвращают её
+в угол.
+
+**Увеличение панель двигает**, и иначе нельзя: панель на 74 px уже, чем станет, не может
+сохранить левый верхний угол так близко к правому краю и не уехать за экран, поэтому её
+подтягивают обратно — вплотную к краю, а не в 10 px от него. **Reset position** или двойной
+клик возвращают эти 10 px.
 
 ### Поверх игр в полноэкранном режиме
 

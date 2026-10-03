@@ -4,8 +4,12 @@ Under PyInstaller `__file__` points inside the bundle, which is unpacked to a
 temp directory that is wiped on exit, so a frozen build must anchor on
 sys.executable instead.
 
-This module imports nothing from the rest of the project, so the alpha range is
-restated here rather than borrowed from theme.
+The alpha range and the default come from theme rather than being restated
+here. Two copies of a bound are two answers to "what is the lowest usable
+opacity", and nothing would report the disagreement: the loader would reject a
+value the wheel had just produced, or accept one the panel clamps away. theme
+is the project's home for design tokens and settings is a consumer of them, so
+importing it is what makes the pair impossible rather than merely checked.
 
 Loading sanitises: a file that cannot be read, parsed or trusted degrades to
 usable settings instead of raising, because the caller is a GUI startup path
@@ -21,20 +25,21 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+import theme
+
 logger = logging.getLogger("widget.settings")
 
 CONFIG_NAME = "settings.json"
 
-# Restated from theme; see the module docstring.
-MIN_ALPHA = 0.35
-MAX_ALPHA = 1.0
+MIN_ALPHA = theme.MIN_ALPHA
+MAX_ALPHA = theme.MAX_ALPHA
 
 
 @dataclass
 class Settings:
     x: int | None = None
     y: int | None = None
-    alpha: float = 0.80
+    alpha: float = theme.DEFAULT_ALPHA
     always_on_top: bool = True
     acrylic: bool = False
     log_history: bool = False
@@ -114,10 +119,13 @@ def load_settings(path: Path | None = None) -> Settings:
         raw = json.loads(target.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return Settings()
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, RecursionError) as exc:
         # ValueError covers json.JSONDecodeError and the UnicodeDecodeError
         # raised by a file that is not UTF-8, e.g. one written in cp1251 or
-        # UTF-16 by an older build.
+        # UTF-16 by an older build. RecursionError is not a ValueError -- it is
+        # a RuntimeError -- and json.loads raises it once the nesting is deeper
+        # than the C scanner's stack, which a file someone else wrote can
+        # trivially be. A file is not a reason to fail startup.
         logger.warning("settings unreadable at %s (%s); using defaults", target, exc)
         return Settings()
 

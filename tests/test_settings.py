@@ -3,6 +3,7 @@ import sys
 
 import pytest
 
+import theme
 from settings import Settings, load_settings, save_settings
 
 
@@ -84,7 +85,11 @@ def test_alpha_outside_the_usable_range_falls_back_to_the_default(tmp_path, alph
     path.write_text(json.dumps({"alpha": alpha, "x": 10}), encoding="utf-8")
     loaded = load_settings(path)
     assert loaded == Settings(x=10)
-    assert loaded.alpha == Settings().alpha
+    # The number, not Settings().alpha. Comparing a fallback against the
+    # dataclass default it *is* the fallback from passes for any value at all:
+    # change the default to 0.5 and this line still holds, so it was asserting
+    # that the file was ignored and calling that a check on the alpha.
+    assert loaded.alpha == 0.80
 
 
 @pytest.mark.parametrize("alpha", [0.35, 1.0])
@@ -174,3 +179,62 @@ def test_a_dropped_field_is_logged_with_its_name(tmp_path, caplog):
     assert loaded == Settings(x=5)
     messages = [r.getMessage() for r in caplog.records if r.name == "widget.settings"]
     assert any("alpha" in m and "loud" in m for m in messages), messages
+
+
+# --- the alpha range has one home -------------------------------------------
+
+
+def test_the_alpha_range_is_declared_once_in_theme():
+    """settings.py restated MIN_ALPHA/MAX_ALPHA, and nothing checked they agreed.
+
+    Two copies of a bound are two answers to "what is the lowest usable
+    opacity", and the disagreement would not show up as an error: the loader
+    would reject a value the wheel had just produced, or accept one the panel
+    clamps away. theme is the single home, so a value changed there is changed
+    everywhere -- including the Settings dataclass default.
+    """
+    import settings as settings_module
+
+    assert settings_module.MIN_ALPHA is theme.MIN_ALPHA
+    assert settings_module.MAX_ALPHA is theme.MAX_ALPHA
+    assert settings_module.Settings().alpha == theme.DEFAULT_ALPHA
+
+
+def test_the_alpha_bounds_are_the_numbers_they_are():
+    # Pinned rather than derived: these three decide what the panel can look
+    # like and what a settings file is allowed to ask for, and a change to any
+    # of them is a change to saved user data.
+    assert (theme.MIN_ALPHA, theme.MAX_ALPHA, theme.DEFAULT_ALPHA) == (0.35, 1.0, 0.80)
+
+
+def test_a_default_outside_the_range_would_be_rejected_by_the_loader(tmp_path):
+    """The default has to satisfy the bound, or a fresh install cannot be saved.
+
+    Settings.alpha is validated by the same _alpha() as any value read from
+    disk, so a default outside [MIN_ALPHA, MAX_ALPHA] is a setting the app
+    writes and then refuses to read back.
+    """
+    from settings import VALIDATORS
+
+    check = VALIDATORS["alpha"]
+    assert check(theme.DEFAULT_ALPHA) == theme.DEFAULT_ALPHA, (
+        "theme.DEFAULT_ALPHA is outside the range the loader accepts, so every "
+        "save of a default install writes a file that will not load"
+    )
+
+
+def test_deeply_nested_settings_do_not_reach_startup(tmp_path):
+    """json.loads raises RecursionError on nesting, and that is not a ValueError.
+
+    RecursionError is a RuntimeError, so the existing `except (OSError,
+    ValueError)` did not cover it and the exception escaped load_settings --
+    from a GUI startup path with no way to recover, which is exactly what that
+    function's sanitising is for. A file is what a user or another program
+    wrote; depth in it is not a reason to take the panel down.
+    """
+    from settings import load_settings
+
+    path = tmp_path / "settings.json"
+    path.write_text("[" * 20_000 + "]" * 20_000, encoding="utf-8")
+
+    assert load_settings(path) == Settings()

@@ -160,19 +160,26 @@ class Collector(QThread):
             self._on_sampled(snapshot)
 
     def run(self) -> None:
-        # COM for this thread, explicitly, before metrics.py can touch it. Two
-        # measured reasons, and neither is enough on its own:
+        # COM for this thread, explicitly, before metrics.py can touch it. The
+        # measured reason for it is thinner than an earlier version of this
+        # comment claimed, and it is written down accurately because the call
+        # stays:
         #
-        #   1. `import wmi` is not a passive import. At module scope wmi.py
-        #      runs GetObject("winmgmts:") to find its namespace, so the *first*
-        #      import opens a connection -- and on a thread with no apartment
-        #      that call fails with x_wmi_uninitialised_thread before a single
-        #      query is asked for. Measured on this machine: a plain
-        #      threading.Thread cannot even import wmi; a Qt worker thread gets
-        #      an apartment from pywin32's own lazy init, which is an accident
-        #      of the call path rather than a guarantee.
-        #   2. The apartment has to be uninitialised on the way out, or every
-        #      launch leaks one on a thread that then ends.
+        #   `import wmi` is not a passive import. At module scope wmi.py runs
+        #   GetObject("winmgmts:") to find its namespace, so the *first* import
+        #   opens a connection from whichever thread asked for it. Measured on
+        #   this machine: a bare threading.Thread whose first statement is
+        #   `import wmi` *succeeds* -- pywin32 initialises COM on the calling
+        #   thread by itself -- and then prints "Win32 exception occurred
+        #   releasing IUnknown" as the apartment it never asked for is torn
+        #   down. The same thread with the call below imports cleanly and prints
+        #   nothing. So an earlier claim here, that a plain threading.Thread
+        #   could not even import wmi, does not reproduce; what is true is that
+        #   the apartment is then an accident of the call path rather than a
+        #   decision, and the release is what needs it.
+        #
+        #   The apartment has to be uninitialised on the way out, or every
+        #   launch leaks one on a thread that then ends.
         #
         # pywin32's signature is CoInitializeEx(flags) -- one argument. The
         # two-argument form in the COM headers is C's, and passing it here

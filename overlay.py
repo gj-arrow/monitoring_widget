@@ -268,10 +268,12 @@ class MonitorPanel(QWidget):
     # --- input ------------------------------------------------------------
 
     def mousePressEvent(self, event) -> None:
-        if event.button() == Qt.MouseButton.MiddleButton:
-            # Every button path gives the grab back, this one included: the app
-            # is about to quit, and a widget that has already started shutting
-            # down has no business still claiming it is being dragged.
+        if (event.button() == Qt.MouseButton.MiddleButton
+                and event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+            # Every button path that acts gives the grab back, this one
+            # included: the app is about to quit, and a widget that has already
+            # started shutting down has no business still claiming it is being
+            # dragged.
             self._cancel_drag()
             self.quit_requested.emit()
             event.accept()

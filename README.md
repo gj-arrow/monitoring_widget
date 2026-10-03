@@ -64,7 +64,16 @@ in a frameless panel that sits in a corner of the screen.
 | Right-click | Open the menu |
 | Tray icon, click | Open the menu |
 | Tray icon, double-click | Snap the panel back to the top-right corner |
-| Middle-click | Quit |
+| Ctrl + middle-click | Quit |
+
+A bare middle-click does nothing. It used to quit, and that was a way to lose the
+panel by accident: the wheel button is the one a hand lands on while reaching for
+the opacity wheel or the right button, a single unannounced press closed the whole
+application, and the log could not say so afterwards because the exit wrote no
+record either. Ctrl is the one modifier that opens the quit path — Shift, Alt and
+Win+middle do nothing, so it takes a two-button gesture on purpose.
+
+| Quit | The other way out: **Quit** in the menu, from the panel or the tray icon |
 
 The menu holds **Reset position**, **Opacity**, **Scale**, **Write history to file**, and **Quit**.
 
@@ -287,7 +296,16 @@ build started from a shortcut has a working directory nobody chose.
 | ПКМ (правая кнопка) | Открыть меню |
 | Значок в трее, клик | Открыть меню |
 | Значок в трее, двойной клик | Вернуть панель в правый верхний угол |
-| Центральная кнопка | Закрыть приложение |
+| Ctrl + центральная кнопка | Закрыть приложение |
+
+Обычная центральная кнопка ничего не делает. Раньше она закрывала приложение, и это был
+способ потерять панель случайно: центральную кнопку нажимают, потянувшись к колесу
+прозрачности или к правой кнопке, одно незаметное нажатие закрывало всё приложение, а в
+логе после этого ничего не оставалось — выход тоже ничего не писал. Теперь выход открывает
+только Ctrl; Shift, Alt и Win в сочетании с центральной кнопкой не делают ничего, то есть
+нужно осознанное нажатие двух кнопок.
+
+| Выход | Второй способ: **Quit** в меню, с панели или из значка в трее |
 
 В меню есть **Reset position**, **Opacity**, **Scale**, **Write history to file** и **Quit**.
 

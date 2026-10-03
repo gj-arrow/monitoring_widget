@@ -147,7 +147,8 @@ def active_painters(opened):
     return [index for index, painter in enumerate(opened) if painter.isActive()]
 
 
-def mouse_event(kind, panel, global_at, button, buttons):
+def mouse_event(kind, panel, global_at, button, buttons,
+                modifiers=Qt.KeyboardModifier.NoModifier):
     """Build the event the way Qt builds one, from a global position.
 
     QMouseEvent takes QPointF in PyQt6, not QPoint; passing a QPoint raises
@@ -155,6 +156,9 @@ def mouse_event(kind, panel, global_at, button, buttons):
     tracks the cursor globally: a move event whose global position repeats the
     press moves nothing at all, so a drag test written that way passes without
     ever dragging.
+
+    `modifiers` defaults to none so every caller that does not care about the
+    keyboard keeps saying so; the quit path is the one that reads it.
     """
     return QMouseEvent(
         kind,
@@ -162,7 +166,7 @@ def mouse_event(kind, panel, global_at, button, buttons):
         QPointF(global_at),
         button,
         buttons,
-        Qt.KeyboardModifier.NoModifier,
+        modifiers,
     )
 
 
@@ -717,11 +721,11 @@ def test_a_right_button_double_click_leaves_the_panel_alone():
 
 
 def test_a_middle_click_gives_the_drag_back():
-    """Every button path ends the grab, not just the ones that move the panel.
+    """Every button path that acts ends the grab, not just the ones that move it.
 
-    The middle click asks the app to quit, so the stuck cursor never survives
-    long enough to be seen -- but it is the same state as every other path, and
-    a test suite that pins it everywhere else should pin it here too.
+    Ctrl+middle asks the app to quit, so the stuck cursor never survives long
+    enough to be seen -- but it is the same state as every other path, and a
+    test suite that pins it everywhere else should pin it here too.
     """
     panel = make_panel()
     panel.move(400, 300)
@@ -735,14 +739,15 @@ def test_a_middle_click_gives_the_drag_back():
     panel.mousePressEvent(mouse_event(
         QMouseEvent.Type.MouseButtonPress, panel, QPoint(420, 320),
         Qt.MouseButton.MiddleButton, Qt.MouseButton.MiddleButton,
+        Qt.KeyboardModifier.ControlModifier,
     ))
 
-    assert asked == [True], "the middle click stopped asking the app to quit"
-    assert panel._drag_origin is None, "the middle click left the grab armed"
+    assert asked == [True], "ctrl+middle stopped asking the app to quit"
+    assert panel._drag_origin is None, "the quit path left the grab armed"
     assert panel.cursor().shape() == Qt.CursorShape.OpenHandCursor
 
 
-def test_middle_click_asks_the_app_to_quit():
+def test_ctrl_middle_click_asks_the_app_to_quit():
     panel = make_panel()
     asked = []
     panel.quit_requested.connect(lambda: asked.append(True))
@@ -750,9 +755,72 @@ def test_middle_click_asks_the_app_to_quit():
     panel.mousePressEvent(mouse_event(
         QMouseEvent.Type.MouseButtonPress, panel, QPoint(50, 50),
         Qt.MouseButton.MiddleButton, Qt.MouseButton.MiddleButton,
+        Qt.KeyboardModifier.ControlModifier,
     ))
 
     assert asked == [True]
+
+
+def test_a_bare_middle_click_does_nothing_at_all():
+    """The wheel button must not be able to close the widget on its own.
+
+    The middle button is the one a hand lands on by accident while reaching for
+    the wheel or the right button, and this used to quit the whole application
+    from a single unannounced press: the panel vanished and nothing in the log
+    said why, because the exit wrote no record either. A quick exit is worth
+    keeping, so it moved behind Ctrl -- but a bare middle click is now not a
+    smaller quit, it is nothing: no quit, no drag cancelled, no event eaten, so
+    the press falls through to Qt exactly as an unmapped button would.
+    """
+    panel = make_panel()
+    panel.move(400, 300)
+    asked = []
+    eaten = []
+    panel.quit_requested.connect(lambda: asked.append(True))
+
+    panel.mousePressEvent(mouse_event(
+        QMouseEvent.Type.MouseButtonPress, panel, QPoint(410, 310),
+        Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+    ))
+    assert panel._drag_origin is not None, "the fixture never started a drag"
+
+    event = mouse_event(
+        QMouseEvent.Type.MouseButtonPress, panel, QPoint(420, 320),
+        Qt.MouseButton.MiddleButton, Qt.MouseButton.MiddleButton,
+    )
+    panel.mousePressEvent(event)
+    eaten.append(event.isAccepted())
+
+    assert asked == [], "a bare middle click still quits the app"
+    assert panel._drag_origin is not None, (
+        "a bare middle click cancelled a drag it never asked about"
+    )
+    assert eaten == [False], (
+        "a bare middle click swallowed the press; it should reach Qt untouched"
+    )
+
+
+def test_the_other_modifiers_do_not_open_the_quit_path():
+    """Ctrl is the one modifier, not a prefix any modifier satisfies.
+
+    A check written as "some modifier is held" would pass this test's sibling
+    for the wrong reason, and Shift+middle is exactly as accidental as a bare
+    middle click.
+    """
+    for modifier in (Qt.KeyboardModifier.ShiftModifier,
+                     Qt.KeyboardModifier.AltModifier,
+                     Qt.KeyboardModifier.MetaModifier):
+        panel = make_panel()
+        asked = []
+        panel.quit_requested.connect(lambda: asked.append(True))
+
+        panel.mousePressEvent(mouse_event(
+            QMouseEvent.Type.MouseButtonPress, panel, QPoint(50, 50),
+            Qt.MouseButton.MiddleButton, Qt.MouseButton.MiddleButton, modifier,
+        ))
+
+        assert asked == [], ("%s+middle quit the app; only Ctrl may"
+                             % modifier.name)
 
 
 def test_right_click_asks_for_the_menu_where_the_cursor_is():

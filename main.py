@@ -657,17 +657,31 @@ class MonitorApp:
         Middle-click, the tray's Quit and an external quit all land here and
         any two of them can arrive together; a second call returns at once
         rather than waiting out another timeout or saving settings over a
-        collector that is already gone.
+        collector that is already gone. Ctrl+middle is the gesture that reaches
+        this from the panel: a bare wheel click does not, because it is the
+        button a hand lands on by accident.
 
-        Both timers are stopped, not just the tick timer. Both are parented to
-        the panel so Qt stops them when the *widget* goes, but this path calls
+        Both timers are stopped, not just the tick timer. Both are parented to the
+        panel so Qt stops them when the *widget* goes, but this path calls
         QApplication.quit(), which ends the event loop without destroying the
         panel -- so parenting alone leaves the topmost re-assertion armed, waking
         the process once a second for as long as the interpreter takes to come
         down.
+
+        The exit is the one thing this method says out loud. Startup is logged
+        and a failure to start is logged with its traceback, but nothing was
+        written on the way out, so every run of the log ended on the same line
+        -- "MonitorApp starting" -- whether the user quit from the tray or the
+        process was killed where it stood. A log in that state cannot answer the
+        question it gets asked most often after the panel goes missing: did it
+        quit, or did it die? Its absence is the signal, which is why this is one
+        plain line and not a heartbeat or a summary. It is written before the
+        timers stop so it survives a sampler that refuses to wind down, and
+        inside the guard so two callers produce one line, not two.
         """
         if self._stopped:
             return
+        logger.info("MonitorApp exiting")
         self._stopped = True
         self.timer.stop()
         self._topmost_timer.stop()

@@ -958,6 +958,55 @@ def test_stop_collector_is_safe_to_call_twice(qapp, collectors):
     assert probe.calls == 1
 
 
+def test_the_exit_is_written_down(shutting_down, caplog):
+    """The log has to be able to tell a clean exit from an abrupt one.
+
+    Startup is recorded and a failure to start is recorded with its traceback,
+    but the way out wrote nothing at all: every run of this file ended with the
+    last line reading "MonitorApp starting", whether the user quit from the tray
+    or the process was killed where it stood. So the log could not answer the
+    first question anyone asks of it after the panel disappears -- did it quit,
+    or did it die -- and it could not be told apart from a log that had simply
+    stopped being written to.
+
+    One INFO line closes that. It is not a heartbeat and not a summary: the
+    whole point is that its absence is meaningful.
+    """
+    app, _, _ = shutting_down
+
+    with caplog.at_level(logging.INFO, logger="widget.main"):
+        app.shutdown()
+
+    records = [r for r in caplog.records if r.name == "widget.main"]
+    assert records, (
+        "shutdown() wrote nothing: a log whose last line is the startup one "
+        "cannot say whether the app quit or died"
+    )
+    assert any("exiting" in r.getMessage() for r in records), (
+        "no record names the exit: %r"
+        % [r.getMessage() for r in records]
+    )
+
+
+def test_only_one_exit_record_for_two_shutdowns(shutting_down, caplog):
+    """The second shutdown must not write a second exit line.
+
+    shutdown() is reached from the panel, the tray and the aboutToQuit hook, and
+    the guard that keeps it to one pass over the timers and the settings file
+    has to cover the log the same way -- otherwise "one line per run" is not a
+    number anything can rely on.
+    """
+    app, _, _ = shutting_down
+
+    with caplog.at_level(logging.INFO, logger="widget.main"):
+        app.shutdown()
+        app.shutdown()
+
+    exits = [r for r in caplog.records
+             if r.name == "widget.main" and "exiting" in r.getMessage()]
+    assert len(exits) == 1, f"two shutdowns wrote {len(exits)} exit records: {exits!r}"
+
+
 def test_shutdown_twice_leaves_one_of_everything(shutting_down):
     app, saved, application = shutting_down
 

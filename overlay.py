@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 import time
 
-from PyQt6.QtCore import QPoint, Qt, pyqtSignal
+from PyQt6.QtCore import QPoint, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QPainter
 from PyQt6.QtWidgets import QWidget
 
@@ -53,6 +53,22 @@ class MonitorPanel(QWidget):
         }
         self._drag_origin: QPoint | None = None
         self._last_paint_log = float("-inf")
+
+        # A repaint the panel asks for itself. apply_snapshot() calls update()
+        # on every reading, which is the same rate while sampling works -- and
+        # exactly nothing when it does not. A wedged collector sends no
+        # snapshots, so the last frame would sit on screen indefinitely and the
+        # status dot's staleness rule (theme.STALE_AFTER_S) would be true and
+        # invisible, which is the one thing a fix for a wedged collector must
+        # not be.
+        #
+        # Parented to the panel, so Qt stops it when the widget goes. Owned by
+        # nobody else, so nothing has to remember to stop it: a timer that
+        # outlived the panel would wake the process every two seconds for the
+        # life of a widget installed to be left running.
+        self._repaint_timer = QTimer(self)
+        self._repaint_timer.timeout.connect(self.update)
+        self._repaint_timer.start(theme.TICK_MS)
 
         self.setWindowTitle(WINDOW_TITLE)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)

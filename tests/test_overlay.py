@@ -16,11 +16,12 @@ import logging
 import os
 import subprocess
 import sys
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
-from PyQt6.QtCore import QPoint, QPointF, Qt
+from PyQt6.QtCore import QPoint, QPointF, Qt, QThread, QTimer
 from PyQt6.QtGui import (
     QColor,
     QContextMenuEvent,
@@ -1288,3 +1289,53 @@ def test_a_failed_frame_does_not_take_the_process_with_it():
         f"render-driven tests in this file would otherwise have taken this run "
         f"with them:\n{report}"
     )
+
+
+# --- a wedge has to be able to repaint at all -------------------------------
+
+
+def test_the_panel_repaints_with_no_snapshot_arriving(qapp, monkeypatch):
+    """The staleness check is only reachable if something asks for a repaint.
+
+    apply_snapshot() is what calls update() today, and a wedged collector sends
+    no snapshots -- so the last frame, painted while the readings were fresh,
+    would sit on screen indefinitely with its status dot still lit. The dot
+    going grey at STALE_AFTER_S would then be true and invisible, which is the
+    one thing a fix for a wedged collector must not be.
+
+    Counted in update() calls rather than read back off the pixels, because this
+    is the layer below the renderer: a pixel-level test here would be satisfied
+    by a widget that repaints for some other reason.
+
+    Patched before the panel is built, not after: the timer is connected to
+    self.update at construction time, so patching afterwards replaces an
+    attribute the signal no longer calls.
+    """
+    calls = []
+    monkeypatch.setattr(MonitorPanel, "update", lambda self: calls.append(1))
+    panel = make_panel()
+
+    deadline = time.monotonic() + 4.0
+    while not calls and time.monotonic() < deadline:
+        qapp.processEvents()
+        QThread.msleep(10)
+
+    assert calls, (
+        "nothing asked the panel to repaint without a snapshot: a wedged "
+        "collector leaves the last frame up forever, stale or not"
+    )
+
+
+def test_the_repaint_keeps_the_tick_cadence_and_belongs_to_the_panel(qapp):
+    """Every theme.TICK_MS, and parented to the widget so it dies with it.
+
+    A timer that outlived the panel would wake the process every two seconds
+    for nothing, which on a monitoring widget that is installed to be left
+    running is a small permanent cost bought by a check nobody asked for.
+    """
+    panel = make_panel()
+    timers = panel.findChildren(QTimer)
+    assert len(timers) == 1, f"the panel owns {len(timers)} timers, expected 1"
+    assert timers[0].interval() == theme.TICK_MS
+    assert timers[0].isActive(), "the repaint timer is not running"
+    assert timers[0].parent() is panel, "the timer is not owned by the panel"

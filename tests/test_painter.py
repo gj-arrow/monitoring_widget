@@ -1,4 +1,4 @@
-"""Renderer tests, half of them golden-image comparisons.
+﻿"""Renderer tests, half of them golden-image comparisons.
 
 The goldens are near-exact matches: `max_channel_delta` compares the alpha
 channel as well as RGB, so anything above a handful of counts is a real
@@ -41,7 +41,8 @@ def build_histories(values_by_key):
     return histories
 
 
-def render(snapshot, values_by_key=None, alpha=theme.DEFAULT_ALPHA, histories=None):
+def render(snapshot, values_by_key=None, alpha=theme.DEFAULT_ALPHA, histories=None,
+           now=None):
     image = QImage(theme.CANVAS_W, theme.CANVAS_H, QImage.Format.Format_ARGB32_Premultiplied)
     image.fill(QColor(0, 0, 0, 0))
     # Not named `painter`: that would shadow the module the monkeypatch tests use.
@@ -52,6 +53,11 @@ def render(snapshot, values_by_key=None, alpha=theme.DEFAULT_ALPHA, histories=No
             snapshot,
             build_histories(values_by_key or {}) if histories is None else histories,
             alpha,
+            # Defaults to the snapshot's own ts, so every render here reads as
+            # fresh. A wall clock would grey the dot in all three goldens --
+            # they carry ts=1000.0 -- and lock a picture of a dead collector
+            # into the repository.
+            now=snapshot.ts if now is None else now,
         )
     finally:
         canvas_painter.end()
@@ -853,3 +859,94 @@ def test_alpha_zero_still_draws_the_text(monkeypatch):
         "row values are not being drawn, only the header"
     )
     assert max_channel_delta(clear, untexted) > 60
+
+
+# --- the status dot and a stale snapshot -----------------------------------
+
+
+def dot_colour(snapshot, now=None, **kwargs):
+    """The colour the status dot actually reached the pixels in.
+
+    Read back at alpha 1.0, where the panel fill behind the dot is opaque, so
+    the pixel is the pure dot colour and not a blend with it.
+    """
+    x = int(theme.BLEED + theme.header_dot_x())
+    y = int(theme.BLEED + theme.header_rect().center().y())
+    return render(snapshot, RAMPS, alpha=1.0, now=now, **kwargs).pixelColor(x, y)
+
+
+def test_a_fresh_snapshot_lights_the_status_dot_in_its_state_colour():
+    """The normal case: nothing about the dot changes for a current reading."""
+    assert dot_colour(CALM, now=CALM.ts).name() == theme.CALM.name()
+    assert dot_colour(HOT, now=HOT.ts).name() == theme.CRITICAL_COLOR.name()
+
+
+def test_a_stale_snapshot_goes_neutral_instead_of_reporting_a_state():
+    """The wedge the header cannot talk about any more.
+
+    Snapshot.ts was written and read by nothing except the CSV. When the
+    sample-age figure came out of the header at the user's request the panel
+    lost its only on-screen evidence that the numbers were current, so a
+    collector that wedged left the last readings up with the dot still lit as
+    if nothing were wrong. The dot is the panel's alarm, so it is where this
+    belongs -- and NEUTRAL is the colour a panel with no data already uses, so
+    the meaning is borrowed rather than invented.
+
+    HOT, not CALM: the worst state is CRITICAL here, so a dot that merely
+    looked calm could be mistaken for the calm case and the test would pass
+    without the staleness check doing anything.
+    """
+    stale = dot_colour(HOT, now=HOT.ts + theme.STALE_AFTER_S + 0.001)
+    assert stale.name() == theme.NEUTRAL.name(), (
+        f"a snapshot {theme.STALE_AFTER_S + 0.001:.3f}s old still paints the dot "
+        f"{stale.name()}: the panel is claiming currency it does not have"
+    )
+
+
+def test_staleness_does_not_disturb_any_row():
+    """Only the dot changes. The numbers stay, because they are all there is."""
+    aged = HOT.ts + theme.STALE_AFTER_S + 0.001
+    fresh_render = render(HOT, RAMPS, alpha=1.0, now=HOT.ts)
+    stale_render = render(HOT, RAMPS, alpha=1.0, now=aged)
+
+    x = int(theme.BLEED + theme.header_dot_x())
+    y = int(theme.BLEED + theme.header_rect().center().y())
+    assert fresh_render.pixelColor(x, y) != stale_render.pixelColor(x, y), (
+        "the dot did not change colour: nothing was tested"
+    )
+    rows = [
+        (spec, rect) for spec, rect in theme.metric_rects()
+        if not rect.contains(QPointF(x - theme.BLEED, y - theme.BLEED))
+    ]
+    differing = [
+        (px, py)
+        for spec, rect in rows
+        for py in range(int(rect.top()) + theme.BLEED, int(rect.bottom()) + theme.BLEED)
+        for px in range(int(rect.left()) + theme.BLEED, int(rect.right()) + theme.BLEED)
+        if fresh_render.pixelColor(px, py).rgba() != stale_render.pixelColor(px, py).rgba()
+    ]
+    assert not differing, f"{len(differing)} row pixels changed with staleness"
+
+
+def test_the_dot_holds_its_colour_right_up_to_the_threshold():
+    """The boundary is where the panel stops claiming currency, not before it."""
+    fresh_edge = dot_colour(HOT, now=HOT.ts + theme.STALE_AFTER_S)
+    assert fresh_edge.name() == theme.CRITICAL_COLOR.name(), (
+        f"a snapshot exactly {theme.STALE_AFTER_S}s old already reads "
+        f"{fresh_edge.name()}: the threshold is one tick early"
+    )
+    past_edge = dot_colour(HOT, now=HOT.ts + theme.STALE_AFTER_S + 0.001)
+    assert past_edge.name() == theme.NEUTRAL.name()
+
+
+def test_render_defaults_to_treating_the_snapshot_as_current():
+    """The funnel renders at the snapshot's own ts, which is what the goldens do.
+
+    Without this every golden render would be measured against an epoch-1000
+    timestamp and the dot would be grey in all three reference images, locking in
+    a picture of a panel whose collector has been dead for 55 years.
+    """
+    assert render(HOT, RAMPS).pixelColor(
+        int(theme.BLEED + theme.header_dot_x()),
+        int(theme.BLEED + theme.header_rect().center().y()),
+    ).name() == theme.CRITICAL_COLOR.name()

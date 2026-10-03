@@ -49,12 +49,20 @@ def paint(
     snapshot,
     histories: dict[str, History],
     alpha: float,
+    now: float | None = None,
 ) -> None:
     """Draw the whole panel. `histories` may be missing keys; rows degrade.
 
     The paint target must be at least theme.CANVAS_W x theme.CANVAS_H; the
     translate below leaves room for the drop shadow outside the panel, and the
     matching restore() puts the caller's transform back.
+
+    `now` is the wall clock the panel is being painted at, and it is an
+    argument rather than a call to time.time() so the status dot's staleness is
+    a function of the inputs like everything else here. Left None in
+    production, where the answer is the clock; the tests pass the snapshot's own
+    ts, which makes "as fresh as this snapshot" the default reading and keeps a
+    wall clock from moving a pixel between two renders.
     """
     painter.save()
     painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
@@ -62,7 +70,7 @@ def paint(
     painter.translate(theme.BLEED, theme.BLEED)
 
     _draw_panel(painter, theme.panel_rect(), alpha)
-    _draw_header(painter, theme.header_rect(), snapshot)
+    _draw_header(painter, theme.header_rect(), snapshot, now)
 
     for spec, rect in theme.metric_rects():
         _draw_row(painter, spec, rect, snapshot, histories.get(spec.key))
@@ -95,12 +103,8 @@ def _draw_panel(painter: QPainter, rect: QRectF, alpha: float) -> None:
     painter.setPen(Qt.PenStyle.NoPen)
 
 
-def _draw_header(painter: QPainter, rect: QRectF, snapshot) -> None:
-    if theme.has_any_data(snapshot):
-        state = theme.worst_state(theme.metric_state(spec, snapshot) for spec in theme.METRICS)
-        dot_color = theme.state_color(state)
-    else:
-        dot_color = theme.NEUTRAL
+def _draw_header(painter: QPainter, rect: QRectF, snapshot, now: float | None) -> None:
+    dot_color = _dot_color(snapshot, now)
 
     centre_y = rect.center().y()
     # Both edges come from theme, so the dot and the text cannot end up placed
@@ -115,6 +119,28 @@ def _draw_header(painter: QPainter, rect: QRectF, snapshot) -> None:
     if text:
         _draw_text(painter, text, QRectF(text_x, rect.top(), rect.right() - text_x, rect.height()),
                    theme.aux_font(), theme.NEUTRAL)
+
+
+def _dot_color(snapshot, now: float | None) -> QColor:
+    """The status dot: the worst state across the rows, or neutral.
+
+    Two ways to draw nothing alarming, and both are the same grey. No data at
+    all, and -- the reason `now` exists -- data that has stopped arriving. The
+    header carries no age figure, so without this a wedged collector leaves the
+    last readings on screen with a lit dot: a panel reporting a machine nobody
+    has measured, in the colours of whenever it was last measured.
+
+    Staleness is checked before the state, not after, so it costs no extra
+    branch on the common path and cannot be argued with by a row that happens
+    to be critical.
+    """
+    if theme.snapshot_is_stale(snapshot, now):
+        return theme.NEUTRAL
+    if theme.has_any_data(snapshot):
+        return theme.state_color(
+            theme.worst_state(theme.metric_state(spec, snapshot) for spec in theme.METRICS)
+        )
+    return theme.NEUTRAL
 
 
 def _format_net(snapshot) -> str:

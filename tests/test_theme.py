@@ -233,3 +233,42 @@ def test_throughput_never_reaches_a_row_state_or_the_worst_state():
         cpu_pct=1.0, net_down_bytes_per_sec=1e12, net_up_bytes_per_sec=1e12,
     )) for spec in specs]
     assert set(states) == {theme.NORMAL}
+
+
+# --- staleness -------------------------------------------------------------
+
+
+def test_a_snapshot_is_fresh_the_instant_it_is_taken():
+    assert theme.snapshot_is_stale(snapshot(ts=1000.0), now=1000.0) is False
+
+
+def test_staleness_starts_past_the_threshold_not_at_it():
+    """The boundary is exclusive, and which side it falls on is a choice.
+
+    A reading exactly STALE_AFTER_S old is *not* stale yet: the threshold is
+    where the panel stops claiming currency, so it is the first age that counts,
+    not the last one that does not. `>` rather than `>=`.
+    """
+    threshold = theme.STALE_AFTER_S
+    assert theme.snapshot_is_stale(snapshot(ts=1000.0), now=1000.0 + threshold) is False
+    assert theme.snapshot_is_stale(
+        snapshot(ts=1000.0), now=1000.0 + threshold + 0.001
+    ) is True
+
+
+def test_the_staleness_threshold_is_three_ticks():
+    # One tick is the interval the collector samples at, so a threshold of one
+    # tick would call a panel stale between samples. Three is two missed ticks
+    # of slack -- one late tick, or a sample that took as long as a tick --
+    # before the dot changes, and 6 s is still well inside "this is broken"
+    # rather than "this is a hiccup".
+    assert theme.STALE_TICKS == 3
+    assert theme.STALE_AFTER_S == theme.STALE_TICKS * theme.TICK_MS / 1000.0 == 6.0
+
+
+def test_a_snapshot_with_no_timestamp_is_treated_as_fresh():
+    # The field defaults to 0.0, so "no ts" and "epoch zero" are the same thing
+    # and neither is a staleness claim -- a fresh panel should not go grey
+    # because a hand-built snapshot in a test left ts alone.
+    assert theme.snapshot_is_stale(snapshot(), now=1000.0) is False
+    assert theme.snapshot_is_stale(snapshot(ts=0.0), now=1000.0) is False

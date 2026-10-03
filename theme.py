@@ -11,6 +11,7 @@ instead of staying pinned to the pixel grid.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 
 from PyQt6.QtCore import QRectF
@@ -103,6 +104,16 @@ MAX_ALPHA = 1.0
 DEFAULT_ALPHA = 0.80
 WHEEL_ALPHA_STEP = 0.05
 
+# How old a snapshot may be before the panel stops claiming its numbers are
+# current, in ticks. Three, not one: the collector samples every TICK_MS, so a
+# one-tick threshold would call the panel stale in the ordinary gap between two
+# samples and on any frame the GUI thread was late delivering. Three is two
+# missed ticks of slack -- a late tick, or one sample that took as long as a
+# tick -- and 6 s is still plainly "broken" rather than "hiccuped" to anyone
+# watching. Two would be the same argument one tick tighter; one is wrong.
+STALE_TICKS = 3
+STALE_AFTER_S = STALE_TICKS * TICK_MS / 1000.0
+
 _STATE_COLORS = {NORMAL: CALM, WARN: WARN_COLOR, CRITICAL: CRITICAL_COLOR}
 
 
@@ -163,6 +174,32 @@ def has_any_data(snapshot) -> bool:
     if any(row_value(spec, snapshot) is not None for spec in METRICS):
         return True
     return gpu_temp(snapshot) is not None
+
+
+def snapshot_is_stale(snapshot, now: float | None = None) -> bool:
+    """True when the snapshot is older than STALE_AFTER_S.
+
+    The panel's one piece of evidence that its numbers are current. The header
+    carries no age figure -- that was asked for and is not coming back -- so a
+    collector that wedged would otherwise leave the last readings on screen with
+    the status dot still lit in whatever state those readings were in, which is
+    a healthy-looking panel reporting a machine nobody has measured in minutes.
+
+    The boundary is exclusive: a reading exactly STALE_AFTER_S old is not stale
+    yet, because the threshold is where the panel stops claiming currency and
+    not where it starts.
+
+    A missing timestamp is never stale. `ts` defaults to 0.0, so "absent" and
+    "epoch zero" are the same value, and treating either as an age of 56 years
+    would grey the dot on a panel that has never claimed to have measured
+    anything -- which is what has_any_data() is already for.
+    """
+    stamp = getattr(snapshot, "ts", 0.0)
+    if not stamp:
+        return False
+    if now is None:
+        now = time.time()
+    return now - stamp > STALE_AFTER_S
 
 
 def worst_state(states) -> int:

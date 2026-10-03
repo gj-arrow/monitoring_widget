@@ -19,6 +19,7 @@ import sys
 import threading
 import time
 from dataclasses import asdict
+from pathlib import Path
 
 import pytest
 from PyQt6.QtCore import QPoint, QPointF, Qt, QThread
@@ -526,6 +527,150 @@ def test_the_probe_is_released_before_com_goes_away(qapp, monkeypatch, collector
 
     assert seen["probe_at_uninit"] is None, (
         "the WMI connection was still held when the apartment was torn down"
+    )
+
+
+def test_a_probe_factory_that_raises_is_logged_and_the_run_returns(
+    qapp, monkeypatch, caplog, collectors
+):
+    """The escape hatch, because an exception out of run() is fatal to the process.
+
+    Building the probe here rather than on the GUI thread is what fixed the
+    cross-apartment WMI fault, and it moved `import psutil` (SystemProbe) and
+    the COM connection (CpuClockProbe) under main()'s try/except no more: both
+    are unguarded, and an exception escaping a QThread virtual cannot be caught
+    from the outside. Measured before the fix: the process died with
+    -1073740791 (0xC0000409) and app_debug.log held **zero** records, so a
+    missing dependency or an unavailable sensor at startup killed the app with
+    no explanation at all -- strictly worse than the failure the factory fixed.
+
+    run() is called here rather than started on a thread, and that is the point:
+    it makes a regression a failed test instead of a dead interpreter, the same
+    reason tests/test_overlay.py drives paintEvent(None) for the paint-failure
+    floor. The subprocess test below is what pins the real thread.
+    """
+    def refuse():
+        raise ImportError("No module named 'psutil'")
+
+    import pythoncom
+
+    recorder = RecordingCom()
+    monkeypatch.setattr(app_main, "pythoncom", recorder)
+    collector = collectors(refuse)
+
+    with caplog.at_level(logging.ERROR, logger="widget.main"):
+        collector.run()
+
+    assert recorder.inits == [pythoncom.COINIT_APARTMENTTHREADED], (
+        f"COM was initialised {recorder.inits} before the factory ran"
+    )
+    assert recorder.uninits == 1, (
+        "the COM pairing was not kept when the factory raised: the apartment is "
+        f"left initialised ({recorder.inits} init(s), {recorder.uninits} uninit(s))"
+    )
+    records = [r for r in caplog.records if r.name == "widget.main"]
+    assert len(records) == 1, (
+        f"{len(records)} records for a probe factory that raised: the fault "
+        "escapes the thread with nothing written down, so there is no trace to "
+        "work from and no exit code to explain"
+    )
+    assert records[0].exc_info is not None, (
+        "the record carries no traceback: a missing dependency is exactly the "
+        "case where the stack is the answer"
+    )
+    # caplog.text, not getMessage(): logger.exception puts the fault in the
+    # traceback, and the traceback is what a reader of the log file gets.
+    assert "psutil" in caplog.text, (
+        f"the record does not name the fault: {caplog.text!r}"
+    )
+
+
+def test_a_sample_that_raises_stops_the_loop_and_is_logged(qapp, monkeypatch, caplog, collectors):
+    """The same guard on the loop, where the exception can arrive every tick.
+
+    SystemProbe catches its own per-source faults, so what reaches run() is the
+    unexpected one: a probe built for the app going wrong in a way no guard
+    covers. The panel then goes stale -- the status dot goes neutral, which is
+    the signal for exactly this -- and the process stays up with the reason on
+    file. Also pins that the probe is released on this path too, since the
+    finally has to cover the loop as well as the construction.
+    """
+    class Exploding:
+        def sample(self):
+            raise RuntimeError("the probe fell over")
+
+    seen = {}
+
+    class PeekingCom:
+        COINIT_APARTMENTTHREADED = 2
+
+        def CoInitializeEx(self, flag):
+            pass
+
+        def CoUninitialize(self):
+            seen["probe_at_uninit"] = collector._probe
+
+    monkeypatch.setattr(app_main, "pythoncom", PeekingCom())
+    collector = collectors(Exploding)
+
+    with caplog.at_level(logging.ERROR, logger="widget.main"):
+        collector.run()
+
+    assert seen.get("probe_at_uninit") is None, (
+        "the probe was still held when the apartment was torn down"
+    )
+    messages = [r.getMessage() for r in caplog.records if r.name == "widget.main"]
+    assert any("sampler thread stopped" in m for m in messages), (
+        f"the fault that ended the sampler was not logged at all: {messages!r}"
+    )
+    assert "fell over" in caplog.text, (
+        f"the record does not carry the exception that ended the thread: {caplog.text!r}"
+    )
+
+
+def test_an_exception_out_of_the_sampler_thread_leaves_the_process_running(tmp_path):
+    """The claim itself, on the real thread, because the one above cannot see it.
+
+    An exception out of QThread.run() is fatal: the process exits with
+    -1073740791 (0xC0000409) and, measured on this machine, writes nothing to
+    app_debug.log at all. So this runs a child process whose probe factory
+    raises, and asks two questions of it -- what was the exit code, and what
+    reached the log.
+    """
+    log = tmp_path / "app_debug.log"
+    root = Path(app_main.__file__).parent
+    script = (
+        "import logging.handlers, sys\n"
+        f"sys.path.insert(0, {str(root)!r})\n"
+        "handler = logging.handlers.RotatingFileHandler(\n"
+        f"    {str(log)!r}, maxBytes=512 * 1024, backupCount=2, encoding='utf-8'\n"
+        ")\n"
+        "handler.setFormatter(logging.Formatter('%(levelname)s %(name)s: %(message)s'))\n"
+        "logging.getLogger().addHandler(handler)\n"
+        "logging.getLogger().setLevel(logging.INFO)\n"
+        "from PyQt6.QtCore import QCoreApplication, QThread\n"
+        "import main as app_main\n"
+        "def refuse():\n"
+        "    raise ImportError(\"No module named 'psutil'\")\n"
+        "app = QCoreApplication(sys.argv)\n"
+        "collector = app_main.Collector(refuse)\n"
+        "collector.finished.connect(app.quit)\n"
+        "collector.start()\n"
+        "collector.wait(30000)\n"
+        "logging.shutdown()\n"
+    )
+    done = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, timeout=180
+    )
+    written = log.read_text(encoding="utf-8") if log.exists() else ""
+
+    assert done.returncode == 0, (
+        f"a probe factory that raised took the process down with it: exit "
+        f"{done.returncode}, log {len(written)} bytes (stderr: {done.stderr[-300:]})"
+    )
+    assert "psutil" in written, (
+        f"the process survived but nothing was written down, so the log is no "
+        f"better than the crash: {written!r}"
     )
 
 

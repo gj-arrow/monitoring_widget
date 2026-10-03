@@ -181,12 +181,33 @@ class Collector(QThread):
         try:
             self._probe = self._make_probe()
             self._sample_loop()
+        except Exception:
+            # An exception out of a QThread virtual cannot be caught from the
+            # outside: it aborts the interpreter. Measured here, on this
+            # machine, for exactly this handler's sake: -1073740791 (0xC0000409)
+            # and **zero** bytes in app_debug.log. So a missing psutil or an
+            # unavailable sensor took the app down with no explanation at all --
+            # worse than the cross-apartment fault the factory above fixed,
+            # which at least logged.
+            #
+            # It is here rather than in main()'s try/except because neither
+            # SystemProbe.__init__ nor CpuClockProbe guards what it builds --
+            # `import psutil` and a COM connection are both unguarded -- and the
+            # factory that moved the construction onto this thread moved it out
+            # of main()'s reach. What is left when this catches is a panel whose
+            # status dot goes neutral, which is the signal for a collector that
+            # stopped, and one record here saying why.
+            logger.exception("sampler thread stopped on an unhandled fault")
         finally:
             # Released before CoUninitialize, on the thread that opened it. A
-            # COM object released after its apartment is gone prints
-            # "Win32 exception occurred releasing IUnknown" on stderr, and a
-            # frame-local would not be released early enough to avoid it: the
-            # frame is popped only after run() returns.
+            # COM object released after its apartment is gone makes pywin32
+            # release it into nothing and abort the process with 0xC0000409
+            # ("Win32 exception occurred releasing IUnknown" on stderr is the
+            # last thing it manages to say). Reversing the two lines reproduces
+            # that on every shutdown.
+            #
+            # A frame-local cannot release early enough to avoid it: the frame
+            # is popped only after run() returns.
             self._probe = None
             pythoncom.CoUninitialize()
 

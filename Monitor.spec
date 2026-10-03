@@ -25,12 +25,23 @@ a = Analysis(
     binaries=[],
     datas=[],
     # metrics.py imports these two inside the functions that need them --
-    # `import wmi` in the WMI probe and the CPU-clock probe, `import pynvml`
-    # in GpuProbe -- so that a machine without a GPU or without WMI still
-    # starts. A function-local import is invisible to static analysis, and
-    # PyInstaller would ship a build where the GPU row and the CPU clock fail
-    # at runtime with ImportError. Naming them here is what makes the guarded
-    # imports safe to keep.
+    # `import wmi` in the WMI probe and the CPU-clock probe, `import pynvml` in
+    # GpuProbe -- so that a machine without a GPU or without WMI still starts.
+    #
+    # The old comment here said PyInstaller cannot see a function-local import.
+    # That is wrong, and it was checked rather than assumed: PyInstaller 6.21's
+    # own dependency analysis run over main.py with no hidden imports at all
+    # returns both `wmi` and `pynvml` in the graph. It walks function bodies.
+    #
+    # So why keep them? Because the guarded import is exactly the kind of
+    # dependency that disappears without a signal. `try: import wmi / except:
+    # pass` succeeds whether or not wmi is present, so moving it into a helper,
+    # renaming it, or reaching for importlib instead would drop it from the
+    # archive and the build would still succeed -- the absence would surface
+    # only at runtime, as dashed rows, on a machine with WMI. Naming them here
+    # makes it a stated contract instead of an accident of the analyser's AST
+    # walk, and a name that stops resolving is a build-time error
+    # ("Hidden import 'wmi' not found") rather than a quiet regression.
     hiddenimports=['wmi', 'pynvml'],
     hookspath=[],
     hooksconfig={},

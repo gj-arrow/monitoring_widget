@@ -12,6 +12,15 @@ and commit the new PNGs:
 These tests must not run under QT_QPA_PLATFORM=offscreen: conftest strips it,
 because under it Qt on Windows has no font database and every glyph would
 rasterise as a tofu box, locking an unrenderable picture into the repository.
+
+Regenerating the goldens is the documented escape hatch for an expected
+rendering change, so the command here has to be the one that works in the
+shell this project is developed in. On Windows that is PowerShell, where
+`VAR=1 cmd` is not a prefix assignment at all -- PowerShell parses `1` as a
+command and the environment variable is never set, so the run quietly produces
+no new PNGs and the change looks like it did nothing:
+
+    $env:MONITOR_REGEN_GOLDEN=1; python -m pytest tests/test_painter.py
 """
 
 import os
@@ -135,7 +144,9 @@ def assert_golden(name, snapshot, values_by_key=None):
         f"font change on this machine (a different Segoe UI Variable Display "
         f"build, a Qt patch release) altering rasterisation, or a DPI change. "
         f"If that is the expected change, regenerate with "
-        f"MONITOR_REGEN_GOLDEN=1 and commit the new PNGs. If you were editing "
+        f"$env:MONITOR_REGEN_GOLDEN=1; python -m pytest tests/test_painter.py "
+        f"(PowerShell -- the VAR=1 cmd form is bash and does not set the "
+        f"variable here) and commit the new PNGs. If you were editing "
         f"theme.py or painter.py, this is the test doing its job."
     )
 

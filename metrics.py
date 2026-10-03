@@ -87,6 +87,13 @@ _NOMINAL_MAX_MHZ = 20_000.0
 # the machine talks to itself about, which is not network throughput.
 _PSEUDO_ADAPTERS = ("loopback", "pseudo")
 
+# How long GpuProbe may answer from its cached WMI fallback before asking WMI
+# again. Sixty seconds: the answer is a property of the installed card, so it is
+# re-read far more slowly than it is displayed, and it is re-read rather than
+# cached for good because a WMI service that was down at startup would
+# otherwise leave the GPU row dashed for the rest of the session.
+WMI_FALLBACK_REFRESH_S = 60.0
+
 # The spec's rule for this log: "Логирование ограничено по частоте: не чаще
 # одной записи на источник в минуту" -- no more than one record per source per
 # minute. Nothing here enforced it, so every guard below wrote a record per
@@ -226,9 +233,20 @@ class GpuProbe:
     The previous code called nvmlInit() once per metric, so a tick cost four
     initialisations, and a machine without NVIDIA raised eight exceptions
     every two seconds instead of answering once at startup.
+
+    The WMI fallback is held to the same discipline from the other side. With
+    no handle, read() used to call wmi_fallback() on every tick, and that opens
+    a *fresh* COM connection and runs Win32_VideoController() -- thirty times a
+    minute, for an answer that is a property of the installed card. So the
+    machines the spec's acceptance criterion 5 singles out as the ones that must
+    work were the ones paying for it. The answer is cached and re-checked on
+    WMI_FALLBACK_REFRESH_S rather than never re-checked: it can change (a WMI
+    service that is down at startup leaves an empty answer cached, and a driver
+    install partway through a session would otherwise go unnoticed), and a
+    minute is far below anything a person watching the panel would notice.
     """
 
-    def __init__(self, nvml: Any | None = None) -> None:
+    def __init__(self, nvml: Any | None = None, now: Callable[[], float] | None = None) -> None:
         if nvml is None:
             try:
                 import pynvml as nvml  # type: ignore[no-redef]
@@ -237,6 +255,9 @@ class GpuProbe:
                 nvml = None
         self._nvml = nvml
         self._handle: Any | None = None
+        self._now = now or time.monotonic
+        self._fallback: dict[str, float | None] | None = None
+        self._fallback_at: float = float("-inf")
         if nvml is not None:
             try:
                 nvml.nvmlInit()
@@ -267,7 +288,7 @@ class GpuProbe:
 
     def read(self) -> dict[str, float | None]:
         if self._handle is None:
-            return wmi_fallback()
+            return self._wmi_fallback()
         nvml, handle = self._nvml, self._handle
         out = _empty(GPU_KEYS)
         try:
@@ -287,6 +308,19 @@ class GpuProbe:
         except Exception:
             logger.info("NVML memory info unavailable", exc_info=True)
         return out
+
+    def _wmi_fallback(self) -> dict[str, float | None]:
+        """wmi_fallback(), answered from cache, and a copy of the cache.
+
+        The copy is not tidiness: SystemProbe iterates the dict it is handed
+        and copies out the four GPU keys, so handing back the cached object
+        would let a caller that added to it change what the next read returns.
+        """
+        moment = self._now()
+        if self._fallback is None or moment - self._fallback_at >= WMI_FALLBACK_REFRESH_S:
+            self._fallback = wmi_fallback()
+            self._fallback_at = moment
+        return dict(self._fallback)
 
 
 def _psutil_nominal_mhz() -> float | None:

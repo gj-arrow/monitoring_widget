@@ -1651,3 +1651,133 @@ def test_a_recovered_source_is_not_logged_again_on_its_next_failure(caplog, faul
         f"{len(records_for(caplog, 'cpu_percent'))} records from a source that "
         "fails on every other tick"
     )
+
+
+# --- the WMI fallback on a machine with no NVIDIA --------------------------
+
+
+class CountingFallback:
+    """Stands in for wmi_fallback() and counts how often it is asked."""
+
+    def __init__(self, answer=None):
+        self.calls = 0
+        self.answer = answer if answer is not None else {"vram_total_gb": 8.0}
+
+    def __call__(self):
+        self.calls += 1
+        return dict(self.answer)
+
+
+class FallbackClock:
+    def __init__(self, now=0.0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+def no_nvidia_probe(now):
+    return GpuProbe(nvml=FakeNvml(fail_init=True), now=now)
+
+
+def test_the_wmi_fallback_is_not_queried_every_tick(monkeypatch):
+    """The spec's acceptance criterion 5 machine: no NVIDIA, and no spam.
+
+    With no NVML handle, read() fell through to wmi_fallback(), which opens a
+    *fresh* COM connection and runs Win32_VideoController() -- every tick, every
+    two seconds, for a number that is a property of the installed card. So the
+    machines the spec singles out as the ones that must work were also the ones
+    paying for a COM connect and a WMI query 30 times a minute.
+
+    Cached and re-checked on a slow interval instead of never, because the
+    answer can change: a WMI service that is down at startup leaves an empty
+    answer cached, and a driver install partway through a session would
+    otherwise never be noticed. Sixty seconds is far below anything a person
+    watching a panel would see and 30x less WMI.
+    """
+    clock = FallbackClock()
+    fallback = CountingFallback()
+    probe = no_nvidia_probe(clock)
+    monkeypatch.setattr(metrics, "wmi_fallback", fallback)
+
+    for _ in range(300):
+        probe.read()
+
+    assert fallback.calls == 1, (
+        f"the WMI fallback was queried {fallback.calls} times in 300 ticks: "
+        "a fresh COM connection and a Win32_VideoController query every two "
+        "seconds, on exactly the machines without an NVIDIA card"
+    )
+
+
+def test_the_fallback_is_asked_again_after_the_refresh_interval(monkeypatch):
+    clock = FallbackClock()
+    fallback = CountingFallback()
+    probe = no_nvidia_probe(clock)
+    monkeypatch.setattr(metrics, "wmi_fallback", fallback)
+
+    probe.read()
+    clock.advance(metrics.WMI_FALLBACK_REFRESH_S - 0.001)
+    probe.read()
+    assert fallback.calls == 1, "the answer was re-queried before the interval"
+
+    clock.advance(0.002)
+    probe.read()
+    assert fallback.calls == 2, (
+        "the cached answer was never refreshed, so a WMI service that was down "
+        "at startup leaves the GPU row dashed for the rest of the session"
+    )
+
+
+def test_a_refreshed_fallback_picks_up_a_changed_answer(monkeypatch):
+    """The reason for the refresh rather than caching for the process's life."""
+    clock = FallbackClock()
+    fallback = CountingFallback({"vram_total_gb": 8.0})
+    probe = no_nvidia_probe(clock)
+    monkeypatch.setattr(metrics, "wmi_fallback", fallback)
+
+    assert probe.read()["vram_total_gb"] == 8.0
+    fallback.answer = {"vram_total_gb": 12.0}
+    assert probe.read()["vram_total_gb"] == 8.0, (
+        "the cache was consulted before the interval, so it is not a cache"
+    )
+
+    clock.advance(metrics.WMI_FALLBACK_REFRESH_S)
+    assert probe.read()["vram_total_gb"] == 12.0
+
+
+def test_a_caller_cannot_corrupt_the_cached_answer_by_editing_it(monkeypatch):
+    """A copy per read, because SystemProbe reads the dict it is handed."""
+    clock = FallbackClock()
+    fallback = CountingFallback({"vram_total_gb": 8.0})
+    probe = no_nvidia_probe(clock)
+    monkeypatch.setattr(metrics, "wmi_fallback", fallback)
+
+    first = probe.read()
+    first["vram_total_gb"] = 999.0
+    first["gpu_pct"] = 50.0
+    assert probe.read()["vram_total_gb"] == 8.0
+    assert "gpu_pct" not in probe.read()
+
+
+def test_an_nvidia_gpu_never_touches_the_wmi_fallback(monkeypatch):
+    """The fallback is a fallback. A machine with a card must not pay for it."""
+    fallback = CountingFallback()
+    probe = GpuProbe(nvml=FakeNvml(), now=FallbackClock())
+    monkeypatch.setattr(metrics, "wmi_fallback", fallback)
+
+    for _ in range(300):
+        probe.read()
+
+    assert fallback.calls == 0, (
+        f"the WMI fallback ran {fallback.calls} times on a machine with a "
+        "working NVML handle"
+    )
+
+
+def test_the_refresh_interval_is_longer_than_a_tick():
+    assert metrics.WMI_FALLBACK_REFRESH_S == 60.0
+    assert metrics.WMI_FALLBACK_REFRESH_S > metrics.LOG_INTERVAL / 1000.0

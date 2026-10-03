@@ -94,15 +94,46 @@ _PSEUDO_ADAPTERS = ("loopback", "pseudo")
 # otherwise leave the GPU row dashed for the rest of the session.
 WMI_FALLBACK_REFRESH_S = 60.0
 
-# The spec's rule for this log: "Логирование ограничено по частоте: не чаще
-# одной записи на источник в минуту" -- no more than one record per source per
-# minute. Nothing here enforced it, so every guard below wrote a record per
-# tick: one persistently failing source measured 99 KB per ten minutes against
-# the spec's 5 KB ceiling, and rotation only deferred the problem to 1.5 MB.
-LOG_INTERVAL = 60.0
+# How long a source must be healthy before its next failure is announced. The
+# spec's rule for this log is "Логирование ограничено по частоте: не чаще одной
+# записи на источник в минуту" -- no more than one record per source per minute
+# -- and app_debug.log is capped at 5 KB per ten minutes.
+#
+# The interval is not a summary timer any more, so it is not the spec's minute.
+# It is the healthy spell a source has to serve before a failure counts as news
+# again, and the number is set by the ceiling rather than by the spec: a record
+# measures 103 B here and its traceback about 340, so 5 KB is roughly 50 records
+# per ten minutes, and the seven fault sites would have to fit inside that. At
+# the spec's minute a source flapping every two minutes still earns a record
+# every minute -- measured 6,900 B for five such sources -- so the ceiling was
+# breached permanently, not at startup. At 300 s the worst case the rule permits
+# is two records per source per ten minutes, and five such sources measure
+# 2,655 B, half the ceiling. It is also the floor overlay.PAINT_ERROR_LOG_INTERVAL
+# already uses, for the same reason: a repeating fault is one event, not one
+# event per interval.
+#
+# The cost, stated rather than discovered later: a fault of the same type that
+# heals and returns inside five minutes is silent. The panel shows that -- the
+# row went from a number to dashes and back -- and the traceback for that fault
+# is already on file, so what is lost is a timestamp and nothing else.
+LOG_INTERVAL = 300.0
 
-# source -> (when it last wrote, whether it has carried a traceback yet).
-_FAULT_LOG: dict[str, tuple[float, bool]] = {}
+
+@dataclass(slots=True)
+class _Fault:
+    """What one source has already been given, and what it owes the log next.
+
+    Per source, never shared: five broken sources are five records, and one of
+    them healing must not reopen another's silence.
+    """
+
+    when: float                      # when the last record was written
+    kind: type | None                # the exception type that record named
+    traced: bool                     # has this type been given a traceback
+    healthy_since: float | None = None  # None while the source is still broken
+
+
+_FAULT_LOG: dict[str, _Fault] = {}
 
 
 def _one_line(exc: BaseException) -> str:
@@ -115,36 +146,76 @@ def _one_line(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"
 
 
+def clear_fault(source: str) -> None:
+    """Tell the throttle this source worked. Called on the healthy path.
+
+    Nothing else can: a source that answers does not call log_fault, so this is
+    the only way the throttle learns a fault is over, and without it a source
+    that recovers can never be announced again -- it would be quiet in the one
+    way a broken source is not allowed to be.
+
+    Only the moment is kept, and only the first one: a streak of healthy samples
+    is one event, so the streak's start is what a later fault is measured from.
+    A source that has never faulted has nothing to say and costs one lookup.
+    """
+    previous = _FAULT_LOG.get(source)
+    if previous is None or previous.healthy_since is not None:
+        return
+    previous.healthy_since = time.monotonic()
+
+
 def log_fault(source: str, message: str, exc: BaseException | None = None) -> bool:
-    """One record per source per LOG_INTERVAL. True when it was written.
+    """The first fault for a source, and only what is news after that. True when written.
 
-    Three decisions, all of them load-bearing:
+    Three ways in, and each one is a change rather than a repeat:
 
-    WHICH FAULTS COUNT AS A CHANGE: none. The timer runs from the last record
-    written for that source, whatever happened in between, so a fault whose
-    text varies per occurrence -- two adapters alternating, an HRESULT that
-    flips, a counter in the message -- cannot reopen the floor. Any rule keyed
-    on the message is only a bound until something starts varying it, and a
-    flapping source is exactly the case the bound exists for. Nothing resets
-    the timer on success either: recovery is not a fault and gets no record, so
-    there is nothing to reset it for. The cost is a genuinely new fault going
-    unannounced for at most one interval, on a panel already showing its
-    dashes.
+    THE FIRST FAULT: always written, with its traceback. Nothing before it.
 
-    THE TRACEBACK: first record for a source only. Measured over 300 ticks at
-    the real two-second cadence with one source broken, app_debug.log went from
-    99,300 bytes to 1,331: of those, 338 is the one traceback and the ten
-    one-line summaries are about 99 each. The traceback says *where* the fault
-    is and the location is a property of the source, not of the occurrence, so
-    it is the one part that repeats without adding anything; the exception type
-    and message are what can change, and they ride on every record.
+    A DIFFERENT EXCEPTION TYPE: always written, with a traceback again. The type
+    is the one part of a fault that names a different problem -- a dead counter
+    and a missing sensor want different fixes, and a log carrying only the first
+    one sends the reader after the wrong cause. The traceback's latch resets
+    with it, because the *raising line* changes with the exception and a
+    traceback that places the old one is a traceback for a different fault.
+
+    A FAULT AFTER A FULL HEALTHY INTERVAL: written, without a traceback (that
+    type's is on file). The source's row went from a number to dashes and back,
+    which is a fact the log does not otherwise hold.
+
+    And nothing else. A source that keeps failing writes exactly one record for
+    the life of the process; a fault whose message varies per occurrence -- two
+    adapters alternating, an HRESULT that flips, a counter in the message --
+    writes one record, because keying on the message would let any source that
+    varies reopen the floor and the bound would not be a bound. Same for a
+    source that flaps with a healthy gap short of the interval: a streak that is
+    broken by a failure is not a streak, so those healthy samples do not add up
+    towards the next record either.
     """
     moment = time.monotonic()
+    kind = type(exc) if exc is not None else None
     previous = _FAULT_LOG.get(source)
-    if previous is not None and moment - previous[0] < LOG_INTERVAL:
+    changed = previous is not None and previous.kind is not kind
+    healed = (
+        previous is not None
+        and previous.healthy_since is not None
+        and moment - previous.healthy_since >= LOG_INTERVAL
+    )
+    if previous is not None and not (changed or healed):
+        # The streak ends here even though nothing is written: this source is
+        # broken again, so the next fault starts counting from this moment and
+        # not from the last healthy sample before it. Without that, a source
+        # flapping every half interval accumulates healthy time across its own
+        # failures and eventually earns a recovery record for a spell of health
+        # it never had.
+        previous.healthy_since = None
         return False
-    traced = exc is not None and (previous is None or not previous[1])
-    _FAULT_LOG[source] = (moment, (previous[1] if previous else False) or traced)
+
+    traced = exc is not None and (previous is None or changed)
+    _FAULT_LOG[source] = _Fault(
+        when=moment,
+        kind=kind,
+        traced=traced or (previous.traced if previous is not None else False),
+    )
 
     if exc is None:
         logger.warning("%s", message)
@@ -528,6 +599,8 @@ That wall figure is not a floor, and the obvious next reader should know it.
         except Exception as exc:
             log_fault("nominal CPU frequency", "nominal CPU frequency failed", exc)
             return None
+        if fallback is not None:
+            clear_fault("nominal CPU frequency")
         self._nominal = fallback
         return fallback
 
@@ -615,6 +688,7 @@ class NetProbe:
         except Exception as exc:
             log_fault("net_io_counters", "net_io_counters failed", exc)
             return out
+        clear_fault("net_io_counters")
 
         previous = self._previous
         now = (moment, names, *(totals[key] for key in NET_KEYS))
@@ -754,6 +828,7 @@ class SystemProbe:
 
         try:
             values["cpu_pct"] = float(self._cpu_pct())
+            clear_fault("cpu_percent")
         except Exception as exc:
             log_fault("cpu_percent", "cpu_percent failed", exc)
 
@@ -761,6 +836,7 @@ class SystemProbe:
             for key, value in self._cpu_clock.read().items():
                 if key in CPU_CLOCK_KEYS:
                     values[key] = value
+            clear_fault("cpu clock read")
         except Exception as exc:
             log_fault("cpu clock read", "cpu clock read failed", exc)
 
@@ -768,6 +844,7 @@ class SystemProbe:
             memory = self._ram()
             values["ram_used_gb"] = round(memory.used / _GB, 1)
             values["ram_total_gb"] = round(memory.total / _GB, 1)
+            clear_fault("virtual_memory")
         except Exception as exc:
             log_fault("virtual_memory", "virtual_memory failed", exc)
 
@@ -775,6 +852,7 @@ class SystemProbe:
             for key, value in self._gpu.read().items():
                 if key in GPU_KEYS:
                     values[key] = value
+            clear_fault("gpu read")
         except Exception as exc:
             log_fault("gpu read", "gpu read failed", exc)
 
@@ -782,6 +860,7 @@ class SystemProbe:
             for key, value in self._net.read().items():
                 if key in NET_KEYS:
                     values[key] = value
+            clear_fault("net read")
         except Exception as exc:
             log_fault("net read", "net read failed", exc)
 

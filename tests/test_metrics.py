@@ -1376,3 +1376,278 @@ def test_the_network_columns_appear_in_the_declared_direction_order():
     assert columns.index("net_down_bytes_per_sec") < columns.index("net_up_bytes_per_sec")
 
 
+
+
+# --- how often a failing source may write to the log -----------------------
+
+# Ten minutes at theme.TICK_MS: the number of ticks a persistently broken
+# source used to write one record for.
+TEN_MINUTE_TICKS = 300
+
+
+@pytest.fixture
+def fault_log(monkeypatch):
+    """A fresh fault throttle over a clock the test owns, and a clean slate.
+
+    The throttle is process-wide on purpose -- a source that failed once must
+    not have its interval restarted by the next test -- so every test that
+    counts records installs its own.
+    """
+    clock = FakeClock(1_000.0)
+    monkeypatch.setattr(
+        metrics, "time", SimpleNamespace(monotonic=clock, time=clock)
+    )
+    metrics._FAULT_LOG.clear()
+    yield clock
+    metrics._FAULT_LOG.clear()
+
+
+def records_for(caplog, source):
+    return [r for r in caplog.records if r.name == "widget.metrics" and source in r.getMessage()]
+
+
+def readable_ram():
+    return SimpleNamespace(used=11.4 * GB, total=32 * GB)
+
+
+def boom():
+    raise RuntimeError("sensor bus is on fire")
+
+
+# Each source is driven on its own, because a throttle that counted all sources
+# together would pass every one of these while a per-source throttle was missing
+# from four of the five call sites.
+FAILING_SOURCES = {
+    "cpu_percent": lambda: SystemProbe(
+        cpu_pct=boom, ram=readable_ram, cpu_clock=FakeCpuClock({}),
+        gpu=FakeGpu({}), net=FakeNet(),
+    ),
+    "virtual_memory": lambda: SystemProbe(
+        cpu_pct=lambda: 1.0, ram=boom, cpu_clock=FakeCpuClock({}),
+        gpu=FakeGpu({}), net=FakeNet(),
+    ),
+    "cpu clock read": lambda: SystemProbe(
+        cpu_pct=lambda: 1.0, ram=readable_ram, cpu_clock=BrokenCpuClock(),
+        gpu=FakeGpu({}), net=FakeNet(),
+    ),
+    "gpu read": lambda: SystemProbe(
+        cpu_pct=lambda: 1.0, ram=readable_ram, cpu_clock=FakeCpuClock({}),
+        gpu=BrokenGpu(), net=FakeNet(),
+    ),
+    "net read": lambda: SystemProbe(
+        cpu_pct=lambda: 1.0, ram=readable_ram, cpu_clock=FakeCpuClock({}),
+        gpu=FakeGpu({}), net=BrokenNet(),
+    ),
+}
+
+
+class FakeNet:
+    def read(self):
+        return {}
+
+
+class BrokenNet:
+    def read(self):
+        raise RuntimeError("sensor bus is on fire")
+
+
+@pytest.mark.parametrize("source", sorted(FAILING_SOURCES))
+def test_a_persistently_failing_source_is_logged_once_per_interval(
+    source, caplog, fault_log
+):
+    """The spec's rule, and the reason app_debug.log had a size problem.
+
+    'Логирование ограничено по частоте: не чаще одной записи на источник в
+    минуту' -- at most one record per source per minute. Nothing implemented
+    it: every one of these guards called logger.warning(exc_info=True) on
+    every tick, so one broken source wrote 300 records -- and 99 KB -- in the
+    ten minutes the spec measures the log over.
+    """
+    probe = FAILING_SOURCES[source]()
+    with caplog.at_level(logging.WARNING, logger="widget.metrics"):
+        for _ in range(TEN_MINUTE_TICKS):
+            probe.sample()
+
+    assert len(records_for(caplog, source)) == 1, (
+        f"{len(records_for(caplog, source))} records for one source in "
+        f"{TEN_MINUTE_TICKS} ticks: the interval is not being enforced"
+    )
+
+
+@pytest.mark.parametrize("source", sorted(FAILING_SOURCES))
+def test_a_record_appears_again_once_the_interval_expires(source, caplog, fault_log):
+    """A floor, not a latch: the interval has to expire for the next record.
+
+    The previous version kept a memo that a clean frame emptied, so a source
+    failing on every other tick looked healthy half the time and still wrote
+    one record per bad tick. Silence in between changes nothing.
+    """
+    probe = FAILING_SOURCES[source]()
+    with caplog.at_level(logging.WARNING, logger="widget.metrics"):
+        for _ in range(TEN_MINUTE_TICKS):
+            probe.sample()
+        fault_log.advance(metrics.LOG_INTERVAL)
+        probe.sample()
+        fault_log.advance(metrics.LOG_INTERVAL - 0.001)
+        probe.sample()
+        fault_log.advance(metrics.LOG_INTERVAL)
+        probe.sample()
+
+    assert len(records_for(caplog, source)) == 3, (
+        f"{len(records_for(caplog, source))} records across three intervals: "
+        "the interval is either not enforced or never reopens"
+    )
+
+
+def test_one_source_going_bad_does_not_silence_another(caplog, fault_log):
+    """Per source, not per logger: five broken sources are five floors."""
+    with caplog.at_level(logging.WARNING, logger="widget.metrics"):
+        for _ in range(3):
+            SystemProbe(
+                cpu_pct=boom, ram=boom, cpu_clock=BrokenCpuClock(),
+                gpu=BrokenGpu(), net=BrokenNet(),
+            ).sample()
+
+    for source in FAILING_SOURCES:
+        assert len(records_for(caplog, source)) == 1, (
+            f"{source!r} wrote {len(records_for(caplog, source))} records: "
+            "one source's record is suppressing another's"
+        )
+
+
+def test_the_traceback_is_written_once_and_the_summary_after_it(caplog, fault_log):
+    """Where the bytes go, since a traceback is most of a record.
+
+    Measured over 300 ticks at the real 2 s cadence, one source broken: 99,300
+    bytes before, 1,331 after. Of those 1,331, the traceback is 338 and the ten
+    one-line summaries are about 99 each. So the traceback is kept for the
+    first record of a source and the exception is carried on the line after it:
+    300 dumps become one dump plus ten lines.
+
+    The traceback is not dropped, only rationed: it says *where* the fault is,
+    which is what a reader needs and what the summary cannot carry. The
+    exception type and message are what can change between two occurrences of
+    the same source, so those are on every record.
+    """
+    probe = FAILING_SOURCES["virtual_memory"]()
+    with caplog.at_level(logging.WARNING, logger="widget.metrics"):
+        for _ in range(10):
+            probe.sample()
+        fault_log.advance(metrics.LOG_INTERVAL)
+        probe.sample()
+
+    written = records_for(caplog, "virtual_memory")
+    assert len(written) == 2
+    assert written[0].exc_info is not None, (
+        "the first record of a fault carries no traceback: there is nothing "
+        "left to diagnose it with if the log is all that survives"
+    )
+    assert written[1].exc_info is None, (
+        "the tenth record of the same fault repeated the whole traceback"
+    )
+    assert "RuntimeError" in written[1].getMessage() and "on fire" in written[1].getMessage(), (
+        f"the summary lost the exception it was supposed to carry: "
+        f"{written[1].getMessage()!r}"
+    )
+
+
+def test_a_differing_fault_does_not_restart_the_interval(caplog, fault_log):
+    """The decision, and the reason for it: time only, never the message.
+
+    Any rule that lets a *changed* fault reopen the floor is defeated by a
+    fault whose text varies per occurrence -- two adapters alternating, an
+    HRESULT that flips, a counter value in the message -- and then the bound
+    is no longer a bound. So the timer runs from the last record written for
+    that source, whatever happened in between.
+
+    The cost is stated rather than discovered later: a genuinely new fault is
+    not announced until the interval expires, at most 60 s late, and the panel
+    is already showing dashes for it.
+    """
+    alternating = {"n": 0}
+
+    def flip():
+        alternating["n"] += 1
+        raise RuntimeError(f"attempt {alternating['n']}")
+
+    probe = SystemProbe(
+        cpu_pct=flip, ram=readable_ram, cpu_clock=FakeCpuClock({}),
+        gpu=FakeGpu({}), net=FakeNet(),
+    )
+    with caplog.at_level(logging.WARNING, logger="widget.metrics"):
+        for _ in range(50):
+            probe.sample()
+
+    assert len(records_for(caplog, "cpu_percent")) == 1, (
+        f"{len(records_for(caplog, 'cpu_percent'))} records from a fault whose "
+        "message changes every tick: the interval is keyed on the message"
+    )
+
+
+def test_the_network_counter_failure_is_rate_limited_too(caplog, fault_log):
+    """NetProbe logs its own failure, one source away from SystemProbe's.
+
+    SystemProbe catches whatever NetProbe.read() lets out, but read() catches
+    its own counter failure and returns two dashes, so this is the record a
+    machine with a dead psutil net counter actually produces -- and it was one
+    per tick.
+    """
+    probe = NetProbe(io_counters=boom)
+    with caplog.at_level(logging.WARNING, logger="widget.metrics"):
+        for _ in range(TEN_MINUTE_TICKS):
+            probe.read()
+
+    assert len(records_for(caplog, "net_io_counters")) == 1, (
+        f"{len(records_for(caplog, 'net_io_counters'))} records in "
+        f"{TEN_MINUTE_TICKS} ticks"
+    )
+
+
+def test_the_psutil_nominal_failure_is_rate_limited_too(caplog, fault_log):
+    """The clock's own fallback, which fires on every tick until it works."""
+    probe = CpuClockProbe(
+        wmi=FakeWmi(connection=FakeWmiConnection(processors=(), perf=())),
+        nominal_max=boom,
+    )
+    with caplog.at_level(logging.WARNING, logger="widget.metrics"):
+        for _ in range(TEN_MINUTE_TICKS):
+            probe.read()
+
+    assert len(records_for(caplog, "nominal CPU frequency")) == 1, (
+        f"{len(records_for(caplog, 'nominal CPU frequency'))} records in "
+        f"{TEN_MINUTE_TICKS} ticks"
+    )
+
+
+def test_the_interval_is_the_one_the_spec_promises():
+    # "не чаще одной записи на источник в минуту" -- a minute, not a tick.
+    assert metrics.LOG_INTERVAL == 60.0
+
+
+def test_a_recovered_source_is_not_logged_again_on_its_next_failure(caplog, fault_log):
+    """Silence does not hand a source a fresh interval -- it costs a whole one.
+
+    The obvious way to keep a repeated fault quiet is to forget the timer when
+    the source recovers, and that turns any flapping source back into one
+    record per tick: fail, recover, fail, recover. Nothing here resets.
+    """
+    failing = {"on": True}
+
+    def flaky():
+        if failing["on"]:
+            raise RuntimeError("sensor bus is on fire")
+        return 1.0
+
+    probe = SystemProbe(
+        cpu_pct=flaky, ram=readable_ram, cpu_clock=FakeCpuClock({}),
+        gpu=FakeGpu({}), net=FakeNet(),
+    )
+    with caplog.at_level(logging.WARNING, logger="widget.metrics"):
+        for index in range(50):
+            failing["on"] = index % 2 == 0
+            probe.sample()
+
+    assert len(records_for(caplog, "cpu_percent")) == 1, (
+        f"{len(records_for(caplog, 'cpu_percent'))} records from a source that "
+        "fails on every other tick"
+    )

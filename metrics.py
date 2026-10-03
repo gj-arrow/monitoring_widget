@@ -87,6 +87,66 @@ _NOMINAL_MAX_MHZ = 20_000.0
 # the machine talks to itself about, which is not network throughput.
 _PSEUDO_ADAPTERS = ("loopback", "pseudo")
 
+# The spec's rule for this log: "Логирование ограничено по частоте: не чаще
+# одной записи на источник в минуту" -- no more than one record per source per
+# minute. Nothing here enforced it, so every guard below wrote a record per
+# tick: one persistently failing source measured 99 KB per ten minutes against
+# the spec's 5 KB ceiling, and rotation only deferred the problem to 1.5 MB.
+LOG_INTERVAL = 60.0
+
+# source -> (when it last wrote, whether it has carried a traceback yet).
+_FAULT_LOG: dict[str, tuple[float, bool]] = {}
+
+
+def _one_line(exc: BaseException) -> str:
+    """`TypeName: message`, on one line.
+
+    str(exc) alone drops the type, and the type is the half of an exception
+    that a reader searching the log is usually after -- "RuntimeError" versus
+    "OSError" says whether to keep reading.
+    """
+    return f"{type(exc).__name__}: {exc}"
+
+
+def log_fault(source: str, message: str, exc: BaseException | None = None) -> bool:
+    """One record per source per LOG_INTERVAL. True when it was written.
+
+    Three decisions, all of them load-bearing:
+
+    WHICH FAULTS COUNT AS A CHANGE: none. The timer runs from the last record
+    written for that source, whatever happened in between, so a fault whose
+    text varies per occurrence -- two adapters alternating, an HRESULT that
+    flips, a counter in the message -- cannot reopen the floor. Any rule keyed
+    on the message is only a bound until something starts varying it, and a
+    flapping source is exactly the case the bound exists for. Nothing resets
+    the timer on success either: recovery is not a fault and gets no record, so
+    there is nothing to reset it for. The cost is a genuinely new fault going
+    unannounced for at most one interval, on a panel already showing its
+    dashes.
+
+    THE TRACEBACK: first record for a source only. Measured over 300 ticks at
+    the real two-second cadence with one source broken, app_debug.log went from
+    99,300 bytes to 1,331: of those, 338 is the one traceback and the ten
+    one-line summaries are about 99 each. The traceback says *where* the fault
+    is and the location is a property of the source, not of the occurrence, so
+    it is the one part that repeats without adding anything; the exception type
+    and message are what can change, and they ride on every record.
+    """
+    moment = time.monotonic()
+    previous = _FAULT_LOG.get(source)
+    if previous is not None and moment - previous[0] < LOG_INTERVAL:
+        return False
+    traced = exc is not None and (previous is None or not previous[1])
+    _FAULT_LOG[source] = (moment, (previous[1] if previous else False) or traced)
+
+    if exc is None:
+        logger.warning("%s", message)
+    elif traced:
+        logger.warning("%s: %s", message, _one_line(exc), exc_info=exc)
+    else:
+        logger.warning("%s: %s", message, _one_line(exc))
+    return True
+
 
 @dataclass(frozen=True, slots=True)
 class Snapshot:
@@ -431,8 +491,8 @@ That wall figure is not a floor, and the obvious next reader should know it.
                     return speed
         try:
             fallback = _reading(self._nominal_max(), ceiling=_NOMINAL_MAX_MHZ)
-        except Exception:
-            logger.warning("nominal CPU frequency failed", exc_info=True)
+        except Exception as exc:
+            log_fault("nominal CPU frequency", "nominal CPU frequency failed", exc)
             return None
         self._nominal = fallback
         return fallback
@@ -518,8 +578,8 @@ class NetProbe:
         try:
             names, totals = _summed_adapters(self._io_counters(pernic=True))
             moment = self._now()
-        except Exception:
-            logger.warning("net_io_counters failed", exc_info=True)
+        except Exception as exc:
+            log_fault("net_io_counters", "net_io_counters failed", exc)
             return out
 
         previous = self._previous
@@ -660,36 +720,36 @@ class SystemProbe:
 
         try:
             values["cpu_pct"] = float(self._cpu_pct())
-        except Exception:
-            logger.warning("cpu_percent failed", exc_info=True)
+        except Exception as exc:
+            log_fault("cpu_percent", "cpu_percent failed", exc)
 
         try:
             for key, value in self._cpu_clock.read().items():
                 if key in CPU_CLOCK_KEYS:
                     values[key] = value
-        except Exception:
-            logger.warning("cpu clock read failed", exc_info=True)
+        except Exception as exc:
+            log_fault("cpu clock read", "cpu clock read failed", exc)
 
         try:
             memory = self._ram()
             values["ram_used_gb"] = round(memory.used / _GB, 1)
             values["ram_total_gb"] = round(memory.total / _GB, 1)
-        except Exception:
-            logger.warning("virtual_memory failed", exc_info=True)
+        except Exception as exc:
+            log_fault("virtual_memory", "virtual_memory failed", exc)
 
         try:
             for key, value in self._gpu.read().items():
                 if key in GPU_KEYS:
                     values[key] = value
-        except Exception:
-            logger.warning("gpu read failed", exc_info=True)
+        except Exception as exc:
+            log_fault("gpu read", "gpu read failed", exc)
 
         try:
             for key, value in self._net.read().items():
                 if key in NET_KEYS:
                     values[key] = value
-        except Exception:
-            logger.warning("net read failed", exc_info=True)
+        except Exception as exc:
+            log_fault("net read", "net read failed", exc)
 
         values["ts"] = time.time()
         return Snapshot(**values)

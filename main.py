@@ -31,6 +31,8 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap
 from PyQt6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
+import pythoncom
+
 import theme
 from history import HistoryLog
 from metrics import SystemProbe
@@ -121,13 +123,21 @@ class Collector(QThread):
     through the `sampled` signal. That signal is queued, so its slots run on
     the GUI thread -- which is fine for painting a panel and wrong for
     appending a CSV row on every tick.
+
+    `make_probe` is a factory, and it is called here rather than by the caller,
+    because a probe is not just an object: SystemProbe opens a COM connection
+    for the CPU clock, and a COM connection belongs to the thread that opened
+    it. Building the probe on the GUI thread and querying it here made the first
+    WMI query of every launch fail with RPC_E_WRONG_THREAD (0x8001010E), which
+    only _reconnect() hid -- see the docstring on run().
     """
 
     sampled = pyqtSignal(object)
 
-    def __init__(self, probe, on_sampled=None, parent=None) -> None:
+    def __init__(self, make_probe, on_sampled=None, parent=None) -> None:
         super().__init__(parent)
-        self._probe = probe
+        self._make_probe = make_probe
+        self._probe = None
         self._on_sampled = on_sampled
         self._mutex = QMutex()
         self._wake = QWaitCondition()
@@ -150,6 +160,39 @@ class Collector(QThread):
             self._on_sampled(snapshot)
 
     def run(self) -> None:
+        # COM for this thread, explicitly, before metrics.py can touch it. Two
+        # measured reasons, and neither is enough on its own:
+        #
+        #   1. `import wmi` is not a passive import. At module scope wmi.py
+        #      runs GetObject("winmgmts:") to find its namespace, so the *first*
+        #      import opens a connection -- and on a thread with no apartment
+        #      that call fails with x_wmi_uninitialised_thread before a single
+        #      query is asked for. Measured on this machine: a plain
+        #      threading.Thread cannot even import wmi; a Qt worker thread gets
+        #      an apartment from pywin32's own lazy init, which is an accident
+        #      of the call path rather than a guarantee.
+        #   2. The apartment has to be uninitialised on the way out, or every
+        #      launch leaks one on a thread that then ends.
+        #
+        # pywin32's signature is CoInitializeEx(flags) -- one argument. The
+        # two-argument form in the COM headers is C's, and passing it here
+        # raises TypeError.
+        pythoncom.CoInitializeEx(pythoncom.COINIT_APARTMENTTHREADED)
+        try:
+            self._probe = self._make_probe()
+            self._sample_loop()
+        finally:
+            # Released before CoUninitialize, on the thread that opened it. A
+            # COM object released after its apartment is gone prints
+            # "Win32 exception occurred releasing IUnknown" on stderr, and a
+            # frame-local would not be released early enough to avoid it: the
+            # frame is popped only after run() returns.
+            self._probe = None
+            pythoncom.CoUninitialize()
+
+    def _sample_loop(self) -> None:
+        """Sample until interrupted. Runs entirely inside run()'s COM scope."""
+        probe = self._probe
         while not self.isInterruptionRequested():
             # Cleared before the sample rather than after it: a sample takes
             # about 100 ms, and a poke arriving in that window would be erased
@@ -158,7 +201,7 @@ class Collector(QThread):
             # waiting on is dropped, and it is dropped here, mid-sample.
             with QMutexLocker(self._mutex):
                 self._pending = False
-            self._publish(self._probe.sample())
+            self._publish(probe.sample())
             with QMutexLocker(self._mutex):
                 # The three ways out of a wait: poked, the tick expiring, and
                 # an interruption. The last one is checked here as well as at
@@ -294,12 +337,32 @@ class MonitorApp:
     def _make_collector(self) -> Collector:
         """The sampler, with the CSV trace hanging off its worker side.
 
+        `SystemProbe` is passed as a class, not called here: the probe opens a
+        WMI COM connection while it is being built, and that connection belongs
+        to whichever thread did the building. Collector builds it on the worker
+        thread that will query it. Building it on this one made the first query
+        of every launch fail -- measured, every launch, x_wmi
+        RPC_E_WRONG_THREAD -- and the app only survived because
+        CpuClockProbe._reconnect() silently rebuilt the handle on the worker a
+        few microseconds later.
+
+        Initialising COM at the top of Collector.run() was the other candidate
+        and it does not work, which is worth recording so nobody tries it again:
+        the connection carries an apartment-threaded proxy belonging to the
+        thread that opened it, and CoInitializeEx on the *querying* thread puts
+        that thread in an apartment without moving the proxy into it. Both
+        COINIT_APARTMENTTHREADED and COINIT_MULTITHREADED were measured on this
+        machine and both still raise x_wmi 0x8001010E. pywin32 initialises COM
+        on the calling thread by itself when wmi.WMI() is constructed, so there
+        is nothing left to initialise by hand once the connection is opened
+        where it is used.
+
         The append is a callback on the collector rather than a slot on
         `sampled`: that signal is queued to the GUI thread, so a file write
         every two seconds would land on the one thread this class exists to
         keep free. Panel painting is the only thing that belongs over there.
         """
-        return Collector(SystemProbe(), self._record_history)
+        return Collector(SystemProbe, self._record_history)
 
     def _record_history(self, snapshot) -> None:
         self.history_log.write(snapshot)

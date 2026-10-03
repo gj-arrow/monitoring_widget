@@ -1,4 +1,4 @@
-"""Tests for the entry point: the sampler thread, the log and the menu wiring.
+﻿"""Tests for the entry point: the sampler thread, the log and the menu wiring.
 
 No test here calls show(). MonitorApp's constructor shows the panel and the
 tray icon, so the methods worth driving directly are run against an instance
@@ -14,6 +14,8 @@ guess about timing.
 import ctypes
 import logging
 import logging.handlers
+import subprocess
+import sys
 import threading
 import time
 from dataclasses import asdict
@@ -24,6 +26,7 @@ from PyQt6.QtGui import QWheelEvent
 from PyQt6.QtWidgets import QApplication
 
 import main as app_main
+import metrics
 import theme
 from history import HistoryLog
 from metrics import Snapshot
@@ -203,20 +206,27 @@ def wait_until(predicate, timeout_s):
 def collectors():
     """Build collectors that get stopped even when the test fails half way.
 
-    build() takes a probe and returns a Collector, or takes a Collector the
-    test assembled itself and adopts that one -- a Collector passed as a probe
-    would be sampled for as if it had a sample() method, and the AttributeError
-    that raises inside run() is a qFatal, which takes the run with it instead
-    of reporting. Either way the thread is joined at teardown, because a
-    QThread still running when its Python wrapper is collected aborts the
-    interpreter, and a red test is exactly when one is most likely to be left
-    behind.
+    build() takes a *factory* -- something Collector calls on its own thread to
+    get a probe -- or takes a Collector the test assembled itself and adopts
+    that one. A Collector passed as a factory would be sampled for as if it had
+    a sample() method, and the AttributeError that raises inside run() is a
+    qFatal, which takes the run with it instead of reporting. Either way the
+    thread is joined at teardown, because a QThread still running when its
+    Python wrapper is collected aborts the interpreter, and a red test is
+    exactly when one is most likely to be left behind.
+
+    The factory is the whole point of the signature rather than an
+    inconvenience: Collector has to build the probe on the thread that queries
+    it, because SystemProbe opens a COM connection as it is constructed and a
+    COM connection belongs to the thread that opened it.
     """
     made = []
 
-    def build(probe):
+    def build(make_probe):
         collector = (
-            probe if isinstance(probe, app_main.Collector) else app_main.Collector(probe)
+            make_probe
+            if isinstance(make_probe, app_main.Collector)
+            else app_main.Collector(make_probe)
         )
         made.append(collector)
         return collector
@@ -288,7 +298,7 @@ def shutting_down(qapp, tmp_path, monkeypatch, collectors):
     app = bare_app(tmp_path)
     app._stopped = False
     app.timer = StubTimer()
-    app.collector = collectors(RecordingProbe())
+    app.collector = collectors(RecordingProbe)
     app.collector.start()
 
     saved = []
@@ -306,12 +316,280 @@ def shutting_down(qapp, tmp_path, monkeypatch, collectors):
         app.collector.wait(2000)
 
 
+# --- where the WMI connection is opened ------------------------------------
+
+
+class QueryingProbe(metrics.SystemProbe):
+    """The real probe, plus the one WMI query SystemProbe hides.
+
+    sample() catches every source exception, so a WMI connection opened on the
+    wrong thread is invisible through a Snapshot -- the row simply reads `--`
+    and `_reconnect()` quietly repairs it. So this records what the raw query
+    did, and it does that *before* super().sample() runs: by the time sample()
+    returns, _reconnect() may already have replaced the connection, which would
+    hide the very failure under test.
+    """
+
+    built_on: list = []
+    queried_on: list = []
+    outcomes: list = []
+
+    def __init__(self):
+        super().__init__()
+        QueryingProbe.built_on.append(QThread.currentThread())
+
+    def sample(self):
+        QueryingProbe.queried_on.append(QThread.currentThread())
+        try:
+            self._cpu_clock._conn.query(metrics._PERF_RATIO_WQL)
+        except Exception as exc:  # noqa: BLE001 - the point is that it raised
+            QueryingProbe.outcomes.append(f"{type(exc).__name__}: {exc}")
+        else:
+            QueryingProbe.outcomes.append(None)
+        return super().sample()
+
+    @classmethod
+    def reset(cls):
+        cls.built_on, cls.queried_on, cls.outcomes = [], [], []
+
+
+@pytest.fixture
+def querying_probe(qapp, tmp_path, monkeypatch, collectors):
+    """QueryingProbe behind main.py's own wiring, torn down after.
+
+    The probe is the real one on purpose: every CPU-clock test in the suite
+    injects a fake WMI, so nothing else in this repository can tell a connection
+    opened on the wrong thread from one opened on the right one.
+    """
+    QueryingProbe.reset()
+    monkeypatch.setattr(app_main, "SystemProbe", QueryingProbe)
+    app = bare_app(tmp_path)
+    collector = collectors(app._make_collector())
+    yield QueryingProbe, collector
+    QueryingProbe.reset()
+
+
+def test_the_wmi_connection_is_opened_on_the_thread_that_queries_it(
+    qapp, querying_probe
+):
+    """The first query of every launch used to raise, and nothing noticed.
+
+    main.py built SystemProbe on the GUI thread, which opened a wmi.WMI() COM
+    connection there, and then every query ran on the collector's thread. COM
+    refuses that call: WMI's object is an apartment-threaded proxy, and using it
+    from a thread it was not created on fails with RPC_E_WRONG_THREAD
+    (0x8001010E). The app survived only because CpuClockProbe._reconnect()
+    rebuilt the connection on the worker thread, and the exception was logged at
+    INFO on a logger main.py pins to WARNING.
+
+    Measured before this test existed: tick 0 raised on every single launch.
+    """
+    probe, collector = querying_probe
+    collector.start()
+
+    assert wait_until(lambda: probe.outcomes, 10.0), (
+        "the collector never queried WMI: the panel would be showing dashes "
+        "with no attempt to measure anything"
+    )
+    collector.requestInterruption()
+    collector.poke()
+    assert collector.wait(5000) is True
+
+    assert probe.outcomes[0] is None, (
+        f"the first WMI query on the collector's thread raised {probe.outcomes[0]}: "
+        "the connection was opened somewhere else"
+    )
+
+
+def test_the_probe_itself_is_built_on_the_collector_thread(qapp, querying_probe):
+    """Why the query above succeeds has to be the connection, not COM init.
+
+    Initialising COM on the querying thread does *not* rescue a connection
+    opened elsewhere -- see the characterisation test below -- so "the query no
+    longer raises" on its own would be satisfied by anything that merely
+    initialised COM. This pins the actual fix: the object holding the COM
+    connection is constructed on the thread that will use it.
+    """
+    probe, collector = querying_probe
+    collector.start()
+
+    assert wait_until(lambda: probe.built_on, 10.0), "the collector never built a probe"
+    built_on = probe.built_on[0]
+    collector.requestInterruption()
+    collector.poke()
+    assert collector.wait(5000) is True
+
+    assert built_on is collector, (
+        f"the probe was built on {built_on!r}, not the collector's thread: the "
+        "WMI connection inside it belongs to the GUI thread and every query "
+        "against it is a cross-apartment call"
+    )
+    assert probe.queried_on[0] is collector, "the query did not run on the collector's thread"
+
+
+class RecordingCom:
+    """A stand-in for pythoncom that writes down what it was asked to do.
+
+    Real CoInitializeEx/CoUninitialize cannot be observed from here, and the
+    ordering is the part worth pinning: the probe has to go before the last
+    CoUninitialize, or pywin32 releases it against an apartment that is already
+    gone and writes "Win32 exception occurred releasing IUnknown" to stderr.
+    """
+
+    COINIT_APARTMENTTHREADED = 2
+
+    def __init__(self):
+        self.inits = []
+        self.uninits = 0
+
+    def CoInitializeEx(self, flag):
+        self.inits.append(flag)
+
+    def CoUninitialize(self):
+        self.uninits += 1
+
+
+def test_the_sampler_initialises_and_releases_com_on_its_own_thread(
+    qapp, monkeypatch, collectors
+):
+    """COM in, COM out, exactly once, on the thread that uses it.
+
+    Two separate obligations that one missing line each would break, and both
+    are silent when broken: an uninitialised worker thread is what made
+    `import wmi` fail outright off the GUI thread (wmi.py runs GetObject at
+    module scope), and an apartment that is never uninitialised leaks one per
+    launch on a thread that then ends.
+    """
+    import pythoncom
+
+    recorder = RecordingCom()
+    monkeypatch.setattr(app_main, "pythoncom", recorder)
+
+    collector = collectors(RecordingProbe)
+    collector.start()
+    assert wait_until(lambda: collector.isRunning() and collector._probe is not None, 4.0), (
+        "the collector never built its probe"
+    )
+    collector.requestInterruption()
+    collector.poke()
+    assert collector.wait(3000) is True
+    # wait() returning only means run() is unwinding; the finally has to have
+    # run before the counts can be believed.
+    assert wait_until(lambda: recorder.uninits, 2.0)
+
+    assert recorder.inits == [pythoncom.COINIT_APARTMENTTHREADED], (
+        f"the sampler initialised COM {len(recorder.inits)} time(s) with "
+        f"{recorder.inits}, not once with COINIT_APARTMENTTHREADED"
+    )
+    assert recorder.uninits == 1, (
+        f"CoUninitialize ran {recorder.uninits} times against one "
+        "CoInitializeEx: a thread that ends without matching its init leaks the "
+        "apartment for the life of the process"
+    )
+
+
+def test_the_probe_is_released_before_com_goes_away(qapp, monkeypatch, collectors):
+    """The ordering, because getting it wrong is only visible on stderr.
+
+    A COM object released after its apartment is gone makes pywin32 write
+    "Win32 exception occurred releasing IUnknown" to stderr on every shutdown.
+    A frame-local cannot prevent it -- the frame is popped only after run()
+    returns -- so the probe is held on the instance and dropped in the finally,
+    ahead of the CoUninitialize.
+    """
+    seen = {}
+
+    class WatchingProbe:
+        def sample(self):
+            return Snapshot(cpu_pct=1.0)
+
+    class PeekingCom:
+        COINIT_APARTMENTTHREADED = 2
+
+        def CoInitializeEx(self, flag):
+            pass
+
+        def CoUninitialize(self):
+            seen["probe_at_uninit"] = holder[0]._probe
+
+    holder = []
+    monkeypatch.setattr(app_main, "pythoncom", PeekingCom())
+
+    collector = collectors(WatchingProbe)
+    holder.append(collector)
+    collector.start()
+    assert wait_until(lambda: collector._probe is not None, 4.0)
+    collector.requestInterruption()
+    collector.poke()
+    assert collector.wait(3000) is True
+    assert wait_until(lambda: "probe_at_uninit" in seen, 2.0)
+
+    assert seen["probe_at_uninit"] is None, (
+        "the WMI connection was still held when the apartment was torn down"
+    )
+
+
+def test_com_init_on_the_querying_thread_does_not_fix_a_foreign_connection():
+    """The alternative fix, measured rather than assumed: it does not work.
+
+    `CoInitializeEx(COINIT_APARTMENTTHREADED)` at the top of Collector.run()
+    looks like the textbook answer -- initialise COM where COM is used -- and it
+    is not. A `wmi.WMI()` connection carries an apartment-threaded proxy created
+    on the thread that called WMI(); initialising the *querying* thread puts it
+    in an apartment, and the proxy still belongs to the other one. Both
+    apartment models were measured on this machine and both fail identically
+    with RPC_E_WRONG_THREAD (0x8001010E):
+
+        STA: x_wmi on Win32_VideoController
+        MTA: x_wmi on Win32_VideoController
+
+    So the only correct fix is to open the connection where it is queried, which
+    is why Collector takes a factory rather than a probe.
+
+    Run in a subprocess because the failure is not a tidy one: pywin32 turns
+    RPC_E_WRONG_THREAD into an unhandled structured exception on a worker thread
+    with no message filter, which under pytest's faulthandler prints
+    "Windows fatal exception: code 0x8001010e" and takes the whole run with it.
+    A child process reports the same thing without owning the test session.
+    """
+    script = (
+        "import threading, sys\n"
+        "import pythoncom, wmi\n"
+        "conn = wmi.WMI()\n"
+        "for flag in (pythoncom.COINIT_APARTMENTTHREADED,\n"
+        "             pythoncom.COINIT_MULTITHREADED):\n"
+        "    box = {}\n"
+        "    def run(box=box, flag=flag):\n"
+        "        pythoncom.CoInitializeEx(flag)\n"
+        "        try:\n"
+        "            list(conn.query('SELECT Name FROM Win32_VideoController'))\n"
+        "            box['r'] = 'no error'\n"
+        "        except Exception as exc:\n"
+        "            box['r'] = type(exc).__name__\n"
+        "        finally:\n"
+        "            pythoncom.CoUninitialize()\n"
+        "    t = threading.Thread(target=run); t.start(); t.join(30)\n"
+        "    print(box.get('r'))\n"
+    )
+    done = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, timeout=180
+    )
+    results = [line.strip() for line in done.stdout.splitlines() if line.strip()]
+
+    assert results == ["x_wmi", "x_wmi"], (
+        f"a cross-thread query did not fail under both apartment models: "
+        f"{results} (stderr: {done.stderr[-400:]}). If CoInitializeEx ever does "
+        "fix it, the factory in Collector can be replaced by a CoInitializeEx "
+        "call in run()."
+    )
+
+
 # --- the sampler thread ---------------------------------------------------
 
 
 def test_sampling_runs_on_the_collector_thread(qapp, collectors):
     probe = RecordingProbe()
-    collector = collectors(probe)
+    collector = collectors(lambda: probe)
     collector.start()
 
     deadline = 4000
@@ -336,7 +614,7 @@ def test_sampling_runs_on_the_collector_thread(qapp, collectors):
 
 def test_snapshot_is_delivered_back_on_the_gui_thread(qapp, collectors):
     probe = RecordingProbe()
-    collector = collectors(probe)
+    collector = collectors(lambda: probe)
     delivered = []
     collector.sampled.connect(lambda snap: delivered.append(threading.current_thread()))
     collector.start()
@@ -358,7 +636,7 @@ def test_snapshot_is_delivered_back_on_the_gui_thread(qapp, collectors):
 
 
 def test_collector_stops_cleanly(qapp, collectors):
-    collector = collectors(RecordingProbe())
+    collector = collectors(RecordingProbe)
     collector.start()
     qapp.processEvents()
     collector.requestInterruption()
@@ -368,7 +646,7 @@ def test_collector_stops_cleanly(qapp, collectors):
 
 def test_collector_stops_promptly_on_interruption(qapp, collectors):
     probe = BlockingProbe()
-    collector = collectors(probe)
+    collector = collectors(lambda: probe)
     collector.start()
     assert probe.entered[0].wait(4.0), "collector never sampled"
 
@@ -384,7 +662,7 @@ def test_collector_stops_promptly_on_interruption(qapp, collectors):
 
 def test_pokes_collapse_into_one_extra_sample(qapp, collectors):
     probe = CollapsingProbe()
-    collector = collectors(probe)
+    collector = collectors(lambda: probe)
     collector.start()
     assert probe.first_entered.wait(4.0), "collector never sampled"
 
@@ -428,7 +706,7 @@ def test_pokes_collapse_into_one_extra_sample(qapp, collectors):
 
 def test_stop_collector_is_bounded_while_a_sample_is_stuck(qapp, collectors):
     probe = BlockingProbe()
-    collector = collectors(probe)
+    collector = collectors(lambda: probe)
     collector.start()
     assert probe.entered[0].wait(4.0), "collector never sampled"
 
@@ -450,7 +728,7 @@ def test_stop_collector_is_bounded_while_a_sample_is_stuck(qapp, collectors):
 
 def test_stop_collector_is_safe_to_call_twice(qapp, collectors):
     probe = BlockingProbe()
-    collector = collectors(probe)
+    collector = collectors(lambda: probe)
     collector.start()
     assert probe.entered[0].wait(4.0), "collector never sampled"
 
